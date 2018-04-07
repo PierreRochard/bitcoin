@@ -224,7 +224,8 @@ UniValue getlabeladdress(const JSONRPCRequest& request)
 
     // Parse the label first so we don't generate a key if there's an error
     std::string label = LabelFromValue(request.params[0]);
-    bool force = false;
+    // Todo: remove default to true when getaccountaddress is removed
+    bool force = request.strMethod == "getaccountaddress" ? true : false;
     if (!request.params[1].isNull()) {
         force = request.params[1].get_bool();
     }
