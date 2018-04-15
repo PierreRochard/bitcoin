@@ -9,6 +9,7 @@
 #include <hash.h>
 #include <protocol.h>
 #include <utilstrencodings.h>
+#include <wallet/wallet.h>
 #include <wallet/walletutil.h>
 
 #include <stdint.h>
@@ -69,7 +70,7 @@ BerkeleyEnvironment* GetWalletEnv(const fs::path& wallet_path, std::string& data
         // Normal case: Interpret wallet path as a directory path containing
         // data and log files.
         env_directory = wallet_path;
-        database_filename = "wallet.dat";
+        database_filename = DEFAULT_WALLET_NAME;
     }
     LOCK(cs_db);
     // Note: An ununsed temporary BerkeleyEnvironment object may be created inside the
@@ -318,8 +319,7 @@ bool BerkeleyBatch::VerifyEnvironment(const fs::path& file_path, std::string& er
     BerkeleyEnvironment* env = GetWalletEnv(file_path, walletFile);
     fs::path walletDir = env->Directory();
 
-    LogPrintf("Using BerkeleyDB version %s\n", DbEnv::version(0, 0, 0));
-    LogPrintf("Using wallet [%s]\n", walletFile);
+    LogPrintf("[%s] Using BerkeleyDB version %s\n", walletFile, DbEnv::version(0, 0, 0));
 
     // Wallet file must be a plain filename without a directory
     if (walletFile != fs::basename(walletFile) + fs::extension(walletFile))

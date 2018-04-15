@@ -66,6 +66,7 @@ static const unsigned int DEFAULT_TX_CONFIRM_TARGET = 6;
 static const bool DEFAULT_WALLET_RBF = false;
 static const bool DEFAULT_WALLETBROADCAST = true;
 static const bool DEFAULT_DISABLE_WALLET = false;
+static const std::string DEFAULT_WALLET_NAME = "wallet.dat";
 
 static const int64_t TIMESTAMP_MIN = 0;
 
@@ -726,7 +727,7 @@ private:
      * Used in debug logs and to send RPCs to the right wallet instance when
      * more than one wallet is loaded.
      */
-    std::string m_name;
+    std::string m_name = DEFAULT_WALLET_NAME;
 
     /** Internal database handle. */
     std::unique_ptr<WalletDatabase> database;
