@@ -253,7 +253,22 @@ bool WalletInit::Verify()
     // Keep track of each wallet absolute path to detect duplicates.
     std::set<fs::path> wallet_paths;
 
-    for (const std::string& walletFile : gArgs.GetArgs("-wallet")) {
+    const std::vector<std::string> walletFiles = gArgs.GetArgs("-wallet");
+
+    if (walletFiles.size()) {
+        std::string strWalletFiles;
+        for (auto const& walletFile : walletFiles) {
+            strWalletFiles += walletFile;
+            if (walletFile != walletFiles.back()) {
+                strWalletFiles += ", ";
+            }
+        }
+        LogPrintf("Using wallet(s) [%s]\n", strWalletFiles);
+    } else {
+        LogPrintf("Using default wallet\n");
+    }
+
+    for (const std::string& walletFile : walletFiles) {
         // Do some checking on wallet path. It should be either a:
         //
         // 1. Path where a directory can be created.
