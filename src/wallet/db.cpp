@@ -53,10 +53,10 @@ void CheckUniqueFileid(const BerkeleyEnvironment& env, const std::string& filena
 }
 
 CCriticalSection cs_db;
-std::map<std::string, BerkeleyEnvironment> g_dbenvs GUARDED_BY(cs_db); //!< Map from directory name to open db environment.
+std::map<std::string, std::weak_ptr<BerkeleyEnvironment>> g_dbenvs GUARDED_BY(cs_db); //!< Map from directory name to db environment.
 } // namespace
 
-BerkeleyEnvironment* GetWalletEnv(const fs::path& wallet_path, std::string& database_filename)
+std::shared_ptr<BerkeleyEnvironment> GetWalletEnv(const fs::path& wallet_path, std::string& database_filename)
 {
     fs::path env_directory;
     if (fs::is_regular_file(wallet_path)) {
@@ -72,11 +72,14 @@ BerkeleyEnvironment* GetWalletEnv(const fs::path& wallet_path, std::string& data
         database_filename = "wallet.dat";
     }
     LOCK(cs_db);
-    // Note: An unused temporary BerkeleyEnvironment object may be created inside the
-    // emplace function if the key already exists. This is a little inefficient,
-    // but not a big concern since the map will be changed in the future to hold
-    // pointers instead of objects, anyway.
-    return &g_dbenvs.emplace(std::piecewise_construct, std::forward_as_tuple(env_directory.string()), std::forward_as_tuple(env_directory)).first->second;
+    auto inserted = g_dbenvs.emplace(env_directory.string(), std::weak_ptr<BerkeleyEnvironment>());
+    if (inserted.second) {
+        auto env = std::make_shared<BerkeleyEnvironment>(env_directory.string());
+        inserted.first->second = env;
+        return env;
+    } else {
+        return inserted.first->second.lock();
+    }
 }
 
 //
@@ -121,6 +124,7 @@ BerkeleyEnvironment::BerkeleyEnvironment(const fs::path& dir_path) : strPath(dir
 
 BerkeleyEnvironment::~BerkeleyEnvironment()
 {
+    g_dbenvs.erase(strPath);
     Close();
 }
 
@@ -198,10 +202,9 @@ bool BerkeleyEnvironment::Open(bool retry)
     return true;
 }
 
-void BerkeleyEnvironment::MakeMock()
+BerkeleyEnvironment::BerkeleyEnvironment()
 {
-    if (fDbEnvInit)
-        throw std::runtime_error("BerkeleyEnvironment::MakeMock: Already initialized");
+    Reset();
 
     boost::this_thread::interruption_point();
 
@@ -250,7 +253,7 @@ BerkeleyEnvironment::VerifyResult BerkeleyEnvironment::Verify(const std::string&
 bool BerkeleyBatch::Recover(const fs::path& file_path, void *callbackDataIn, bool (*recoverKVcallback)(void* callbackData, CDataStream ssKey, CDataStream ssValue), std::string& newFilename)
 {
     std::string filename;
-    BerkeleyEnvironment* env = GetWalletEnv(file_path, filename);
+    std::shared_ptr<BerkeleyEnvironment> env = GetWalletEnv(file_path, filename);
 
     // Recovery procedure:
     // move wallet file to walletfilename.timestamp.bak
@@ -319,7 +322,7 @@ bool BerkeleyBatch::Recover(const fs::path& file_path, void *callbackDataIn, boo
 bool BerkeleyBatch::VerifyEnvironment(const fs::path& file_path, std::string& errorStr)
 {
     std::string walletFile;
-    BerkeleyEnvironment* env = GetWalletEnv(file_path, walletFile);
+    std::shared_ptr<BerkeleyEnvironment> env = GetWalletEnv(file_path, walletFile);
     fs::path walletDir = env->Directory();
 
     LogPrintf("Using BerkeleyDB version %s\n", DbEnv::version(0, 0, 0));
@@ -343,7 +346,7 @@ bool BerkeleyBatch::VerifyEnvironment(const fs::path& file_path, std::string& er
 bool BerkeleyBatch::VerifyDatabaseFile(const fs::path& file_path, std::string& warningStr, std::string& errorStr, BerkeleyEnvironment::recoverFunc_type recoverFunc)
 {
     std::string walletFile;
-    BerkeleyEnvironment* env = GetWalletEnv(file_path, walletFile);
+    std::shared_ptr<BerkeleyEnvironment> env = GetWalletEnv(file_path, walletFile);
     fs::path walletDir = env->Directory();
 
     if (fs::exists(walletDir / walletFile))
@@ -447,7 +450,7 @@ BerkeleyBatch::BerkeleyBatch(BerkeleyDatabase& database, const char* pszMode, bo
 {
     fReadOnly = (!strchr(pszMode, '+') && !strchr(pszMode, 'w'));
     fFlushOnClose = fFlushOnCloseIn;
-    env = database.env;
+    env = database.env.get();
     if (database.IsDummy()) {
         return;
     }
@@ -504,7 +507,7 @@ BerkeleyBatch::BerkeleyBatch(BerkeleyDatabase& database, const char* pszMode, bo
             // versions of BDB have an set_lk_exclusive method for this
             // purpose, but the older version we use does not.)
             for (const auto& env : g_dbenvs) {
-                CheckUniqueFileid(env.second, strFilename, *pdb_temp);
+                CheckUniqueFileid(*env.second.lock().get(), strFilename, *pdb_temp);
             }
 
             pdb = pdb_temp.release();
@@ -577,7 +580,7 @@ bool BerkeleyBatch::Rewrite(BerkeleyDatabase& database, const char* pszSkip)
     if (database.IsDummy()) {
         return true;
     }
-    BerkeleyEnvironment *env = database.env;
+    BerkeleyEnvironment *env = database.env.get();
     const std::string& strFile = database.strFile;
     while (true) {
         {
@@ -709,7 +712,7 @@ bool BerkeleyBatch::PeriodicFlush(BerkeleyDatabase& database)
         return true;
     }
     bool ret = false;
-    BerkeleyEnvironment *env = database.env;
+    BerkeleyEnvironment *env = database.env.get();
     const std::string& strFile = database.strFile;
     TRY_LOCK(cs_db, lockDb);
     if (lockDb)

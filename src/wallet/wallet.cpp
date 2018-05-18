@@ -3844,6 +3844,9 @@ bool CWallet::Verify(std::string wallet_file, bool salvage_wallet, std::string& 
         }
     }
 
+    // Keep same database environment instance across Verify/Recover calls below.
+    std::unique_ptr<WalletDatabase> database = WalletDatabase::Create(wallet_path);
+
     try {
         if (!WalletBatch::VerifyEnvironment(wallet_path, error_string)) {
             return false;
