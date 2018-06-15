@@ -560,7 +560,7 @@ UniValue importwallet(const JSONRPCRequest& request)
 
         // Use uiInterface.ShowProgress instead of pwallet.ShowProgress because pwallet.ShowProgress has a cancel button tied to AbortRescan which
         // we don't want for this progress bar showing the import progress. uiInterface.ShowProgress does not have a cancel button.
-        uiInterface.ShowProgress(_("Importing..."), 0, false); // show progress dialog in GUI
+        uiInterface.ShowProgress(strprintf(_("[%s] Importing..."), pwallet->GetName()), 0, false); // show progress dialog in GUI
         while (file.good()) {
             uiInterface.ShowProgress("", std::max(1, std::min(99, (int)(((double)file.tellg() / (double)nFilesize) * 100))), false);
             std::string line;
@@ -578,7 +578,7 @@ UniValue importwallet(const JSONRPCRequest& request)
                 assert(key.VerifyPubKey(pubkey));
                 CKeyID keyid = pubkey.GetID();
                 if (pwallet->HaveKey(keyid)) {
-                    LogPrintf("Skipping import of %s (key already present)\n", EncodeDestination(keyid));
+                    LogPrintf("[%s] Skipping import of %s (key already present)\n", pwallet->GetName(), EncodeDestination(keyid));
                     continue;
                 }
                 int64_t nTime = DecodeDumpTime(vstr[1]);
@@ -596,7 +596,7 @@ UniValue importwallet(const JSONRPCRequest& request)
                         fLabel = true;
                     }
                 }
-                LogPrintf("Importing %s...\n", EncodeDestination(keyid));
+                LogPrintf("[%s] Importing %s...\n", pwallet->GetName(), EncodeDestination(keyid));
                 if (!pwallet->AddKeyPubKey(key, pubkey)) {
                     fGood = false;
                     continue;
@@ -610,11 +610,11 @@ UniValue importwallet(const JSONRPCRequest& request)
                CScript script = CScript(vData.begin(), vData.end());
                CScriptID id(script);
                if (pwallet->HaveCScript(id)) {
-                   LogPrintf("Skipping import of %s (script already present)\n", vstr[0]);
+                   LogPrintf("[%s] Skipping import of %s (script already present)\n", pwallet->GetName(), vstr[0]);
                    continue;
                }
                if(!pwallet->AddCScript(script)) {
-                   LogPrintf("Error importing script %s\n", vstr[0]);
+                   LogPrintf("[%s] Error importing script %s\n", pwallet->GetName(), vstr[0]);
                    fGood = false;
                    continue;
                }
