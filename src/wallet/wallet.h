@@ -1185,6 +1185,15 @@ public:
 
     /** Whether a given output is spendable by this wallet */
     bool OutputEligibleForSpending(const COutput& output, const CoinEligibilityFilter& eligibility_filter) const;
+    
+    const std::string GetDisplayName() const {
+        return "[" + (GetName().length() == 0 ? "default wallet" : GetName()) + "]";
+    };
+
+    template<typename... Params>
+    void WalletLogPrintf(std::string fmt, Params... parameters) const {
+        LogPrintf((GetDisplayName() + " " + fmt).c_str(), parameters...);
+    };
 };
 
 /** A key allocated from the key pool. */
