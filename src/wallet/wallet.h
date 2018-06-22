@@ -1202,6 +1202,11 @@ public:
 
     /** Whether a given output is spendable by this wallet */
     bool OutputEligibleForSpending(const COutput& output, const CoinEligibilityFilter& eligibility_filter) const;
+
+    template<typename... Params>
+    void WalletLogPrintf(std::string fmt, Params... parameters) const {
+        LogPrintf(("[" + GetName() + "] " + fmt).c_str(), parameters...);
+    };
 };
 
 /** A key allocated from the key pool. */
