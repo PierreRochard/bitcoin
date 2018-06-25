@@ -214,7 +214,6 @@ public Q_SLOTS:
     /// Handle runaway exceptions. Shows a message box with the problem and quits the program.
     void handleRunawayException(const QString &message);
     void addWallet(WalletModel* walletModel);
-    void removeWallet();
 
 Q_SIGNALS:
     void requestedInitialize();
@@ -444,19 +443,14 @@ void BitcoinApplication::addWallet(WalletModel* walletModel)
 
     connect(walletModel, SIGNAL(coinsSent(WalletModel*, SendCoinsRecipient, QByteArray)),
         paymentServer, SLOT(fetchPaymentACK(WalletModel*, const SendCoinsRecipient&, QByteArray)));
-    connect(walletModel, SIGNAL(unload()), this, SLOT(removeWallet()));
+
+    connect(walletModel, &WalletModel::unload, [=]() {
+        m_wallet_models.erase(std::find(m_wallet_models.begin(), m_wallet_models.end(), walletModel));
+        window->removeWallet(walletModel);
+        walletModel->deleteLater();
+    });
 
     m_wallet_models.push_back(walletModel);
-#endif
-}
-
-void BitcoinApplication::removeWallet()
-{
-#ifdef ENABLE_WALLET
-    WalletModel* walletModel = static_cast<WalletModel*>(sender());
-    m_wallet_models.erase(std::find(m_wallet_models.begin(), m_wallet_models.end(), walletModel));
-    window->removeWallet(walletModel);
-    walletModel->deleteLater();
 #endif
 }
 
