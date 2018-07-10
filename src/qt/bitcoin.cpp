@@ -437,10 +437,6 @@ void BitcoinApplication::addWallet(WalletModel* walletModel)
 #ifdef ENABLE_WALLET
     window->addWallet(walletModel);
 
-    if (m_wallet_models.empty()) {
-        window->setCurrentWallet(walletModel->getWalletName());
-    }
-
     connect(walletModel, SIGNAL(coinsSent(WalletModel*, SendCoinsRecipient, QByteArray)),
         paymentServer, SLOT(fetchPaymentACK(WalletModel*, const SendCoinsRecipient&, QByteArray)));
 

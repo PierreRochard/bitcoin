@@ -123,6 +123,9 @@ private:
     QAction* openRPCConsoleAction = nullptr;
     QAction* openAction = nullptr;
     QAction* showHelpMessageAction = nullptr;
+    QAction* m_new_wallet_action = nullptr;
+    QAction* m_open_wallet_action = nullptr;
+    QAction* m_close_wallet_action = nullptr;
     QAction* m_wallet_selector_label_action = nullptr;
     QAction* m_wallet_selector_action = nullptr;
 
@@ -236,6 +239,12 @@ private Q_SLOTS:
 
     /** Show open dialog */
     void openClicked();
+    /** New wallet dialog */
+    void newWallet();
+    /** Show open wallet dialog */
+    void openWallet();
+    /** Close current wallet */
+    void closeWallet();
 #endif // ENABLE_WALLET
     /** Show configuration dialog */
     void optionsClicked();
