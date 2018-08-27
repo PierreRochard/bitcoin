@@ -35,8 +35,13 @@ private:
     std::string strPath;
 
 public:
+    //! A Berkeley DB environment is an encapsulation of one or more databases, log files, and region files
     std::unique_ptr<DbEnv> dbenv;
+
+    //! Map from database file name to how many BerkeleyBatch objects are currently accessing it
     std::map<std::string, int> mapFileUseCount;
+
+    //! Map from database file name to Db, the handle for a Berkeley DB database
     std::map<std::string, Db*> mapDb;
 
     BerkeleyEnvironment(const fs::path& env_directory);
