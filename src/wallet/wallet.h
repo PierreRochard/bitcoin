@@ -1208,6 +1208,8 @@ public:
         LogPrintf(("%s " + fmt).c_str(), GetDisplayName(), parameters...);
     };
 
+    void ReloadDbEnv();
+
 };
 
 /** A key allocated from the key pool. */

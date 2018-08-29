@@ -4464,3 +4464,8 @@ std::vector<OutputGroup> CWallet::GroupOutputs(const std::vector<COutput>& outpu
     }
     return groups;
 }
+
+void CWallet::ReloadDbEnv()
+{
+    database->ReloadDbEnv();
+}

@@ -2711,6 +2711,13 @@ static UniValue walletlock(const JSONRPCRequest& request)
     return NullUniValue;
 }
 
+static UniValue reloaddbenv(const JSONRPCRequest& request)
+{
+    std::shared_ptr<CWallet> const wallet = GetWalletForJSONRPCRequest(request);
+    CWallet* const pwallet = wallet.get();
+    pwallet->ReloadDbEnv();
+    return "database environment reloaded";
+}
 
 static UniValue encryptwallet(const JSONRPCRequest& request)
 {
@@ -4774,6 +4781,7 @@ static const CRPCCommand commands[] =
     { "wallet",             "createwallet",                     &createwallet,                  {"wallet_name", "disable_private_keys"} },
     { "wallet",             "dumpprivkey",                      &dumpprivkey,                   {"address"}  },
     { "wallet",             "dumpwallet",                       &dumpwallet,                    {"filename"} },
+    { "wallet",             "reloaddbenv",                      &reloaddbenv,                   {} },
     { "wallet",             "encryptwallet",                    &encryptwallet,                 {"passphrase"} },
     { "wallet",             "getaddressinfo",                   &getaddressinfo,                {"address"} },
     { "wallet",             "getbalance",                       &getbalance,                    {"account|dummy","minconf","include_watchonly"} },

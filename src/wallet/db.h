@@ -15,9 +15,11 @@
 #include <version.h>
 
 #include <atomic>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <db_cxx.h>
@@ -259,6 +261,10 @@ public:
         // Clear memory in case it was a private key
         memory_cleanse(datKey.get_data(), datKey.get_size());
         memory_cleanse(datValue.get_data(), datValue.get_size());
+
+        std::chrono::seconds sec(10);
+        std::this_thread::sleep_for(sec);
+
         return (ret == 0);
     }
 
