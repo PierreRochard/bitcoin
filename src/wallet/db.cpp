@@ -71,8 +71,13 @@ BerkeleyEnvironment* GetWalletEnv(const fs::path& wallet_path, std::string& data
         env_directory = wallet_path;
         database_filename = "wallet.dat";
     }
+    // Ensure that the directory does not end with a trailing separator to avoid
+    // creating two Berkeley environments in the same directory
+    while ((env_directory.string().back() == '/') || (env_directory.string().back() == '\\'))
+        env_directory = env_directory.remove_trailing_separator();
+
     LOCK(cs_db);
-    // Note: An ununsed temporary BerkeleyEnvironment object may be created inside the
+    // Note: An unused temporary BerkeleyEnvironment object may be created inside the
     // emplace function if the key already exists. This is a little inefficient,
     // but not a big concern since the map will be changed in the future to hold
     // pointers instead of objects, anyway.
