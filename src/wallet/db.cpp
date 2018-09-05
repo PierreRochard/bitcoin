@@ -56,6 +56,12 @@ CCriticalSection cs_db;
 std::map<std::string, BerkeleyEnvironment> g_dbenvs GUARDED_BY(cs_db); //!< Map from directory name to open db environment.
 } // namespace
 
+/**
+ * @param[in] wallet_path Either the path for a wallet file or for a directory containing one or more wallet files.
+ * @param[out] database_filename Assigned to the wallet file name, defaults to wallet.dat if wallet_path is a directory.
+ * @return A pointer to the BerkeleyEnvironment instance, which is in g_dbenvs mapped to its directory path.
+ * @post A new BerkeleyEnvironment instance is inserted into g_dbenvs if the directory path key was not already in the map.
+ */
 BerkeleyEnvironment* GetWalletEnv(const fs::path& wallet_path, std::string& database_filename)
 {
     fs::path env_directory;
