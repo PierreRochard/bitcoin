@@ -23,5 +23,11 @@ fs::path GetWalletDir()
         }
     }
 
+    // Ensure that the directory does not end with a trailing separator to avoid
+    // creating two Berkeley environments in the same directory
+    while (fs::detail::is_directory_separator(path.string().back())) {
+        path.remove_trailing_separator();
+    }
+
     return path;
 }
