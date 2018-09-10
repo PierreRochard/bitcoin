@@ -8,7 +8,7 @@
 
 #include <wallet/test/init_test_fixture.h>
 
-InitTestingSetup::InitTestingSetup(const std::string& chainName): BasicTestingSetup(chainName)
+InitWalletDirTestingSetup::InitWalletDirTestingSetup(const std::string& chainName): BasicTestingSetup(chainName)
 {
     std::string sep;
     sep += fs::path::preferred_separator;
@@ -21,8 +21,8 @@ InitTestingSetup::InitTestingSetup(const std::string& chainName): BasicTestingSe
     m_walletdir_path_cases["nonexistent"] = m_datadir / "path_does_not_exist";
     m_walletdir_path_cases["file"] = m_datadir / "not_a_directory.dat";
     m_walletdir_path_cases["relative"] = "wallets";
-    m_walletdir_path_cases["trailing"] = m_datadir / sep;
-    m_walletdir_path_cases["trailing2"] = m_datadir / sep / sep;
+    m_walletdir_path_cases["trailing"] = m_datadir / "wallets" / sep;
+    m_walletdir_path_cases["trailing2"] = m_datadir / "wallets" / sep / sep;
 
 
     fs::create_directories(m_walletdir_path_cases["default"]);
@@ -30,14 +30,14 @@ InitTestingSetup::InitTestingSetup(const std::string& chainName): BasicTestingSe
     fs::create_directories(m_walletdir_path_cases["relative"]);
     std::ofstream f(m_walletdir_path_cases["file"].BOOST_FILESYSTEM_C_STR);
     if (!f) {
-        throw fs::filesystem_error("InitTestingSetup fixture constructor",
+        throw fs::filesystem_error("InitWalletDirTestingSetup fixture constructor",
                                    m_walletdir_path_cases["file"],
                                    boost::system::error_code(errno, boost::system::system_category()));
     }
 
 }
 
-void InitTestingSetup::SetWalletDir(const fs::path& walletdir_path)
+void InitWalletDirTestingSetup::SetWalletDir(const fs::path& walletdir_path)
 {
     gArgs.ForceSetArg("-walletdir", walletdir_path.string());
 }

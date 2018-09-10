@@ -8,8 +8,8 @@
 #include <test/test_bitcoin.h>
 
 
-struct InitTestingSetup: public BasicTestingSetup {
-    explicit InitTestingSetup(const std::string& chainName = CBaseChainParams::MAIN);
+struct InitWalletDirTestingSetup: public BasicTestingSetup {
+    explicit InitWalletDirTestingSetup(const std::string& chainName = CBaseChainParams::MAIN);
     void SetWalletDir(const fs::path& walletdir_path);
 
     fs::path m_datadir;
