@@ -10,9 +10,11 @@
 
 struct InitWalletDirTestingSetup: public BasicTestingSetup {
     explicit InitWalletDirTestingSetup(const std::string& chainName = CBaseChainParams::MAIN);
+    ~InitWalletDirTestingSetup();
     void SetWalletDir(const fs::path& walletdir_path);
 
     fs::path m_datadir;
+    fs::path m_cwd;
     std::map<std::string, fs::path> m_walletdir_path_cases;
 };
 
