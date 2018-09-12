@@ -26,6 +26,7 @@ InitWalletDirTestingSetup::InitWalletDirTestingSetup(const std::string& chainNam
     fs::create_directories(m_walletdir_path_cases["custom"]);
     fs::create_directories(m_walletdir_path_cases["relative"]);
     std::ofstream f(m_walletdir_path_cases["file"].BOOST_FILESYSTEM_C_STR);
+    f.close();
 }
 
 void InitWalletDirTestingSetup::SetWalletDir(const fs::path& walletdir_path)
