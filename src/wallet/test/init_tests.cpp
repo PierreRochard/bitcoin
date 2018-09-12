@@ -7,8 +7,9 @@
 #include <test/test_bitcoin.h>
 #include <wallet/test/init_test_fixture.h>
 
+#include <init.h>
+#include <walletinitinterface.h>
 #include <wallet/wallet.h>
-#include <wallet/init.cpp>
 
 
 BOOST_FIXTURE_TEST_SUITE(init_walletdir_tests, InitWalletDirTestingSetup)
