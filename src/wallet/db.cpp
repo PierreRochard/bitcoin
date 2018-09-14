@@ -56,6 +56,13 @@ CCriticalSection cs_db;
 std::map<std::string, std::weak_ptr<BerkeleyEnvironment>> g_dbenvs GUARDED_BY(cs_db); //!< Map from directory name to db environment.
 } // namespace
 
+/**
+ * @param[in] wallet_path Either the path for a wallet file or for a directory containing one or more wallet files.
+ * @param[out] database_filename Assigned to the wallet file name, defaults to wallet.dat if wallet_path is a directory.
+ * @return A shared pointer to the BerkeleyEnvironment object, never empty because ~BerkeleyEnvironment
+ * erases the weak pointer from the g_dbenvs map.
+ * @post A new BerkeleyEnvironment weak pointer is inserted into g_dbenvs if the directory path key was not already in the map.
+ */
 std::shared_ptr<BerkeleyEnvironment> GetWalletEnv(const fs::path& wallet_path, std::string& database_filename)
 {
     fs::path env_directory;
@@ -202,6 +209,7 @@ bool BerkeleyEnvironment::Open(bool retry)
     return true;
 }
 
+//! Construct an in-memory mock Berkeley environment for testing and as a place-holder for g_dbenvs emplace
 BerkeleyEnvironment::BerkeleyEnvironment()
 {
     Reset();
