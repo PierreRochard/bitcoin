@@ -33,6 +33,13 @@ struct CCoinsStats
 
     //! The number of coins contained.
     uint64_t coins_count{0};
+
+    // Following values are only available from coinstats index
+    CAmount total_unspendable_amount{0};
+    CAmount block_unspendable_amount{0};
+    CAmount block_prevout_spent_amount{0};
+    CAmount block_new_outputs_ex_coinbase_amount{0};
+    CAmount block_coinbase_amount{0};
 };
 
 //! Calculate statistics about the unspent transaction output set
