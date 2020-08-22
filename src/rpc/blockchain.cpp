@@ -1008,6 +1008,7 @@ static UniValue gettxoutsetinfo(const JSONRPCRequest& request)
                 {
                     {"hash_type", RPCArg::Type::STR, /* default */ "hash_serialized_2", "Which UTXO set hash should be calculated. Options: 'hash_serialized_2' (the legacy algorithm), 'none'."},
                     {"hash_or_height", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "The block hash or height of the target height (only available with coinstatsindex)", "", {"", "string or numeric"}},
+                    {"verbose", RPCArg::Type::BOOL, /* default */ "false", "Results include total_unspendable_amount and block-specific amounts (only available with coinstatsindex)"},
                 },
                 RPCResult{
                     RPCResult::Type::OBJ, "", "",
@@ -1019,16 +1020,26 @@ static UniValue gettxoutsetinfo(const JSONRPCRequest& request)
                         {RPCResult::Type::STR_HEX, "hash_serialized_2", "The serialized hash (only present if 'hash_serialized_2' hash_type is chosen)"},
                         {RPCResult::Type::NUM, "disk_size", "The estimated size of the chainstate on disk"},
                         {RPCResult::Type::STR_AMOUNT, "total_amount", "The total amount of coins in the UTXO set"},
+                        {RPCResult::Type::STR_AMOUNT, "total_unspendable_amount", "The total amount of coins excluded from the UTXO set (only with verbose = true)"},
+                        {RPCResult::Type::OBJ, "block_info", "Info on amounts in the block at this block height (only with verbose = true)",
+                        {
+                            {RPCResult::Type::STR_AMOUNT, "unspendable_amount", ""},
+                            {RPCResult::Type::STR_AMOUNT, "total_prevout_spent_amount", ""},
+                            {RPCResult::Type::STR_AMOUNT, "total_new_outputs_ex_coinbase_amount", ""},
+                            {RPCResult::Type::STR_AMOUNT, "coinbase_amount", ""},
+                        }},
                     }},
                 RPCExamples{
                     HelpExampleCli("gettxoutsetinfo", "") +
                     HelpExampleCli("gettxoutsetinfo", R"("none")") +
                     HelpExampleCli("gettxoutsetinfo", R"("none" 1000)") +
                     HelpExampleCli("gettxoutsetinfo", R"("none" "00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09")") +
+                    HelpExampleCli("gettxoutsetinfo", R"("none" 1000 true)") +
                     HelpExampleRpc("gettxoutsetinfo", "") +
                     HelpExampleRpc("gettxoutsetinfo", R"("none")") +
                     HelpExampleRpc("gettxoutsetinfo", R"("none", 1000)") +
-                    HelpExampleRpc("gettxoutsetinfo", R"("none", "00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09")")
+                    HelpExampleRpc("gettxoutsetinfo", R"("none", "00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09")") +
+                    HelpExampleRpc("gettxoutsetinfo", R"("none", 1000, true)")
                 },
             }.Check(request);
 
@@ -1037,6 +1048,7 @@ static UniValue gettxoutsetinfo(const JSONRPCRequest& request)
     CCoinsStats stats;
     ::ChainstateActive().ForceFlushStateToDisk();
     CBlockIndex* pindex{nullptr};
+    bool verbose{false};
 
     const CoinStatsHashType hash_type = ParseHashType(request.params[0], CoinStatsHashType::HASH_SERIALIZED);
 
@@ -1046,6 +1058,10 @@ static UniValue gettxoutsetinfo(const JSONRPCRequest& request)
         }
 
         pindex = ParseHashOrHeight(request.params[1]);
+
+        if (!request.params[2].isNull()) {
+            verbose = request.params[2].get_bool();
+        }
     }
 
     CCoinsView* coins_view = WITH_LOCK(cs_main, return &ChainstateActive().CoinsDB());
@@ -1060,6 +1076,15 @@ static UniValue gettxoutsetinfo(const JSONRPCRequest& request)
         }
         ret.pushKV("disk_size", stats.nDiskSize);
         ret.pushKV("total_amount", ValueFromAmount(stats.nTotalAmount));
+        if (verbose) {
+            ret.pushKV("total_unspendable_amount", ValueFromAmount(stats.total_unspendable_amount));
+            UniValue block_info(UniValue::VOBJ);
+            block_info.pushKV("unspendable_amount", ValueFromAmount(stats.block_unspendable_amount));
+            block_info.pushKV("total_prevout_spent_amount", ValueFromAmount(stats.block_prevout_spent_amount));
+            block_info.pushKV("total_new_outputs_ex_coinbase_amount", ValueFromAmount(stats.block_new_outputs_ex_coinbase_amount));
+            block_info.pushKV("coinbase_amount", ValueFromAmount(stats.block_coinbase_amount));
+            ret.pushKV("block_info", block_info);
+        }
     } else {
         throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to read UTXO set");
     }
@@ -2410,7 +2435,7 @@ static const CRPCCommand commands[] =
     { "blockchain",         "getmempoolinfo",         &getmempoolinfo,         {} },
     { "blockchain",         "getrawmempool",          &getrawmempool,          {"verbose"} },
     { "blockchain",         "gettxout",               &gettxout,               {"txid","n","include_mempool"} },
-    { "blockchain",         "gettxoutsetinfo",        &gettxoutsetinfo,        {"hash_type", "hash_or_height"} },
+    { "blockchain",         "gettxoutsetinfo",        &gettxoutsetinfo,        {"hash_type", "hash_or_height", "verbose"} },
     { "blockchain",         "pruneblockchain",        &pruneblockchain,        {"height"} },
     { "blockchain",         "savemempool",            &savemempool,            {} },
     { "blockchain",         "verifychain",            &verifychain,            {"checklevel","nblocks"} },
