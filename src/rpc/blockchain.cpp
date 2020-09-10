@@ -30,6 +30,7 @@
 #include <txdb.h>
 #include <txmempool.h>
 #include <undo.h>
+#include <util/moneystr.h>
 #include <util/ref.h>
 #include <util/strencodings.h>
 #include <util/system.h>
@@ -998,6 +999,75 @@ static UniValue pruneblockchain(const JSONRPCRequest& request)
         block = block->pprev;
     }
     return uint64_t(block->nHeight);
+}
+
+static UniValue dumpcoinstats(const JSONRPCRequest& request)
+{
+    RPCHelpMan{"dumpcoinstats",
+        "\nDumps content of coinstats index to a CSV file.\n",
+        {
+            {"filename", RPCArg::Type::STR, RPCArg::Optional::NO, "The filename with path (absolute path recommended)"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR, "filename", "The filename with full absolute path"},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("dumpcoinstats", "\"test\"") +
+            HelpExampleRpc("dumpcoinstats", "\"test\"")
+        },
+    }.Check(request);
+
+    fs::path filepath = request.params[0].get_str();
+    filepath = fs::absolute(filepath);
+
+    if (fs::exists(filepath)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, filepath.string() + " already exists. If you are sure this is what you want, move it out of the way first");
+    }
+
+    fsbridge::ofstream file;
+    file.open(filepath);
+    if (!file.is_open())
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Cannot open dump file");
+
+    if (!g_coin_stats_index) {
+        throw JSONRPCError(RPC_MISC_ERROR, "Coinstats index is not enabled");
+    }
+
+    file << strprintf("height,bestblock,txouts,bogosize,disk_size,total_amount,total_unspendable_amount,unspendable_amount,total_prevout_spent_amount,total_new_outputs_ex_coinbase_amount,coinbase_amount\n");
+
+    CCoinsStats stats;
+    CCoinsView* coins_view = WITH_LOCK(cs_main, return &ChainstateActive().CoinsDB());
+    CBlockIndex *pindex = ::ChainActive().Genesis();
+    NodeContext& node = EnsureNodeContext(request.context);
+
+    for (; pindex; pindex = ::ChainActive().Next(pindex)) {
+        if (!GetUTXOStats(coins_view, stats, CoinStatsHashType::NONE, node.rpc_interruption_point, pindex))
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to read UTXO set");
+
+        file << strprintf("%d,", (int64_t)stats.nHeight);
+        file << strprintf("%s,", stats.hashBlock.GetHex());
+        file << strprintf("%d,", (int64_t)stats.nTransactionOutputs);
+        file << strprintf("%d,", (int64_t)stats.nBogoSize);
+        file << strprintf("%d,", stats.nDiskSize);
+        file << strprintf("%s,", FormatMoney(stats.nTotalAmount));
+        file << strprintf("%s,", FormatMoney(stats.total_unspendable_amount));
+        file << strprintf("%s,", FormatMoney(stats.block_unspendable_amount));
+        file << strprintf("%s,", FormatMoney(stats.block_prevout_spent_amount));
+        file << strprintf("%s,", FormatMoney(stats.block_new_outputs_ex_coinbase_amount));
+        file << strprintf("%s\n", FormatMoney(stats.block_coinbase_amount));
+
+        if (pindex->nHeight >= ::ChainActive().Tip()->nHeight) break;
+    }
+
+    file.close();
+
+    UniValue response(UniValue::VOBJ);
+    response.pushKV("filename", filepath.string());
+
+    return response;
 }
 
 static UniValue gettxoutsetinfo(const JSONRPCRequest& request)
@@ -2436,6 +2506,7 @@ static const CRPCCommand commands[] =
     { "blockchain",         "getrawmempool",          &getrawmempool,          {"verbose"} },
     { "blockchain",         "gettxout",               &gettxout,               {"txid","n","include_mempool"} },
     { "blockchain",         "gettxoutsetinfo",        &gettxoutsetinfo,        {"hash_type", "hash_or_height", "verbose"} },
+    { "blockchain",         "dumpcoinstats",          &dumpcoinstats,          {"filename"} },
     { "blockchain",         "pruneblockchain",        &pruneblockchain,        {"height"} },
     { "blockchain",         "savemempool",            &savemempool,            {} },
     { "blockchain",         "verifychain",            &verifychain,            {"checklevel","nblocks"} },
