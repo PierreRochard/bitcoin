@@ -288,6 +288,8 @@ class WalletCreateMultisigDescriptorTest(BitcoinTestFramework):
         raw = sent.get("hex") or wallet.gettransaction(sent["txid"])["hex"]
         witness = self.nodes[0].decoderawtransaction(raw)["vin"][0]["txinwitness"]
         assert_equal(len(witness), 1)
+        # Full m-of-n computer-key vault matrix (recovery, split wallets, BIP68)
+        # lives in wallet_taproot_vault_local.py.
 
     def test_internal_and_account(self):
         self.log.info("Test internal and account options")
