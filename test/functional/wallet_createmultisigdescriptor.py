@@ -47,6 +47,7 @@ class WalletCreateMultisigDescriptorTest(BitcoinTestFramework):
         self.test_address_types()
         self.test_taproot_musig2()
         self.test_taproot_sortedmulti_a()
+        self.test_taproot_delayed_fallback()
         self.test_internal_and_account()
         self.test_multiple_hdkeys_require_explicit()
         self.test_encrypted()
@@ -258,6 +259,35 @@ class WalletCreateMultisigDescriptorTest(BitcoinTestFramework):
         self.generate(self.nodes[0], 1)
         sent = wallet.send(outputs={funding.getnewaddress(): 1}, options={"change_type": "bech32m"})
         assert sent["complete"]
+
+    def test_taproot_delayed_fallback(self):
+        self.log.info("Test bech32m MuSig2 key-path with older() m-of-n fallback")
+        funding = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
+        wallet = self._blank("type_bech32m_vault")
+        x1, x2, x3 = wallet.addhdkey()["xpub"], wallet.addhdkey()["xpub"], wallet.addhdkey()["xpub"]
+        assert_raises_rpc_error(
+            -8, "fallback_older is only valid with type bech32m",
+            wallet.createmultisigdescriptor, 2, self._keys([x1, x2], path=BIP48_BECH32),
+            {"type": "bech32", "fallback_older": 1},
+        )
+        res = wallet.createmultisigdescriptor(
+            2, self._keys([x1, x2, x3], path=BIP48_BECH32M),
+            {"type": "bech32m", "fallback_older": 1},
+        )
+        assert_equal(res["fallback_older"], 1)
+        desc = res["descs"][0]
+        assert "tr(musig(" in desc
+        assert "multi_a(2," in desc
+        assert "older(1)" in desc
+        addr = wallet.getnewaddress("", "bech32m")
+        assert addr.startswith("bcrt1p")
+        funding.sendtoaddress(addr, 4)
+        self.generate(self.nodes[0], 1)
+        sent = wallet.send(outputs={funding.getnewaddress(): 1}, options={"change_type": "bech32m"})
+        assert sent["complete"]
+        raw = sent.get("hex") or wallet.gettransaction(sent["txid"])["hex"]
+        witness = self.nodes[0].decoderawtransaction(raw)["vin"][0]["txinwitness"]
+        assert_equal(len(witness), 1)
 
     def test_internal_and_account(self):
         self.log.info("Test internal and account options")

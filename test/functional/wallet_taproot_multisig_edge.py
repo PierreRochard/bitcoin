@@ -93,6 +93,7 @@ class WalletTaprootMultisigEdgeTest(BitcoinTestFramework):
         self.test_concurrent_sessions()
         self.test_protocol_failures()
         self.test_large_sortedmulti_a()
+        self.test_delayed_fallback_spend()
 
     def _blank(self, name):
         self.nodes[0].createwallet(wallet_name=name, blank=True)
@@ -299,6 +300,51 @@ class WalletTaprootMultisigEdgeTest(BitcoinTestFramework):
         raw = sent.get("hex") or wallet.gettransaction(sent["txid"])["hex"]
         witness = self.nodes[0].decoderawtransaction(raw)["vin"][0]["txinwitness"]
         assert_greater_than(len(witness), 1)
+
+    def test_delayed_fallback_spend(self):
+        self.log.info("MuSig2 key-path plus older(1) 2-of-3 recovery with a missing key")
+        pat = "tr(musig($0/<0;1>/*,$1/<0;1>/*,$2/<0;1>/*),and_v(v:older(1),multi_a(2,$0/<0;1>/*,$1/<0;1>/*,$2/<0;1>/*)))"
+        full, keys = self._one_wallet_keys(3)
+        assert_equal(full.importdescriptors([{"desc": self._subst(pat, keys), "timestamp": "now", "active": True}])[0]["success"], True)
+        addr = full.getnewaddress("", "bech32m")
+        self.def_wallet.sendtoaddress(addr, 4)
+        self.generate(self.nodes[0], 1)
+        sent = full.send(outputs={self.def_wallet.getnewaddress(): 1}, options={"change_type": "bech32m"})
+        assert sent["complete"]
+        raw = sent.get("hex") or full.gettransaction(sent["txid"])["hex"]
+        assert_equal(len(self.nodes[0].decoderawtransaction(raw)["vin"][0]["txinwitness"]), 1)
+
+        rec = self._blank(f"recover_{self.n}")
+        self.n += 1
+        desc_rec = self._subst(pat, keys, priv_mask={1, 2})
+        assert_equal(rec.importdescriptors([{"desc": desc_rec, "timestamp": "now", "active": True}])[0]["success"], True)
+        addr2 = rec.getnewaddress("", "bech32m")
+        self.def_wallet.sendtoaddress(addr2, 4)
+        self.generate(self.nodes[0], 1)
+        utxo = rec.listunspent()[0]
+        dest = self.def_wallet.getnewaddress()
+        too_soon = rec.walletcreatefundedpsbt(
+            [{"txid": utxo["txid"], "vout": utxo["vout"], "sequence": 0xFFFFFFFE}],
+            [{dest: 1}],
+            0,
+            {"change_type": "bech32m", "replaceable": False},
+        )["psbt"]
+        proc = rec.walletprocesspsbt(psbt=too_soon)
+        assert_equal(proc["complete"], False)
+
+        self.generate(self.nodes[0], 1)
+        ready = rec.walletcreatefundedpsbt(
+            [{"txid": utxo["txid"], "vout": utxo["vout"], "sequence": 1}],
+            [{dest: 1}],
+            0,
+            {"change_type": "bech32m", "replaceable": False},
+        )["psbt"]
+        proc = rec.walletprocesspsbt(psbt=ready)
+        assert proc["complete"]
+        witness = self.nodes[0].decoderawtransaction(proc["hex"])["vin"][0]["txinwitness"]
+        assert_greater_than(len(witness), 1)
+        self.nodes[0].sendrawtransaction(proc["hex"])
+        self.generate(self.nodes[0], 1)
 
 
 if __name__ == "__main__":

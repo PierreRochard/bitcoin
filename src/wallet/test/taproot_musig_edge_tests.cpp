@@ -557,6 +557,26 @@ BOOST_AUTO_TEST_CASE(large_sortedmulti_a_padding)
     CheckComplete(RunEdge(pat, {.parts = {Part::Hardware}}), /*scriptpath=*/true);
 }
 
+BOOST_AUTO_TEST_CASE(delayed_musig_fallback_older)
+{
+    const char* pat =
+        "tr(musig($0/<0;1>/*,$1/<0;1>/*,$2/<0;1>/*),and_v(v:older(1),multi_a(2,$0/<0;1>/*,$1/<0;1>/*,$2/<0;1>/*)))";
+
+    CheckComplete(RunEdge(pat, {.parts = Locals(3)}), /*scriptpath=*/false);
+    CheckComplete(RunEdge(pat, {.parts = MixedHwLast(3)}), /*scriptpath=*/false);
+    CheckComplete(RunEdge(pat, {.parts = AllHw(3)}), /*scriptpath=*/false);
+
+    // One key missing: key-path cannot finish; older(1) + two keys can.
+    CheckComplete(RunEdge(pat, {.parts = {Part::Watch, Part::Local, Part::Local}, .sequence = 1}),
+                  /*scriptpath=*/true);
+    CheckComplete(RunEdge(pat, {.parts = {Part::Watch, Part::Local, Part::Hardware}, .sequence = 1}),
+                  /*scriptpath=*/true);
+
+    CheckIncomplete(RunEdge(pat, {.parts = {Part::Watch, Part::Local, Part::Local},
+                                  .sequence = CTxIn::SEQUENCE_FINAL}));
+    CheckIncomplete(RunEdge(pat, {.parts = {Part::Watch, Part::Watch, Part::Local}, .sequence = 1}));
+}
+
 BOOST_AUTO_TEST_CASE(max_pubkeys_sortedmulti_a_parse)
 {
     std::string desc = "tr(" + HexStr(XOnlyPubKey::NUMS_H) + ",sortedmulti_a(1";
