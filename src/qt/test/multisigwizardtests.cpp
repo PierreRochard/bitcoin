@@ -4,12 +4,25 @@
 
 #include <qt/test/multisigwizardtests.h>
 
+#include <addresstype.h>
+#include <common/args.h>
+#include <hwi/mock.h>
 #include <interfaces/node.h>
+#include <interfaces/wallet.h>
+#include <key_io.h>
 #include <outputtype.h>
+#include <qt/clientmodel.h>
 #include <qt/multisigwizard.h>
+#include <qt/optionsmodel.h>
+#include <qt/platformstyle.h>
 #include <qt/test/util.h>
+#include <qt/walletcontroller.h>
+#include <qt/walletmodel.h>
 #include <test/util/setup_common.h>
 #include <util/chaintype.h>
+#include <util/check.h>
+#include <util/result.h>
+#include <util/translation.h>
 #include <wallet/multisig.h>
 
 #include <QApplication>
@@ -206,4 +219,47 @@ void MultisigWizardTests::grabPages()
         Grab(wizard, dir, QStringLiteral("06b-done-taproot"));
         wizard.close();
     }
+}
+
+void MultisigWizardTests::createWalletWithController()
+{
+    TestChain100Setup test;
+    auto wallet_loader = interfaces::MakeWalletLoader(*test.m_node.chain, *Assert(test.m_node.args));
+    test.m_node.wallet_loader = wallet_loader.get();
+    m_node.setContext(&test.m_node);
+    gArgs.ForceSetArg("-signer", "internal");
+
+    hwi::MockRegistration mock{hwi::MakeMockMasterFromHex(), ChainType::REGTEST};
+
+    bilingual_str error;
+    OptionsModel options(m_node);
+    QVERIFY(options.Init(error));
+    ClientModel client(m_node, &options);
+    std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate(QStringLiteral("other")));
+    QVERIFY(style);
+    WalletController controller(client, style.get(), nullptr);
+    QApplication::processEvents();
+
+    MultisigWizard wizard(m_node, &controller);
+    wizard.setWalletName(QStringLiteral("FamilyVault"));
+    wizard.setIncludeLocalKey(true);
+    wizard.addHardwareKey(mock.Fingerprint(), "Mock Trezor");
+    wizard.rebuildKeyList();
+    QCOMPARE(static_cast<int>(wizard.keys().size()), 2);
+    wizard.setNRequired(1);
+    wizard.setOutputType(OutputType::BECH32M);
+    wizard.setFallbackOlder(1);
+
+    QVERIFY2(wizard.createWallet(), qPrintable(wizard.createError()));
+    QVERIFY(wizard.createdWallet());
+    QVERIFY(wizard.transcript().contains(QStringLiteral("tr(musig")));
+    QVERIFY(wizard.transcript().contains(QStringLiteral("older")));
+
+    const auto dest = wizard.firstReceiveAddress();
+    QVERIFY2(!!dest, "wizard did not produce a receive address");
+    const std::string addr = EncodeDestination(*dest);
+    QVERIFY(QString::fromStdString(addr).startsWith(QStringLiteral("bcrt1p")));
+
+    const auto shown = wizard.verifyOnDevice(mock.Fingerprint());
+    QVERIFY2(!!shown, qPrintable(QString::fromStdString(util::ErrorString(shown).original)));
 }

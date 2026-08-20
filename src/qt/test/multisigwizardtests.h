@@ -23,6 +23,7 @@ public:
 private Q_SLOTS:
     void wizardTests();
     void grabPages();
+    void createWalletWithController();
 };
 
 #endif // BITCOIN_QT_TEST_MULTISIGWIZARDTESTS_H

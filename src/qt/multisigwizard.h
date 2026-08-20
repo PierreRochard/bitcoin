@@ -71,6 +71,7 @@ public:
     bilingual_str policyError() const;
 
     bool createWallet();
+    QString createError() const { return m_create_error; }
     util::Result<CTxDestination> firstReceiveAddress();
     util::Result<void> verifyOnDevice(const std::string& fingerprint);
 
