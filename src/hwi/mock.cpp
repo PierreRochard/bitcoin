@@ -6,15 +6,19 @@
 
 #include <common/signmessage.h>
 #include <common/types.h>
+#include <musig.h>
 #include <psbt.h>
 #include <pubkey.h>
 #include <script/keyorigin.h>
 #include <script/signingprovider.h>
 #include <sync.h>
 #include <tinyformat.h>
+#include <uint256.h>
 #include <util/bip32.h>
 #include <util/strencodings.h>
 
+#include <map>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -29,9 +33,12 @@ struct MockRecord {
     CExtKey master;
     ChainType chain;
     std::string fingerprint;
+    // Secret nonces must survive the nonce round so the next SignTx can
+    // produce a MuSig2 partial signature (BIP 327).
+    std::map<uint256, MuSig2SecNonce> musig2_secnonces;
 };
 
-std::vector<MockRecord> g_mocks GUARDED_BY(g_mocks_mutex);
+std::vector<std::unique_ptr<MockRecord>> g_mocks GUARDED_BY(g_mocks_mutex);
 
 CExtPubKey DeriveXpub(const CExtKey& master, const std::string& bip32_path)
 {
@@ -98,6 +105,23 @@ public:
         }
         if (!have_key) {
             throw HWIError("Signer fingerprint does not match any PSBT input", ErrorCode::INVALID_TX);
+        }
+
+        for (const PSBTInput& input : psbt.inputs) {
+            provider.aggregate_pubkeys.insert(input.m_musig2_participants.begin(), input.m_musig2_participants.end());
+        }
+
+        {
+            LOCK(g_mocks_mutex);
+            for (auto& record : g_mocks) {
+                if (record->path == m_path) {
+                    provider.musig2_secnonces = &record->musig2_secnonces;
+                    break;
+                }
+            }
+        }
+        if (!provider.musig2_secnonces) {
+            throw HWIError("Mock device not found", ErrorCode::DEVICE_CONN_ERROR);
         }
 
         std::optional<PrecomputedTransactionData> txdata = PrecomputePSBTData(psbt);
@@ -168,13 +192,18 @@ MockRegistration::MockRegistration(CExtKey master, ChainType chain)
     LOCK(g_mocks_mutex);
     m_path = strprintf("mock:%d", g_next_mock_id++);
     m_fingerprint = FingerprintHex(master.id_key_fingerprint());
-    g_mocks.push_back(MockRecord{m_path, std::move(master), chain, m_fingerprint});
+    auto rec = std::make_unique<MockRecord>();
+    rec->path = m_path;
+    rec->master = std::move(master);
+    rec->chain = chain;
+    rec->fingerprint = m_fingerprint;
+    g_mocks.push_back(std::move(rec));
 }
 
 MockRegistration::~MockRegistration()
 {
     LOCK(g_mocks_mutex);
-    std::erase_if(g_mocks, [&](const MockRecord& record) { return record.path == m_path; });
+    std::erase_if(g_mocks, [&](const std::unique_ptr<MockRecord>& record) { return record->path == m_path; });
 }
 
 std::unique_ptr<HardwareWalletClient> MockRegistration::Connect() const
@@ -191,12 +220,12 @@ std::vector<DeviceInfo> EnumerateMockDevices()
     LOCK(g_mocks_mutex);
     std::vector<DeviceInfo> result;
     result.reserve(g_mocks.size());
-    for (const MockRecord& record : g_mocks) {
+    for (const auto& record : g_mocks) {
         DeviceInfo info;
         info.type = "mock";
         info.model = "mock";
-        info.path = record.path;
-        info.fingerprint = record.fingerprint;
+        info.path = record->path;
+        info.fingerprint = record->fingerprint;
         result.push_back(std::move(info));
     }
     return result;
@@ -205,9 +234,9 @@ std::vector<DeviceInfo> EnumerateMockDevices()
 std::unique_ptr<HardwareWalletClient> ConnectMock(const DeviceInfo& info)
 {
     LOCK(g_mocks_mutex);
-    for (const MockRecord& record : g_mocks) {
-        if (record.path == info.path || (!info.fingerprint.empty() && record.fingerprint == info.fingerprint)) {
-            return std::make_unique<MockHardwareWallet>(record.path, record.master, record.chain);
+    for (const auto& record : g_mocks) {
+        if (record->path == info.path || (!info.fingerprint.empty() && record->fingerprint == info.fingerprint)) {
+            return std::make_unique<MockHardwareWallet>(record->path, record->master, record->chain);
         }
     }
     throw HWIError("Mock device not found", ErrorCode::DEVICE_CONN_ERROR);
