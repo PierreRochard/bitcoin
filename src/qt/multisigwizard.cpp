@@ -76,7 +76,7 @@ public:
         fingerprint->setPlaceholderText(tr("aabbccdd"));
         fingerprint->setMaxLength(8);
         path = new QLineEdit;
-        path->setPlaceholderText(tr("m/48h/1h/0h/2h"));
+        path->setPlaceholderText(tr("m/48h/1h/0h/2h (P2WSH) or m/48h/1h/0h/3h (P2TR)"));
         xpub = new QLineEdit;
         xpub->setPlaceholderText(tr("xpub… / tpub…"));
         form->addRow(tr("Label"), label);
@@ -105,7 +105,7 @@ public:
             "Typical setups:</p>"
             "<ul>"
             "<li><b>2 of 3</b> — this computer plus two hardware wallets (Sparrow/BlueWallet default).</li>"
-            "<li><b>2 of 2</b> — this computer and one device you keep elsewhere.</li>"
+            "<li><b>2 of 2</b> — this computer and one device you keep elsewhere. Taproot n-of-n uses MuSig2.</li>"
             "<li>Air-gapped keys — paste an xpub now, sign later with a PSBT file.</li>"
             "</ul>"
             "<p>You will pick the keys, choose how many signatures are required, "
@@ -131,7 +131,7 @@ public:
     explicit MultisigSetupPage(MultisigWizard* wizard) : QWizardPage(wizard), m_wizard(wizard)
     {
         setTitle(tr("Name and address type"));
-        setSubTitle(tr("Native SegWit (P2WSH) is the usual choice."));
+        setSubTitle(tr("Native SegWit (P2WSH) is the usual choice. Taproot uses MuSig2 when every key must sign."));
         auto* form = new QFormLayout(this);
         name = new QLineEdit;
         name->setObjectName("walletNameEdit");
@@ -140,6 +140,7 @@ public:
         type = new QComboBox;
         type->setObjectName("scriptTypeCombo");
         type->addItem(tr("Native SegWit (bech32, P2WSH) — recommended"), QVariant::fromValue(static_cast<int>(OutputType::BECH32)));
+        type->addItem(tr("Taproot (bech32m, P2TR) — n-of-n is MuSig2; otherwise a NUMS script path"), QVariant::fromValue(static_cast<int>(OutputType::BECH32M)));
         type->addItem(tr("Nested SegWit (p2sh-segwit, P2SH-P2WSH)"), QVariant::fromValue(static_cast<int>(OutputType::P2SH_SEGWIT)));
         type->addItem(tr("Legacy (P2SH)"), QVariant::fromValue(static_cast<int>(OutputType::LEGACY)));
         form->addRow(tr("Wallet name"), name);
@@ -377,10 +378,17 @@ public:
 private:
     void updateSentence()
     {
-        sentence->setText(PolicySentence(m_wizard->nrequired(), static_cast<int>(m_wizard->keys().size())) +
-                          QStringLiteral("<p>") +
-                          tr("Write this down. Changing the threshold later means a new wallet and moving funds.") +
-                          QStringLiteral("</p>"));
+        const int n = static_cast<int>(m_wizard->keys().size());
+        QString extra = tr("Write this down. Changing the threshold later means a new wallet and moving funds.");
+        if (m_wizard->outputType() == OutputType::BECH32M) {
+            if (m_wizard->nrequired() == n && n >= 2) {
+                extra = tr("Taproot n-of-n spends as one MuSig2 signature (BIP 327). Every key still has to participate.");
+            } else {
+                extra = tr("Taproot m-of-n uses an unspendable key-path and a sortedmulti_a script path (BIP 387).");
+            }
+        }
+        sentence->setText(PolicySentence(m_wizard->nrequired(), n) +
+                          QStringLiteral("<p>") + extra + QStringLiteral("</p>"));
     }
     MultisigWizard* m_wizard;
 };

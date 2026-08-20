@@ -4,6 +4,7 @@
 
 #include <qt/test/multisigwizardtests.h>
 
+#include <outputtype.h>
 #include <qt/multisigwizard.h>
 #include <qt/test/util.h>
 #include <wallet/multisig.h>
@@ -31,6 +32,11 @@ void MultisigWizardTests::wizardTests()
     QVERIFY(transcript.contains(QStringLiteral("2 of 2")));
     QVERIFY(transcript.contains(QStringLiteral("aabbccdd")));
     QVERIFY(transcript.contains(QStringLiteral("This computer")));
+
+    wizard.setOutputType(OutputType::BECH32M);
+    const QString tap = wizard.transcript();
+    QVERIFY(tap.contains(QStringLiteral("bech32m")));
+    QVERIFY(tap.contains(QStringLiteral("MuSig2")));
 
     wizard.next();
     wizard.next();
