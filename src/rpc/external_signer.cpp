@@ -20,7 +20,7 @@
 static RPCMethod enumeratesigners()
 {
     return RPCMethod{"enumeratesigners",
-        "Returns a list of external signers from -signer. Signers with duplicate master key fingerprints are skipped.",
+        "Returns a list of external signers from -signer. Signers with duplicate master key fingerprints are skipped. Use -signer=internal for the built-in C++ hardware wallet interface.",
         {},
         RPCResult{
             RPCResult::Type::OBJ, "", "",

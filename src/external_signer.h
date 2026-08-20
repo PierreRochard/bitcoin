@@ -31,13 +31,17 @@ public:
     //! @param[in] fingerprint  master key fingerprint of the signer
     //! @param[in] chain        "main", "test", "signet", "regtest" or "testnet4"
     //! @param[in] name         device name
-    ExternalSigner(std::vector<std::string> command, std::string chain, std::string fingerprint, std::string name);
+    //! @param[in] native       if true, talk to the in-process C++ HWI instead of `command`
+    ExternalSigner(std::vector<std::string> command, std::string chain, std::string fingerprint, std::string name, bool native = false);
 
     //! Master key fingerprint of the signer
     std::string m_fingerprint;
 
     //! Name of signer
     std::string m_name;
+
+    //! True when this signer is backed by the in-process C++ HWI (`-signer=internal`).
+    bool m_native{false};
 
     //! Obtain a list of signers. Calls `<command> enumerate`.
     //! @param[in]              command the command which handles interaction with the external signer
@@ -58,6 +62,11 @@ public:
     //! @param[in] account  which BIP32 account to use (e.g. `m/44'/0'/account'`)
     //! @returns see doc/external-signer.md
     UniValue GetDescriptors(int account);
+
+    //! Extended public key at `path`. Native HWI uses GetPubkeyAtPath; the
+    //! subprocess API calls `<command> --fingerprint <fingerprint> --chain
+    //! <chain> getxpub <path>` and expects `{"xpub": "..."}`.
+    UniValue GetXpub(const std::string& path) const;
 
     //! Sign PartiallySignedTransaction on the device.
     //! Calls `<command> --stdin --fingerprint <fingerprint> --chain <chain>` and passes the

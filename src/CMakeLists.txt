@@ -118,6 +118,15 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   core_io.cpp
   deploymentinfo.cpp
   external_signer.cpp
+  hwi/coldcard.cpp
+  hwi/hid.cpp
+  hwi/hwi.cpp
+  hwi/ledger.cpp
+  hwi/mock.cpp
+  hwi/protobuf.cpp
+  hwi/transport.cpp
+  hwi/trezor.cpp
+  hwi/util.cpp
   init/common.cpp
   kernel/chainparams.cpp
   key.cpp
@@ -152,6 +161,7 @@ target_link_libraries(bitcoin_common
     bitcoin_util
     univalue
     secp256k1
+    $<$<BOOL:${ENABLE_HWI_USB}>:HIDAPI::HIDAPI>
     $<TARGET_NAME_IF_EXISTS:USDT::headers>
     $<$<PLATFORM_ID:Windows>:ws2_32>
 )

@@ -7,17 +7,22 @@
 #include <chainparams.h>
 #include <common/run_command.h>
 #include <core_io.h>
+#include <hwi/hwi.h>
+#include <key_io.h>
 #include <psbt.h>
+#include <util/chaintype.h>
 #include <util/strencodings.h>
 #include <util/subprocess.h>
 
 #include <algorithm>
+#include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-ExternalSigner::ExternalSigner(std::vector<std::string> command, std::string chain, std::string fingerprint, std::string name)
-    : m_command{std::move(command)}, m_chain{std::move(chain)}, m_fingerprint{std::move(fingerprint)}, m_name{std::move(name)} {}
+ExternalSigner::ExternalSigner(std::vector<std::string> command, std::string chain, std::string fingerprint, std::string name, bool native)
+    : m_command{std::move(command)}, m_chain{std::move(chain)}, m_fingerprint{std::move(fingerprint)}, m_name{std::move(name)}, m_native{native} {}
 
 std::vector<std::string> ExternalSigner::NetworkArg() const
 {
@@ -26,6 +31,23 @@ std::vector<std::string> ExternalSigner::NetworkArg() const
 
 bool ExternalSigner::Enumerate(const std::string& command, std::vector<ExternalSigner>& signers, const std::string& chain)
 {
+    if (hwi::IsNativeSignerCommand(command)) {
+        for (const hwi::DeviceInfo& device : hwi::Enumerate()) {
+            if (device.fingerprint.empty()) continue;
+            if (device.fingerprint.size() != 8 || !IsHex(device.fingerprint)) {
+                throw std::runtime_error(strprintf("'%s' received invalid fingerprint, must be 8 hex characters", command));
+            }
+            bool duplicate = false;
+            for (const ExternalSigner& signer : signers) {
+                if (signer.m_fingerprint == device.fingerprint) duplicate = true;
+            }
+            if (duplicate) continue;
+            const std::string name = device.model.empty() ? device.type : device.model;
+            signers.emplace_back(std::vector<std::string>{std::string{hwi::NATIVE_SIGNER_COMMAND}}, chain, device.fingerprint, name, /*native=*/true);
+        }
+        return true;
+    }
+
     // Call <command> enumerate
     std::vector<std::string> cmd_args = Cat(subprocess::util::split(command), {"enumerate"});
 
@@ -67,14 +89,56 @@ bool ExternalSigner::Enumerate(const std::string& command, std::vector<ExternalS
     return true;
 }
 
+namespace {
+std::unique_ptr<hwi::HardwareWalletClient> ConnectNative(const std::string& fingerprint, const std::string& chain)
+{
+    const std::optional<ChainType> chain_type{ChainTypeFromString(chain)};
+    if (!chain_type) {
+        throw std::runtime_error("Unknown chain for native HWI: " + chain);
+    }
+    std::unique_ptr<hwi::HardwareWalletClient> client = hwi::FindDevice(fingerprint);
+    if (!client) {
+        throw std::runtime_error("Native HWI device not found");
+    }
+    client->SetChain(*chain_type);
+    return client;
+}
+} // namespace
+
 UniValue ExternalSigner::DisplayAddress(const std::string& descriptor) const
 {
+    if (m_native) {
+        UniValue result{UniValue::VOBJ};
+        result.pushKV("address", hwi::DisplayAddress(*ConnectNative(m_fingerprint, m_chain), descriptor));
+        return result;
+    }
     return RunCommandParseJSON(Cat(m_command, Cat(Cat({"--fingerprint", m_fingerprint}, NetworkArg()), {"displayaddress", "--desc", descriptor})), "");
 }
 
 UniValue ExternalSigner::GetDescriptors(const int account)
 {
+    if (m_native) {
+        const hwi::DescriptorSets descs{hwi::GetDescriptors(*ConnectNative(m_fingerprint, m_chain), account)};
+        UniValue receive{UniValue::VARR};
+        for (const std::string& desc : descs.receive) receive.push_back(desc);
+        UniValue internal{UniValue::VARR};
+        for (const std::string& desc : descs.internal) internal.push_back(desc);
+        UniValue result{UniValue::VOBJ};
+        result.pushKV("receive", std::move(receive));
+        result.pushKV("internal", std::move(internal));
+        return result;
+    }
     return RunCommandParseJSON(Cat(m_command, Cat(Cat({"--fingerprint", m_fingerprint}, NetworkArg()), {"getdescriptors", "--account", strprintf("%d", account)})), "");
+}
+
+UniValue ExternalSigner::GetXpub(const std::string& path) const
+{
+    if (m_native) {
+        UniValue result{UniValue::VOBJ};
+        result.pushKV("xpub", EncodeExtPubKey(ConnectNative(m_fingerprint, m_chain)->GetPubkeyAtPath(path)));
+        return result;
+    }
+    return RunCommandParseJSON(Cat(m_command, Cat(Cat({"--fingerprint", m_fingerprint}, NetworkArg()), {"getxpub", path})), "");
 }
 
 bool ExternalSigner::SignTransaction(PartiallySignedTransaction& psbtx, std::string& error)
@@ -98,6 +162,16 @@ bool ExternalSigner::SignTransaction(PartiallySignedTransaction& psbtx, std::str
     if (!std::any_of(psbtx.inputs.begin(), psbtx.inputs.end(), matches_signer_fingerprint)) {
         error = "Signer fingerprint " + m_fingerprint + " does not match any of the inputs:\n" + EncodeBase64(ssTx.str());
         return false;
+    }
+
+    if (m_native) {
+        try {
+            psbtx = ConnectNative(m_fingerprint, m_chain)->SignTx(psbtx);
+            return true;
+        } catch (const std::exception& e) {
+            error = e.what();
+            return false;
+        }
     }
 
     const std::vector<std::string> command = Cat(m_command, Cat({"--stdin", "--fingerprint", m_fingerprint}, NetworkArg()));

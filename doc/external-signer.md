@@ -2,6 +2,17 @@
 
 Bitcoin Core can be launched with `-signer=<cmd>` where `<cmd>` is an external tool which can sign transactions and perform other functions. For example, it can be used to communicate with a hardware wallet.
 
+This tree also includes an in-process C++ rewrite of [HWI](https://github.com/bitcoin-core/HWI) under `src/hwi/`. Select it with:
+
+```sh
+bitcoind -signer=internal
+```
+
+`-signer=hwi` is accepted as an alias. Native drivers cover Trezor, Ledger,
+and Coldcard over USB (hidapi) and over the vendor emulators (Trezor UDP,
+Speculos TCP, Coldcard unix socket). Tests also register a software mock
+(see `src/hwi/mock.h`). Python HWI remains available as `-signer=/path/to/hwi`.
+
 Interaction with external signer uses [Partially Signed Bitcoin Transaction (PSBT)](psbt.md).
 
 ## Example usage
