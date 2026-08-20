@@ -32,6 +32,7 @@ if(ENABLE_WALLET)
     PRIVATE
       addressbooktests.cpp
       wallettests.cpp
+      multisigwizardtests.cpp
       ../../wallet/test/wallet_test_fixture.cpp
   )
 endif()

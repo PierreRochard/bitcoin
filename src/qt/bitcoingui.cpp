@@ -9,6 +9,7 @@
 #include <qt/bitcoinunits.h>
 #include <qt/clientmodel.h>
 #include <qt/createwalletdialog.h>
+#include <qt/multisigwizard.h>
 #include <qt/guiconstants.h>
 #include <qt/guiutil.h>
 #include <qt/modaloverlay.h>
@@ -354,6 +355,10 @@ void BitcoinGUI::createActions()
     m_create_wallet_action->setEnabled(false);
     m_create_wallet_action->setStatusTip(tr("Create a new wallet"));
 
+    m_create_multisig_action = new QAction(tr("Create Multisig Wallet…"), this);
+    m_create_multisig_action->setEnabled(false);
+    m_create_multisig_action->setStatusTip(tr("Create an m-of-n vault with hardware, local, and air-gapped keys"));
+
     //: Name of the menu item that restores wallet from a backup file.
     m_restore_wallet_action = new QAction(tr("Restore Wallet…"), this);
     m_restore_wallet_action->setEnabled(false);
@@ -471,6 +476,7 @@ void BitcoinGUI::createActions()
             m_wallet_controller->closeWallet(walletFrame->currentWalletModel(), this);
         });
         connect(m_create_wallet_action, &QAction::triggered, this, &BitcoinGUI::createWallet);
+        connect(m_create_multisig_action, &QAction::triggered, this, &BitcoinGUI::createMultisigWallet);
         connect(m_close_all_wallets_action, &QAction::triggered, [this] {
             m_wallet_controller->closeAllWallets(this);
         });
@@ -560,6 +566,7 @@ void BitcoinGUI::createMenuBar()
     if(walletFrame)
     {
         file->addAction(m_create_wallet_action);
+        file->addAction(m_create_multisig_action);
         file->addAction(m_open_wallet_action);
         file->addAction(m_close_wallet_action);
         file->addAction(m_close_all_wallets_action);
@@ -771,6 +778,7 @@ void BitcoinGUI::setWalletController(WalletController* wallet_controller, bool s
     m_wallet_controller = wallet_controller;
 
     m_create_wallet_action->setEnabled(true);
+    m_create_multisig_action->setEnabled(true);
     m_open_wallet_action->setEnabled(true);
     m_open_wallet_action->setMenu(m_open_wallet_menu);
     m_restore_wallet_action->setEnabled(true);
@@ -1280,6 +1288,18 @@ void BitcoinGUI::createWallet()
     connect(activity, &CreateWalletActivity::created, this, &BitcoinGUI::setCurrentWallet);
     connect(activity, &CreateWalletActivity::created, rpcConsole, &RPCConsole::setCurrentWallet);
     activity->create();
+#endif // ENABLE_WALLET
+}
+
+void BitcoinGUI::createMultisigWallet()
+{
+#ifdef ENABLE_WALLET
+    if (!clientModel || !getWalletController()) return;
+    auto* wizard = new MultisigWizard(clientModel->node(), getWalletController(), this);
+    wizard->setAttribute(Qt::WA_DeleteOnClose);
+    connect(wizard, &MultisigWizard::created, this, &BitcoinGUI::setCurrentWallet);
+    connect(wizard, &MultisigWizard::created, rpcConsole, &RPCConsole::setCurrentWallet);
+    wizard->open();
 #endif // ENABLE_WALLET
 }
 
