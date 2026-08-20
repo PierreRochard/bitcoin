@@ -471,6 +471,13 @@ BOOST_AUTO_TEST_CASE(transcript_and_policy)
     BOOST_CHECK(!ValidateMultisigPolicy(0, 2).empty());
     BOOST_CHECK(!ValidateMultisigPolicy(3, 2).empty());
     BOOST_CHECK(ValidateMultisigPolicy(2, 3).empty());
+    BOOST_CHECK(!ValidateMultisigPolicy(2, 21, OutputType::BECH32).empty());
+    BOOST_CHECK(!ValidateMultisigPolicy(1, 16, OutputType::LEGACY).empty());
+    BOOST_CHECK(ValidateMultisigPolicy(20, 20, OutputType::BECH32).empty());
+    BOOST_CHECK(!ValidateMultisigPolicy(1, MAX_PUBKEYS_PER_MULTI_A + 1, OutputType::BECH32M).empty());
+    BOOST_CHECK(ValidateMultisigPolicy(MAX_PUBKEYS_PER_MULTI_A, MAX_PUBKEYS_PER_MULTI_A, OutputType::BECH32M).empty());
+    BOOST_CHECK(!ValidateMultisigPolicy(1, MAX_PUBKEYS_PER_MULTI_A + 1, OutputType::BECH32M, /*fallback_older=*/1).empty());
+    BOOST_CHECK(ValidateMultisigPolicy(1, MAX_PUBKEYS_PER_MULTI_A, OutputType::BECH32M, /*fallback_older=*/1).empty());
 
     std::vector<MultisigKeySpec> keys(2);
     keys[0].label = "This computer";

@@ -24,7 +24,8 @@ struct MultisigKeySpec {
     //! key (no device required). Without xpub, the xpub is fetched from that
     //! connected signer.
     std::optional<std::string> fingerprint;
-    //! Local HD xpub (see gethdkeys) when the key is derived in this wallet.
+    //! Local HD xpub (see gethdkeys) or xprv when the key is derived in this
+    //! wallet. An xprv does not need a prior unused() import.
     std::optional<std::string> hdkey;
     //! Public xpub already known (air-gapped export, coordinator transcript).
     std::optional<std::string> xpub;
@@ -56,7 +57,11 @@ std::string DefaultMultisigPath(OutputType type, uint32_t account);
 std::string WrapSortedMulti(OutputType type, int nrequired, const std::vector<std::string>& keys,
                             std::optional<uint32_t> fallback_older = {});
 
-bilingual_str ValidateMultisigPolicy(int nrequired, size_t nkeys);
+//! Type-aware key-count limits: 15 (P2SH), 20 (P2WSH), 999 (Taproot multi_a /
+//! vault fallback). n-of-n bech32m MuSig2 has no consensus cap.
+bilingual_str ValidateMultisigPolicy(int nrequired, size_t nkeys,
+                                     OutputType type = OutputType::BECH32,
+                                     std::optional<uint32_t> fallback_older = {});
 
 //! Printable backup in the spirit of Specter/Sparrow transcripts.
 std::string FormatMultisigTranscript(const std::string& wallet_name,

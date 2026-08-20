@@ -629,7 +629,8 @@ public:
     }
     bool isComplete() const override
     {
-        return wallet::ValidateMultisigPolicy(m_wizard->nrequired(), m_wizard->keys().size()).empty();
+        return wallet::ValidateMultisigPolicy(m_wizard->nrequired(), m_wizard->keys().size(),
+                                              m_wizard->outputType(), m_wizard->fallbackOlder()).empty();
     }
     int nextId() const override { return MultisigWizard::Page_Backup; }
 
@@ -999,7 +1000,7 @@ QString MultisigWizard::transcript() const
 
 bilingual_str MultisigWizard::policyError() const
 {
-    return wallet::ValidateMultisigPolicy(m_nrequired, m_keys.size());
+    return wallet::ValidateMultisigPolicy(m_nrequired, m_keys.size(), m_type, m_fallback_older);
 }
 
 bool MultisigWizard::createWallet()

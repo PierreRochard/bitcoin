@@ -10,6 +10,7 @@
 #include <outputtype.h>
 #include <pubkey.h>
 #include <script/descriptor.h>
+#include <script/script.h>
 #include <tinyformat.h>
 #include <univalue.h>
 #include <util/bip32.h>
@@ -103,13 +104,29 @@ std::string WrapSortedMulti(OutputType type, int nrequired, const std::vector<st
     return {};
 }
 
-bilingual_str ValidateMultisigPolicy(int nrequired, size_t nkeys)
+bilingual_str ValidateMultisigPolicy(int nrequired, size_t nkeys, OutputType type,
+                                     std::optional<uint32_t> fallback_older)
 {
     if (nkeys == 0) {
         return Untranslated("keys must be a non-empty array");
     }
     if (nrequired <= 0 || static_cast<size_t>(nrequired) > nkeys) {
         return Untranslated("nrequired must be > 0 and <= the number of keys");
+    }
+    // P2SH redeemScript is capped at MAX_SCRIPT_ELEMENT_SIZE (520): 15 compressed keys.
+    static constexpr size_t MAX_PUBKEYS_PER_P2SH_MULTISIG = 15;
+    if (type == OutputType::LEGACY && nkeys > MAX_PUBKEYS_PER_P2SH_MULTISIG) {
+        return Untranslated(strprintf("legacy P2SH multisig supports at most %d keys", MAX_PUBKEYS_PER_P2SH_MULTISIG));
+    }
+    if ((type == OutputType::P2SH_SEGWIT || type == OutputType::BECH32) && nkeys > MAX_PUBKEYS_PER_MULTISIG) {
+        return Untranslated(strprintf("P2WSH multisig supports at most %d keys", MAX_PUBKEYS_PER_MULTISIG));
+    }
+    if (type == OutputType::BECH32M) {
+        // Script-path multi_a / 24861 vault fallback is BIP 342 stack-limited (n+1 ≤ 1000).
+        const bool uses_multi_a = fallback_older.has_value() || static_cast<size_t>(nrequired) < nkeys;
+        if (uses_multi_a && nkeys > MAX_PUBKEYS_PER_MULTI_A) {
+            return Untranslated(strprintf("Taproot script-path multisig supports at most %u keys (BIP 342 stack limit)", MAX_PUBKEYS_PER_MULTI_A));
+        }
     }
     return {};
 }
@@ -226,11 +243,28 @@ static util::Result<std::string> KeyExprFromSpec(CWallet& wallet, const Multisig
         return util::Error{Untranslated("Watch-only wallets cannot use local keys; specify a signer fingerprint or xpub")};
     }
 
+    if (spec.hdkey) {
+        const CExtKey extkey = DecodeExtKey(*spec.hdkey);
+        if (extkey.key.IsValid()) {
+            if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+                return util::Error{Untranslated("Watch-only wallets cannot use local keys; specify a signer fingerprint or xpub")};
+            }
+            auto child = DeriveExtKey(extkey, parsed_path);
+            if (!child) {
+                return util::Error{Untranslated("Unable to derive HD key at the requested path")};
+            }
+            return strprintf("[%s%s]%s/<0;1>/*",
+                             HexStr(child->second.fingerprint),
+                             FormatHDKeypath(child->second.path),
+                             EncodeExtKey(child->first));
+        }
+    }
+
     CExtPubKey xpub;
     if (spec.hdkey) {
         xpub = DecodeExtPubKey(*spec.hdkey);
         if (!xpub.pubkey.IsValid()) {
-            return util::Error{Untranslated("Unable to parse HD key. Please provide a valid xpub")};
+            return util::Error{Untranslated("Unable to parse HD key. Please provide a valid xpub or xprv")};
         }
     } else {
         CWallet::HDPubKeyMap unused = wallet.GetHDPubKeys(CWallet::HDKeyFilter::UnusedKey);
@@ -267,7 +301,7 @@ util::Result<MultisigDescriptorResult> CreateMultisigDescriptor(CWallet& wallet,
     if (!wallet.IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER) && wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
         return util::Error{Untranslated("createmultisigdescriptor requires a wallet with private keys or an external signer")};
     }
-    if (const auto err = ValidateMultisigPolicy(nrequired, keys.size()); !err.empty()) {
+    if (const auto err = ValidateMultisigPolicy(nrequired, keys.size(), options.type, options.fallback_older); !err.empty()) {
         return util::Error{err};
     }
     if (options.type == OutputType::UNKNOWN) {

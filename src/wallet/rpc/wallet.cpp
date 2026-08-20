@@ -875,7 +875,7 @@ static RPCMethod createmultisigdescriptor()
                         {
                             {"path", RPCArg::Type::STR, RPCArg::DefaultHint{"BIP48 path for the chosen address type"}, "BIP32 path from the master key"},
                             {"fingerprint", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "External signer master fingerprint. If omitted, the key is derived from this wallet."},
-                            {"hdkey", RPCArg::Type::STR, RPCArg::DefaultHint{"The wallet's unused(KEY) or sole active HD key"}, "xpub of the local HD key to derive from (see gethdkeys)"},
+                            {"hdkey", RPCArg::Type::STR, RPCArg::DefaultHint{"The wallet's unused(KEY) or sole active HD key"}, "xpub or xprv of the local HD key to derive from (see gethdkeys). An xprv does not need a prior unused() import."},
                             {"xpub", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Public extended key for an air-gapped signer. Requires fingerprint. The device is not contacted."},
                         },
                     },
@@ -883,7 +883,7 @@ static RPCMethod createmultisigdescriptor()
             },
             {"options", RPCArg::Type::OBJ_NAMED_PARAMS, RPCArg::Optional::OMITTED, "",
                 {
-                    {"type", RPCArg::Type::STR, RPCArg::Default{"bech32"}, "Address type. Options are \"legacy\" (sh(sortedmulti)), \"p2sh-segwit\" (sh(wsh(sortedmulti))), \"bech32\" (wsh(sortedmulti)), \"bech32m\" (tr(musig) for n-of-n, tr(NUMS,sortedmulti_a) for m-of-n, or tr(musig,and_v(older,multi_a)) with fallback_older)."},
+                    {"type", RPCArg::Type::STR, RPCArg::Default{"bech32"}, "Address type. Options are \"legacy\" (sh(sortedmulti), max 15 keys), \"p2sh-segwit\" / \"bech32\" (wsh(sortedmulti), max 20 keys), \"bech32m\" (tr(musig) n-of-n with no key-count cap; tr(NUMS,sortedmulti_a) m-of-n or tr(musig,and_v(older,multi_a)) vault, max 999 keys)."},
                     {"account", RPCArg::Type::NUM, RPCArg::Default{0}, "BIP48 account used when a key omits path."},
                     {"internal", RPCArg::Type::BOOL, RPCArg::DefaultHint{"Both receive and change"}, "If set, import only the receive (false) or change (true) branch instead of both."},
                     {"fallback_older", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Bech32m only. Relative delay in blocks (miniscript older()) before an m-of-n script-path spend is valid. Immediate spends still use n-of-n MuSig2 on the key path. nrequired is the delayed threshold."},
