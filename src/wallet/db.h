@@ -175,6 +175,9 @@ struct DatabaseOptions {
     std::optional<DatabaseFormat> require_format;
     uint64_t create_flags = 0;
     SecureString create_passphrase;
+    //! When creating a watch-only external-signer wallet with several devices
+    //! connected, select this master fingerprint. Mixed-key wallets ignore it.
+    std::optional<std::string> create_signer_fingerprint;
 
     // Specialized options. Not every option is supported by every backend.
     bool verify = true;             //!< Check data integrity on load.

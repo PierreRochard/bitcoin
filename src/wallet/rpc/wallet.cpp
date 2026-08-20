@@ -7,15 +7,22 @@
 
 #include <wallet/rpc/wallet.h>
 
+#include <chainparams.h>
 #include <coins.h>
 #include <core_io.h>
+#include <external_signer.h>
 #include <key.h>
 #include <key_io.h>
 #include <rpc/server.h>
 #include <rpc/util.h>
+#include <util/check.h>
+#include <script/descriptor.h>
 #include <univalue.h>
 #include <util/bip32.h>
+#include <util/strencodings.h>
+#include <util/time.h>
 #include <util/translation.h>
+#include <wallet/external_signer_scriptpubkeyman.h>
 #include <wallet/context.h>
 #include <wallet/export.h>
 #include <wallet/receive.h>
@@ -365,7 +372,8 @@ static RPCMethod createwallet()
             {"avoid_reuse", RPCArg::Type::BOOL, RPCArg::Default{false}, "Keep track of coin reuse, and treat dirty and clean coins differently with privacy considerations in mind."},
             {"descriptors", RPCArg::Type::BOOL, RPCArg::Default{true}, "If set, must be \"true\""},
             {"load_on_startup", RPCArg::Type::BOOL, RPCArg::Optional::OMITTED, "Save wallet name to persistent settings and load on startup. True to add wallet to startup list, false to remove, null to leave unchanged."},
-            {"external_signer", RPCArg::Type::BOOL, RPCArg::Default{false}, "Use an external signer such as a hardware wallet. Requires -signer to be configured. Wallet creation will fail if keys cannot be fetched. Requires disable_private_keys and descriptors set to true."},
+            {"external_signer", RPCArg::Type::BOOL, RPCArg::Default{false}, "Use an external signer such as a hardware wallet. Requires -signer to be configured. Combined with disable_private_keys=true this imports the device's singlesig descriptors (watch-only). Combined with disable_private_keys=false this creates a mixed-key wallet that keeps a local HD seed and can co-sign with hardware wallets (see createmultisigdescriptor)."},
+            {"signer", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Master key fingerprint of the external signer to import keys from when more than one device is connected. Only used for watch-only external-signer wallets."},
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
@@ -426,6 +434,16 @@ static RPCMethod createwallet()
     options.require_create = true;
     options.create_flags = flags;
     options.create_passphrase = passphrase;
+    if (!request.params[8].isNull()) {
+        const std::string fingerprint = request.params[8].get_str();
+        if (fingerprint.size() != 8 || !IsHex(fingerprint)) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "signer must be an 8-character hex fingerprint");
+        }
+        if (!(flags & WALLET_FLAG_EXTERNAL_SIGNER) || !(flags & WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "signer is only valid for watch-only external-signer wallets");
+        }
+        options.create_signer_fingerprint = fingerprint;
+    }
     bilingual_str error;
     std::optional<bool> load_on_start = request.params[6].isNull() ? std::nullopt : std::optional<bool>(request.params[6].get_bool());
     const std::shared_ptr<CWallet> wallet = CreateWallet(context, request.params[0].get_str(), load_on_start, options, status, error, warnings);
@@ -836,6 +854,251 @@ static RPCMethod createwalletdescriptor()
     };
 }
 
+#ifdef ENABLE_EXTERNAL_SIGNER
+static std::string DefaultMultisigPath(OutputType type, uint32_t account)
+{
+    const uint32_t coin = Params().GetChainType() == ChainType::MAIN ? 0 : 1;
+    uint32_t script;
+    switch (type) {
+    case OutputType::LEGACY: script = 0; break;
+    case OutputType::P2SH_SEGWIT: script = 1; break;
+    case OutputType::BECH32: script = 2; break;
+    case OutputType::BECH32M:
+    case OutputType::UNKNOWN:
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Unsupported address type for createmultisigdescriptor");
+    }
+    return WriteHDKeypath({
+        48 | BIP32_HARDENED_FLAG,
+        coin | BIP32_HARDENED_FLAG,
+        account | BIP32_HARDENED_FLAG,
+        script | BIP32_HARDENED_FLAG,
+    });
+}
+
+static std::string WrapSortedMulti(OutputType type, int nrequired, const std::vector<std::string>& keys)
+{
+    std::string inner = strprintf("sortedmulti(%d", nrequired);
+    for (const auto& key : keys) {
+        inner += "," + key;
+    }
+    inner += ")";
+    switch (type) {
+    case OutputType::LEGACY: return "sh(" + inner + ")";
+    case OutputType::P2SH_SEGWIT: return "sh(wsh(" + inner + "))";
+    case OutputType::BECH32: return "wsh(" + inner + ")";
+    case OutputType::BECH32M:
+    case OutputType::UNKNOWN:
+        break;
+    }
+    throw JSONRPCError(RPC_INVALID_PARAMETER, "Unsupported address type for createmultisigdescriptor");
+}
+
+static RPCMethod createmultisigdescriptor()
+{
+    return RPCMethod{
+        "createmultisigdescriptor",
+        "Create and import an active sorted-multisig descriptor from local HD keys and/or connected external signers.\n"
+        "Each key is either a local BIP32 path (derived with the wallet's HD seed), an 8-character signer fingerprint "
+        "(xpub fetched from that device), or an object specifying path/fingerprint/hdkey.\n"
+        "Receive and change descriptors are imported using the <0;1> multipath syntax.\n"
+        + HELP_REQUIRING_PASSPHRASE,
+        {
+            {"nrequired", RPCArg::Type::NUM, RPCArg::Optional::NO, "The number of required signatures out of the n keys."},
+            {"keys", RPCArg::Type::ARR, RPCArg::Optional::NO, "Keys that participate in the multisig. A string is a local path (\"m/48h/1h/0h/2h\") or an external-signer fingerprint (\"aabbccdd\"). An object may set path, fingerprint, and hdkey.",
+                {
+                    {"", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Local BIP32 path or 8-character hex fingerprint"},
+                    {"", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "",
+                        {
+                            {"path", RPCArg::Type::STR, RPCArg::DefaultHint{"BIP48 path for the chosen address type"}, "BIP32 path from the master key"},
+                            {"fingerprint", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "External signer master fingerprint. If omitted, the key is derived from this wallet."},
+                            {"hdkey", RPCArg::Type::STR, RPCArg::DefaultHint{"The wallet's unused(KEY) or sole active HD key"}, "xpub of the local HD key to derive from (see gethdkeys)"},
+                        },
+                    },
+                },
+            },
+            {"options", RPCArg::Type::OBJ_NAMED_PARAMS, RPCArg::Optional::OMITTED, "",
+                {
+                    {"type", RPCArg::Type::STR, RPCArg::Default{"bech32"}, "Address type. Options are \"legacy\" (sh(sortedmulti)), \"p2sh-segwit\" (sh(wsh(sortedmulti))), \"bech32\" (wsh(sortedmulti))."},
+                    {"account", RPCArg::Type::NUM, RPCArg::Default{0}, "BIP48 account used when a key omits path."},
+                    {"internal", RPCArg::Type::BOOL, RPCArg::DefaultHint{"Both receive and change"}, "If set, import only the receive (false) or change (true) branch instead of both."},
+                },
+            },
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::NUM, "nrequired", "The threshold"},
+                {RPCResult::Type::ARR, "descs", "The public descriptors that were added",
+                    {{RPCResult::Type::STR, "", ""}}
+                },
+            },
+        },
+        RPCExamples{
+            HelpExampleCli("createmultisigdescriptor", "2 '[\"m/48h/1h/0h/2h\", \"95d8f670\"]'")
+            + HelpExampleRpc("createmultisigdescriptor", "2, [\"m/48h/1h/0h/2h\", \"95d8f670\"]")
+        },
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
+        {
+            std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+            if (!pwallet) return UniValue::VNULL;
+            CWallet& wallet{*pwallet};
+
+            if (!wallet.IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER) && wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "createmultisigdescriptor requires a wallet with private keys or an external signer");
+            }
+
+            const int nrequired = request.params[0].getInt<int>();
+            const UniValue& keys_param = request.params[1];
+            if (!keys_param.isArray() || keys_param.size() == 0) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "keys must be a non-empty array");
+            }
+            if (nrequired <= 0 || static_cast<size_t>(nrequired) > keys_param.size()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "nrequired must be > 0 and <= the number of keys");
+            }
+
+            UniValue options{request.params[2].isNull() ? UniValue::VOBJ : request.params[2]};
+            OutputType output_type = OutputType::BECH32;
+            if (options.exists("type")) {
+                auto parsed = ParseOutputType(options["type"].get_str());
+                if (!parsed || *parsed == OutputType::BECH32M || *parsed == OutputType::UNKNOWN) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown or unsupported address type");
+                }
+                output_type = *parsed;
+            }
+            const uint32_t account = options.exists("account") ? options["account"].getInt<int>() : 0;
+            std::optional<bool> internal_only;
+            if (options.exists("internal")) internal_only = options["internal"].get_bool();
+
+            LOCK(wallet.cs_wallet);
+            if (!wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+                EnsureWalletIsUnlocked(wallet);
+            }
+
+            const std::string default_path = DefaultMultisigPath(output_type, account);
+            std::vector<std::string> key_exprs;
+            key_exprs.reserve(keys_param.size());
+
+            for (const UniValue& key_val : keys_param.getValues()) {
+                std::optional<std::string> fingerprint;
+                std::optional<std::string> path;
+                std::optional<std::string> hdkey;
+                if (key_val.isStr()) {
+                    const std::string s = key_val.get_str();
+                    if (s.size() == 8 && IsHex(s)) {
+                        fingerprint = s;
+                    } else {
+                        path = s;
+                    }
+                } else if (key_val.isObject()) {
+                    if (key_val.exists("fingerprint")) fingerprint = key_val["fingerprint"].get_str();
+                    if (key_val.exists("path")) path = key_val["path"].get_str();
+                    if (key_val.exists("hdkey")) hdkey = key_val["hdkey"].get_str();
+                } else {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "Each key must be a string or object");
+                }
+                if (!path) path = default_path;
+                std::vector<uint32_t> parsed_path = ParsePathBIP32(*path);
+                if (!HasHardenedDerivation(parsed_path)) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "Derivation path requires at least one hardened step");
+                }
+
+                if (fingerprint) {
+                    if (fingerprint->size() != 8 || !IsHex(*fingerprint)) {
+                        throw JSONRPCError(RPC_INVALID_PARAMETER, "fingerprint must be 8 hex characters");
+                    }
+                    auto signer = ExternalSignerScriptPubKeyMan::GetExternalSigner(*fingerprint);
+                    if (!signer) {
+                        throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(signer).original);
+                    }
+                    const UniValue xpub_res = signer->GetXpub(*path);
+                    if (!xpub_res.exists("xpub") || !xpub_res["xpub"].isStr()) {
+                        throw JSONRPCError(RPC_WALLET_ERROR, "Signer getxpub did not return an xpub");
+                    }
+                    key_exprs.push_back(strprintf("[%s%s]%s/<0;1>/*",
+                                                  *fingerprint,
+                                                  FormatHDKeypath(parsed_path),
+                                                  xpub_res["xpub"].get_str()));
+                } else {
+                    if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+                        throw JSONRPCError(RPC_WALLET_ERROR, "Watch-only wallets cannot use local keys; specify a signer fingerprint");
+                    }
+                    CExtPubKey xpub;
+                    if (hdkey) {
+                        xpub = DecodeExtPubKey(*hdkey);
+                        if (!xpub.pubkey.IsValid()) {
+                            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Unable to parse HD key. Please provide a valid xpub");
+                        }
+                    } else {
+                        HDPubKeyMap unused = wallet.GetHDPubKeys(CWallet::HDKeyFilter::UnusedKey);
+                        HDPubKeyMap active = wallet.GetHDPubKeys(CWallet::HDKeyFilter::Active);
+                        if (unused.size() == 1) {
+                            xpub = unused.begin()->first;
+                        } else if (unused.empty() && active.size() == 1) {
+                            xpub = active.begin()->first;
+                        } else {
+                            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Unable to determine which HD key to use. Please specify with 'hdkey'");
+                        }
+                    }
+                    std::optional<CExtKey> xprv = wallet.GetExtKey(xpub);
+                    if (!xprv) {
+                        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf("Private key for %s is not known", EncodeExtPubKey(xpub)));
+                    }
+                    auto child = DeriveExtKey(*xprv, parsed_path);
+                    if (!child) {
+                        throw JSONRPCError(RPC_INVALID_PARAMETER, "Unable to derive HD key at the requested path");
+                    }
+                    key_exprs.push_back(strprintf("[%s%s]%s/<0;1>/*",
+                                                  HexStr(child->second.fingerprint),
+                                                  FormatHDKeypath(child->second.path),
+                                                  EncodeExtKey(child->first)));
+                }
+            }
+
+            std::string desc_str = WrapSortedMulti(output_type, nrequired, key_exprs);
+            const std::string checksum = GetDescriptorChecksum(desc_str);
+            if (!checksum.empty()) desc_str += "#" + checksum;
+
+            FlatSigningProvider keys;
+            std::string parse_error;
+            auto parsed = Parse(desc_str, keys, parse_error, /*require_checksum=*/!checksum.empty());
+            if (parsed.empty()) {
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, parse_error);
+            }
+
+            UniValue descs{UniValue::VARR};
+            for (size_t i = 0; i < parsed.size(); ++i) {
+                const bool desc_internal = (parsed.size() == 2) ? (i == 1) : internal_only.value_or(false);
+                if (internal_only && parsed.size() == 2 && desc_internal != *internal_only) {
+                    continue;
+                }
+                std::vector<CScript> scripts;
+                FlatSigningProvider expand_keys;
+                if (!parsed[i]->Expand(0, keys, scripts, expand_keys)) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, "Cannot expand descriptor");
+                }
+                WalletDescriptor w_desc(std::move(parsed[i]), GetTime(), 0, wallet.m_keypool_size, 0);
+                auto spkm_res = wallet.AddWalletDescriptor(w_desc, keys, /*label=*/"", desc_internal);
+                if (!spkm_res) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(spkm_res).original);
+                }
+                auto& spkm = spkm_res.value().get();
+                if (auto type = w_desc.descriptor->GetOutputType()) {
+                    wallet.AddActiveScriptPubKeyMan(spkm.GetID(), *type, desc_internal);
+                }
+                std::string out_desc;
+                CHECK_NONFATAL(spkm.GetDescriptorString(out_desc, false));
+                descs.push_back(out_desc);
+            }
+
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("nrequired", nrequired);
+            out.pushKV("descs", std::move(descs));
+            return out;
+        },
+    };
+}
+#endif // ENABLE_EXTERNAL_SIGNER
+
 RPCMethod addhdkey()
 {
     return RPCMethod{
@@ -1146,6 +1409,9 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &psbtbumpfee},
         {"wallet", &createwallet},
         {"wallet", &createwalletdescriptor},
+#ifdef ENABLE_EXTERNAL_SIGNER
+        {"wallet", &createmultisigdescriptor},
+#endif
         {"wallet", &derivehdkey},
         {"wallet", &restorewallet},
         {"wallet", &encryptwallet},

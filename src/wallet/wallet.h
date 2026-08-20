@@ -880,7 +880,7 @@ public:
     static bool LoadWalletArgs(std::shared_ptr<CWallet> wallet, const WalletContext& context, bilingual_str& error, std::vector<bilingual_str>& warnings);
 
     /* Initializes, creates and returns a new CWallet; returns a null pointer in case of an error */
-    static std::shared_ptr<CWallet> CreateNew(WalletContext& context, const std::string& name, std::unique_ptr<WalletDatabase> database, uint64_t wallet_creation_flags, bool born_encrypted, bilingual_str& error, std::vector<bilingual_str>& warnings);
+    static std::shared_ptr<CWallet> CreateNew(WalletContext& context, const std::string& name, std::unique_ptr<WalletDatabase> database, uint64_t wallet_creation_flags, bool born_encrypted, bilingual_str& error, std::vector<bilingual_str>& warnings, const std::optional<std::string>& signer_fingerprint = {});
 
     /* Initializes, loads, and returns a CWallet from an existing wallet; returns a null pointer in case of an error */
     static std::shared_ptr<CWallet> LoadExisting(WalletContext& context, const std::string& name, std::unique_ptr<WalletDatabase> database, bilingual_str& error, std::vector<bilingual_str>& warnings);
@@ -1037,13 +1037,15 @@ public:
     DescriptorScriptPubKeyMan& SetupDescriptorScriptPubKeyMan(WalletBatch& batch, const CExtKey& master_key, const OutputType& output_type, bool internal) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     //! Create new DescriptorScriptPubKeyMans and add them to the wallet
     void SetupDescriptorScriptPubKeyMans(WalletBatch& batch, const CExtKey& master_key) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
-    void SetupDescriptorScriptPubKeyMans() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void SetupDescriptorScriptPubKeyMans(const std::optional<std::string>& signer_fingerprint = {}) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
-    //! Create new seed and default DescriptorScriptPubKeyMans for this wallet
-    void SetupOwnDescriptorScriptPubKeyMans(WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! Create new seed and default DescriptorScriptPubKeyMans for this wallet.
+    //! Returns the generated master key so mixed-key wallets can store unused(KEY)
+    //! after the descriptor setup transaction commits.
+    CExtKey SetupOwnDescriptorScriptPubKeyMans(WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Setup new descriptors or seed for new address generation
-    void SetupWalletGeneration() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void SetupWalletGeneration(const std::optional<std::string>& signer_fingerprint = {}) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Return the DescriptorScriptPubKeyMan for a WalletDescriptor if it is already in the wallet
     DescriptorScriptPubKeyMan* GetDescriptorScriptPubKeyMan(const WalletDescriptor& desc) const;

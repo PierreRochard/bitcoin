@@ -8,7 +8,10 @@
 #include <wallet/scriptpubkeyman.h>
 
 #include <memory>
+#include <optional>
+#include <string>
 #include <util/result.h>
+#include <vector>
 
 struct bilingual_str;
 
@@ -29,7 +32,18 @@ public:
     static std::unique_ptr<ExternalSignerScriptPubKeyMan> LoadFromStorage(WalletStorage& storage, WalletDescriptor& descriptor, int64_t keypool_size, const KeyMap& keys, const CryptedKeyMap& ckeys);
     static std::unique_ptr<ExternalSignerScriptPubKeyMan> CreateNew(WalletStorage& storage, WalletBatch& batch, int64_t keypool_size, std::unique_ptr<Descriptor> desc);
 
-  static util::Result<ExternalSigner> GetExternalSigner();
+  //! All devices currently reported by `-signer`. Empty list if none are connected.
+  static util::Result<std::vector<ExternalSigner>> GetExternalSigners();
+
+  //! One signer. If `fingerprint` is set, that device is required. Otherwise
+  //! exactly one connected signer is required (used when creating a watch-only
+  //! external-signer wallet).
+  static util::Result<ExternalSigner> GetExternalSigner(const std::optional<std::string>& fingerprint = std::nullopt);
+
+  //! Ask each connected signer whose master fingerprint appears in `psbt` to
+  //! sign, then optionally finalize. Used after local ScriptPubKeyMans have
+  //! already filled in their keys.
+  static std::optional<common::PSBTError> SignPSBT(PartiallySignedTransaction& psbt, bool finalize);
 
   /**
   * Display address on the device and verify that the returned value matches.

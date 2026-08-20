@@ -90,10 +90,18 @@ parser_displayaddress = subparsers.add_parser('displayaddress', help='display ad
 parser_displayaddress.add_argument('--desc', metavar='desc')
 parser_displayaddress.set_defaults(func=displayaddress)
 
+def getxpub(args):
+    sys.stdout.write(json.dumps({
+        "xpub": "tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B"
+    }))
+
 parser_signtx = subparsers.add_parser('signtx')
 parser_signtx.add_argument('psbt', metavar='psbt')
-
 parser_signtx.set_defaults(func=signtx)
+
+parser_getxpub = subparsers.add_parser('getxpub')
+parser_getxpub.add_argument('path')
+parser_getxpub.set_defaults(func=getxpub)
 
 if not sys.stdin.isatty():
     buffer = sys.stdin.read()

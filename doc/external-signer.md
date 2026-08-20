@@ -196,6 +196,18 @@ Returns descriptors supported by the device. Example:
 }
 ```
 
+### `getxpub` (optional)
+
+Used by `createmultisigdescriptor` to fetch a BIP32 xpub at an arbitrary path
+(typically BIP48). Native HWI implements this in-process. A subprocess signer
+is called as:
+
+```sh
+<cmd> --fingerprint <fingerprint> --chain <name> getxpub <path>
+```
+
+and MUST return `{"xpub": "<xpub>"}`.
+
 ### `displayaddress` (optional)
 
 Usage:
@@ -224,7 +236,7 @@ The command MAY complain if `--chain` is set to a test-network, but the BIP32 co
 
 The `enumeratesigners` RPC calls `<cmd> enumerate`, skips duplicate entries with the same `fingerprint`, and maps the optional `model` field to the RPC `name` field.
 
-Wallet operations that need a signer (`createwallet`, `walletdisplayaddress` and spending) also call `<cmd> enumerate` and fail unless exactly one signer is found, so only one device should be connected at a time.
+Wallet operations that need a signer (`createwallet`, `walletdisplayaddress` and spending) call `<cmd> enumerate` and select a device by master key fingerprint. Watch-only `createwallet external_signer=true disable_private_keys=true` still requires either exactly one connected signer or the `signer` fingerprint argument. Mixed-key wallets (`external_signer=true` with private keys enabled) keep a local HD seed; use `createmultisigdescriptor` to combine it with hardware xpubs. Spending signs with local keys first, then each connected signer whose fingerprint appears in the PSBT.
 
 The `createwallet` RPC calls:
 

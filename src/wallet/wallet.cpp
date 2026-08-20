@@ -402,12 +402,8 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
     options.require_format = DatabaseFormat::SQLITE;
 
 
-    // Private keys must be disabled for an external signer wallet
-    if ((wallet_creation_flags & WALLET_FLAG_EXTERNAL_SIGNER) && !(wallet_creation_flags & WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
-        error = Untranslated("Private keys must be disabled when using an external signer");
-        status = DatabaseStatus::FAILED_CREATE;
-        return nullptr;
-    }
+    // Watch-only external-signer wallets have no passphrase (there are no keys to encrypt).
+    // Mixed-key wallets (local keys + hardware) may be encrypted.
 
     // Do not allow a passphrase when private keys are disabled
     if (born_encrypted && (wallet_creation_flags & WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
@@ -426,7 +422,7 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
 
     // Make the wallet
     context.chain->initMessage(_("Creating wallet…"));
-    std::shared_ptr<CWallet> wallet = CWallet::CreateNew(context, name, std::move(database), wallet_creation_flags, born_encrypted, error, warnings);
+    std::shared_ptr<CWallet> wallet = CWallet::CreateNew(context, name, std::move(database), wallet_creation_flags, born_encrypted, error, warnings, options.create_signer_fingerprint);
     if (!wallet) {
         error = Untranslated("Wallet creation failed.") + Untranslated(" ") + error;
         status = DatabaseStatus::FAILED_CREATE;
@@ -2246,6 +2242,15 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, co
         }
     }
 
+#ifdef ENABLE_EXTERNAL_SIGNER
+    if (options.sign && IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
+        const auto error{ExternalSignerScriptPubKeyMan::SignPSBT(psbtx, options.finalize)};
+        if (error) {
+            return error;
+        }
+    }
+#endif
+
     RemoveUnnecessaryTransactions(psbtx);
 
     // Complete if every input is now signed
@@ -2732,16 +2737,44 @@ void ReserveDestination::ReturnDestination()
 util::Result<void> CWallet::DisplayAddress(const CTxDestination& dest)
 {
     CScript scriptPubKey = GetScriptForDestination(dest);
-    for (const auto& spk_man : GetScriptPubKeyMans(scriptPubKey)) {
-        auto signer_spk_man = dynamic_cast<ExternalSignerScriptPubKeyMan *>(spk_man);
-        if (signer_spk_man == nullptr) {
-            continue;
-        }
-        auto signer{ExternalSignerScriptPubKeyMan::GetExternalSigner()};
-        if (!signer) throw std::runtime_error(util::ErrorString(signer).original);
-        return signer_spk_man->DisplayAddress(dest, *signer);
+    const auto spk_mans = GetScriptPubKeyMans(scriptPubKey);
+    if (spk_mans.empty()) {
+        return util::Error{_("There is no ScriptPubKeyManager for this address")};
     }
-    return util::Error{_("There is no ScriptPubKeyManager for this address")};
+
+    auto signers = ExternalSignerScriptPubKeyMan::GetExternalSigners();
+    if (!signers) throw std::runtime_error(util::ErrorString(signers).original);
+
+    for (const auto& spk_man : spk_mans) {
+        if (auto* ext = dynamic_cast<ExternalSignerScriptPubKeyMan*>(spk_man)) {
+            for (const ExternalSigner& signer : *signers) {
+                try {
+                    auto result = ext->DisplayAddress(dest, signer);
+                    if (result) return result;
+                } catch (const std::exception&) {
+                    continue;
+                }
+            }
+        } else {
+            auto provider = spk_man->GetSolvingProvider(scriptPubKey);
+            if (!provider) continue;
+            const auto descriptor = InferDescriptor(scriptPubKey, *provider);
+            for (const ExternalSigner& signer : *signers) {
+                try {
+                    auto result = signer.DisplayAddress(descriptor->ToString());
+                    const UniValue& error = result.find_value("error");
+                    if (error.isStr()) continue;
+                    const UniValue& ret_address = result.find_value("address");
+                    if (!ret_address.isStr()) continue;
+                    if (ret_address.getValStr() != EncodeDestination(dest)) continue;
+                    return {};
+                } catch (const std::exception&) {
+                    continue;
+                }
+            }
+        }
+    }
+    return util::Error{_("No connected external signer matches this address")};
 }
 
 void CWallet::LoadLockedCoin(const COutPoint& coin, bool persistent)
@@ -3107,7 +3140,7 @@ bool CWallet::LoadWalletArgs(std::shared_ptr<CWallet> wallet, const WalletContex
     return true;
 }
 
-std::shared_ptr<CWallet> CWallet::CreateNew(WalletContext& context, const std::string& name, std::unique_ptr<WalletDatabase> database, uint64_t wallet_creation_flags, bool born_encrypted, bilingual_str& error, std::vector<bilingual_str>& warnings)
+std::shared_ptr<CWallet> CWallet::CreateNew(WalletContext& context, const std::string& name, std::unique_ptr<WalletDatabase> database, uint64_t wallet_creation_flags, bool born_encrypted, bilingual_str& error, std::vector<bilingual_str>& warnings, const std::optional<std::string>& signer_fingerprint)
 {
     interfaces::Chain* chain = context.chain;
     const std::string& walletFile = database->Filename();
@@ -3138,7 +3171,7 @@ std::shared_ptr<CWallet> CWallet::CreateNew(WalletContext& context, const std::s
 
         // Born encrypted wallets will have their keys generated later
         if (!born_encrypted) {
-            walletInstance->SetupWalletGeneration();
+            walletInstance->SetupWalletGeneration(signer_fingerprint);
         }
 
         if (chain) {
@@ -3634,10 +3667,9 @@ void CWallet::SetupDescriptorScriptPubKeyMans(WalletBatch& batch, const CExtKey&
     }
 }
 
-void CWallet::SetupOwnDescriptorScriptPubKeyMans(WalletBatch& batch)
+CExtKey CWallet::SetupOwnDescriptorScriptPubKeyMans(WalletBatch& batch)
 {
     AssertLockHeld(cs_wallet);
-    assert(!IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER));
     // Make a seed
     CKey seed_key = GenerateRandomKey();
     CPubKey seed = seed_key.GetPubKey();
@@ -3648,19 +3680,47 @@ void CWallet::SetupOwnDescriptorScriptPubKeyMans(WalletBatch& batch)
     master_key.SetSeed(seed_key);
 
     SetupDescriptorScriptPubKeyMans(batch, master_key);
+    return master_key;
 }
 
-void CWallet::SetupDescriptorScriptPubKeyMans()
+static void AddUnusedMasterDescriptor(CWallet& wallet, const CExtKey& master_key)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    // Keep the seed as unused(KEY) so mixed-key wallets can derive BIP48
+    // (and other) paths from the master, not from a BIP84 account xpub.
+    // Must run outside of an open wallet DB transaction: AddWalletDescriptor
+    // opens its own batches.
+    std::string desc_str = "unused(" + EncodeExtKey(master_key) + ")";
+    FlatSigningProvider keys;
+    std::string error;
+    auto descs = Parse(desc_str, keys, error, /*require_checksum=*/false);
+    if (descs.empty()) {
+        throw std::runtime_error(std::string(__func__) + ": Invalid unused() descriptor (" + error + ")");
+    }
+    WalletDescriptor w_desc(std::move(descs.at(0)), GetTime(), 0, 0, 0);
+    if (auto spkm = wallet.AddWalletDescriptor(w_desc, keys, /*label=*/"", /*internal=*/false); !spkm) {
+        throw std::runtime_error(util::ErrorString(spkm).original);
+    }
+}
+
+void CWallet::SetupDescriptorScriptPubKeyMans(const std::optional<std::string>& signer_fingerprint)
 {
     AssertLockHeld(cs_wallet);
 
-    if (!IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
+    if (!IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER) || !IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+        CExtKey master_key;
         if (!RunWithinTxn(GetDatabase(), /*process_desc=*/"setup descriptors", [&](WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet){
-            SetupOwnDescriptorScriptPubKeyMans(batch);
+            master_key = SetupOwnDescriptorScriptPubKeyMans(batch);
             return true;
         })) throw std::runtime_error("Error: cannot process db transaction for descriptors setup");
-    } else {
-        auto signer = ExternalSignerScriptPubKeyMan::GetExternalSigner();
+        if (IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
+            AddUnusedMasterDescriptor(*this, master_key);
+        }
+        return;
+    }
+
+    {
+        auto signer = ExternalSignerScriptPubKeyMan::GetExternalSigner(signer_fingerprint);
         if (!signer) throw std::runtime_error(util::ErrorString(signer).original);
 
         // TODO: add account parameter
@@ -3700,7 +3760,7 @@ void CWallet::SetupDescriptorScriptPubKeyMans()
     }
 }
 
-void CWallet::SetupWalletGeneration()
+void CWallet::SetupWalletGeneration(const std::optional<std::string>& signer_fingerprint)
 {
     AssertLockHeld(cs_wallet);
     // Skip setup for non-external-signer wallets that are either blank
@@ -3709,7 +3769,7 @@ void CWallet::SetupWalletGeneration()
         (IsWalletFlagSet(WALLET_FLAG_BLANK_WALLET) || IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS))) {
         return;
     }
-    SetupDescriptorScriptPubKeyMans();
+    SetupDescriptorScriptPubKeyMans(signer_fingerprint);
 }
 
 void CWallet::AddActiveScriptPubKeyMan(uint256 id, OutputType type, bool internal)

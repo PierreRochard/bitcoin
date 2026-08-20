@@ -12,10 +12,12 @@
 #include <iostream>
 #include <key_io.h>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <univalue.h>
 #include <utility>
+#include <util/translation.h>
 #include <vector>
 
 using common::PSBTError;
@@ -52,15 +54,73 @@ std::unique_ptr<ExternalSignerScriptPubKeyMan> ExternalSignerScriptPubKeyMan::Cr
     return spkm;
 }
 
- util::Result<ExternalSigner> ExternalSignerScriptPubKeyMan::GetExternalSigner() {
+util::Result<std::vector<ExternalSigner>> ExternalSignerScriptPubKeyMan::GetExternalSigners()
+{
     const std::string command = gArgs.GetArg("-signer", "");
-    if (command == "") return util::Error{Untranslated("restart bitcoind with -signer=<cmd>")};
+    if (command.empty()) return util::Error{Untranslated("restart bitcoind with -signer=<cmd>")};
     std::vector<ExternalSigner> signers;
     ExternalSigner::Enumerate(command, signers, Params().GetChainTypeString());
-    if (signers.empty()) return util::Error{Untranslated("No external signers found")};
-    // TODO: add fingerprint argument instead of failing in case of multiple signers.
-    if (signers.size() > 1) return util::Error{Untranslated("More than one external signer found. Please connect only one at a time.")};
-    return signers[0];
+    return signers;
+}
+
+util::Result<ExternalSigner> ExternalSignerScriptPubKeyMan::GetExternalSigner(const std::optional<std::string>& fingerprint)
+{
+    auto signers = GetExternalSigners();
+    if (!signers) return util::Error{util::ErrorString(signers)};
+    if (fingerprint) {
+        for (const ExternalSigner& signer : *signers) {
+            if (signer.m_fingerprint == *fingerprint) return signer;
+        }
+        return util::Error{strprintf(_("No external signer with fingerprint %s"), *fingerprint)};
+    }
+    if (signers->empty()) return util::Error{Untranslated("No external signers found")};
+    if (signers->size() > 1) {
+        return util::Error{Untranslated("More than one external signer found. Specify the signer fingerprint.")};
+    }
+    return (*signers)[0];
+}
+
+std::optional<PSBTError> ExternalSignerScriptPubKeyMan::SignPSBT(PartiallySignedTransaction& psbt, bool finalize)
+{
+    bool complete = true;
+    for (const auto& input : psbt.inputs) {
+        complete &= PSBTInputSigned(input);
+    }
+    if (complete) {
+        if (finalize) FinalizePSBT(psbt);
+        return {};
+    }
+
+    auto signers = GetExternalSigners();
+    if (!signers) {
+        LogWarning("%s", util::ErrorString(signers).original);
+        return PSBTError::EXTERNAL_SIGNER_NOT_FOUND;
+    }
+    if (signers->empty()) {
+        return PSBTError::EXTERNAL_SIGNER_NOT_FOUND;
+    }
+
+    bool any_matched = false;
+    for (ExternalSigner& signer : *signers) {
+        std::string failure_reason;
+        if (signer.SignTransaction(psbt, failure_reason)) {
+            any_matched = true;
+            continue;
+        }
+        if (failure_reason.find("does not match") != std::string::npos) {
+            continue;
+        }
+        LogWarning("Failed to sign with %s (%s): %s\n", signer.m_name, signer.m_fingerprint, failure_reason);
+        return PSBTError::EXTERNAL_SIGNER_FAILED;
+    }
+
+    complete = true;
+    for (const auto& input : psbt.inputs) {
+        complete &= PSBTInputSigned(input);
+    }
+    if (finalize) FinalizePSBT(psbt);
+    (void)any_matched;
+    return {};
 }
 
 util::Result<void> ExternalSignerScriptPubKeyMan::DisplayAddress(const CTxDestination& dest, const ExternalSigner &signer) const
@@ -85,32 +145,10 @@ util::Result<void> ExternalSignerScriptPubKeyMan::DisplayAddress(const CTxDestin
     return util::Result<void>();
 }
 
-// If sign is true, transaction must previously have been filled
+// Local keys (if any) are applied here. Connected hardware signers are
+// invoked once from CWallet::FillPSBT after every ScriptPubKeyMan has run.
 std::optional<PSBTError> ExternalSignerScriptPubKeyMan::FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, const common::PSBTFillOptions& options, int* n_signed) const
 {
-    if (!options.sign) {
-        return DescriptorScriptPubKeyMan::FillPSBT(psbt, txdata, options, n_signed);
-    }
-
-    // Already complete if every input is now signed
-    bool complete = true;
-    for (const auto& input : psbt.inputs) {
-        complete &= PSBTInputSigned(input);
-    }
-    if (complete) return {};
-
-    auto signer{GetExternalSigner()};
-    if (!signer) {
-        LogWarning("%s", util::ErrorString(signer).original);
-        return PSBTError::EXTERNAL_SIGNER_NOT_FOUND;
-    }
-
-    std::string failure_reason;
-    if(!signer->SignTransaction(psbt, failure_reason)) {
-        LogWarning("Failed to sign: %s\n", failure_reason);
-        return PSBTError::EXTERNAL_SIGNER_FAILED;
-    }
-    if (options.finalize) FinalizePSBT(psbt); // This won't work in a multisig setup
-    return {};
+    return DescriptorScriptPubKeyMan::FillPSBT(psbt, txdata, options, n_signed);
 }
 } // namespace wallet

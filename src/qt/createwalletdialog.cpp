@@ -45,16 +45,14 @@ CreateWalletDialog::CreateWalletDialog(QWidget* parent) :
     });
 
     connect(ui->external_signer_checkbox, &QCheckBox::toggled, [this](bool checked) {
-        ui->encrypt_wallet_checkbox->setEnabled(!checked);
         ui->blank_wallet_checkbox->setEnabled(!checked);
-        ui->disable_privkeys_checkbox->setEnabled(!checked);
-
-        // The external signer checkbox is only enabled when a device is detected.
-        // In that case it is checked by default. Toggling it restores the other
-        // options to their default.
-        ui->encrypt_wallet_checkbox->setChecked(false);
-        ui->disable_privkeys_checkbox->setChecked(checked);
         ui->blank_wallet_checkbox->setChecked(false);
+        // Watch-only HWW remains the default. Uncheck disable_privkeys for a
+        // mixed-key wallet that keeps a local seed and co-signs with hardware.
+        ui->disable_privkeys_checkbox->setEnabled(true);
+        ui->disable_privkeys_checkbox->setChecked(checked);
+        ui->encrypt_wallet_checkbox->setEnabled(!ui->disable_privkeys_checkbox->isChecked());
+        ui->encrypt_wallet_checkbox->setChecked(false);
     });
 
     connect(ui->disable_privkeys_checkbox, &QCheckBox::toggled, [this](bool checked) {
@@ -108,7 +106,7 @@ void CreateWalletDialog::setSigners(const std::vector<std::unique_ptr<interfaces
         // The order matters, because connect() is called when toggling a checkbox:
         ui->blank_wallet_checkbox->setEnabled(false);
         ui->blank_wallet_checkbox->setChecked(false);
-        ui->disable_privkeys_checkbox->setEnabled(false);
+        ui->disable_privkeys_checkbox->setEnabled(true);
         ui->disable_privkeys_checkbox->setChecked(true);
         const std::string label = signers[0]->getName();
         ui->wallet_name_line_edit->setText(QString::fromStdString(label));
