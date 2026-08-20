@@ -22,6 +22,7 @@ public:
 
 private Q_SLOTS:
     void wizardTests();
+    void grabPages();
 };
 
 #endif // BITCOIN_QT_TEST_MULTISIGWIZARDTESTS_H

@@ -143,7 +143,7 @@ std::string FormatMultisigTranscript(const std::string& wallet_name,
     out << "Script: " << TypeLabel(type) << "\n";
     if (type == OutputType::BECH32M) {
         if (fallback_older) {
-            out << "Immediate: all " << keys.size() << " keys (tr(musig) key-path, BIP 327)\n";
+            out << "Immediate: all " << keys.size() << " keys (tr(musig) key-path, BIP 327 MuSig2)\n";
             out << "Fallback: " << nrequired << " of " << keys.size()
                 << " after " << *fallback_older << " blocks (older(), BIP 68)\n";
         } else if (nrequired == static_cast<int>(keys.size()) && keys.size() >= 2) {

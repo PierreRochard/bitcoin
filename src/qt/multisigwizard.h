@@ -61,6 +61,7 @@ public:
     void setOutputType(OutputType type);
     void setNRequired(int n);
     void setFallbackOlder(std::optional<uint32_t> blocks);
+    void setReceiveAddress(const QString& address) { m_receive_address = address; }
     void addHardwareKey(const std::string& fingerprint, const std::string& label);
     void addAirgappedKey(const std::string& fingerprint, const std::string& path, const std::string& xpub, const std::string& label);
     void rebuildKeyList();
