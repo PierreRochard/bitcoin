@@ -125,12 +125,13 @@ public:
         }
 
         std::optional<PrecomputedTransactionData> txdata = PrecomputePSBTData(psbt);
-        const common::PSBTFillOptions options{
-            .sign = true,
-            .finalize = false,
-            .bip32_derivs = true,
-        };
         for (size_t i = 0; i < psbt.inputs.size(); ++i) {
+            const common::PSBTFillOptions options{
+                .sign = true,
+                .sighash_type = psbt.inputs[i].sighash_type,
+                .finalize = false,
+                .bip32_derivs = true,
+            };
             const PSBTError err = SignPSBTInput(provider, psbt, static_cast<int>(i),
                                                 txdata ? &*txdata : nullptr, options);
             if (err != PSBTError::OK && err != PSBTError::INCOMPLETE) {
