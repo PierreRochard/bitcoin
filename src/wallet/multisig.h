@@ -36,6 +36,10 @@ struct MultisigOptions {
     OutputType type{OutputType::BECH32};
     uint32_t account{0};
     std::optional<bool> internal_only;
+    //! BIP 68 relative delay in blocks (miniscript older()). On bech32m this
+    //! builds tr(musig(…),and_v(v:older(N),multi_a(nrequired,…))):
+    //! n-of-n MuSig2 key-path now, m-of-n script-path after N confirmations.
+    std::optional<uint32_t> fallback_older;
 };
 
 struct MultisigDescriptorResult {
@@ -48,7 +52,9 @@ struct MultisigDescriptorResult {
 std::string DefaultMultisigPath(OutputType type, uint32_t account);
 //! Wrap key expressions: sh/wsh(sortedmulti) for pre-taproot; for bech32m,
 //! n-of-n is tr(musig(...)/<0;1>/*), m-of-n is tr(NUMS,sortedmulti_a(...)).
-std::string WrapSortedMulti(OutputType type, int nrequired, const std::vector<std::string>& keys);
+//! With fallback_older, bech32m is always tr(musig, and_v(older, multi_a)).
+std::string WrapSortedMulti(OutputType type, int nrequired, const std::vector<std::string>& keys,
+                            std::optional<uint32_t> fallback_older = {});
 
 bilingual_str ValidateMultisigPolicy(int nrequired, size_t nkeys);
 
@@ -58,7 +64,8 @@ std::string FormatMultisigTranscript(const std::string& wallet_name,
                                      int nrequired,
                                      const std::vector<MultisigKeySpec>& keys,
                                      OutputType type,
-                                     const std::vector<std::string>& public_descs);
+                                     const std::vector<std::string>& public_descs,
+                                     std::optional<uint32_t> fallback_older = {});
 
 //! Import an active sorted-multisig descriptor. Caller must hold cs_wallet
 //! and, for wallets with private keys, have unlocked the wallet.

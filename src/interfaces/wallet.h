@@ -142,7 +142,8 @@ public:
     //! Import an active sorted-multisig descriptor (see createmultisigdescriptor).
     virtual util::Result<std::vector<std::string>> createMultisigDescriptor(int nrequired,
         const std::vector<MultisigKey>& keys,
-        OutputType type) = 0;
+        OutputType type,
+        std::optional<uint32_t> fallback_older = {}) = 0;
 
     //! Lock coin.
     virtual bool lockCoin(const COutPoint& output, bool write_to_db) = 0;

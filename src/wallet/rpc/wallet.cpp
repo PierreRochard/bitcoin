@@ -883,16 +883,18 @@ static RPCMethod createmultisigdescriptor()
             },
             {"options", RPCArg::Type::OBJ_NAMED_PARAMS, RPCArg::Optional::OMITTED, "",
                 {
-                    {"type", RPCArg::Type::STR, RPCArg::Default{"bech32"}, "Address type. Options are \"legacy\" (sh(sortedmulti)), \"p2sh-segwit\" (sh(wsh(sortedmulti))), \"bech32\" (wsh(sortedmulti)), \"bech32m\" (tr(musig) for n-of-n, tr(NUMS,sortedmulti_a) for m-of-n)."},
+                    {"type", RPCArg::Type::STR, RPCArg::Default{"bech32"}, "Address type. Options are \"legacy\" (sh(sortedmulti)), \"p2sh-segwit\" (sh(wsh(sortedmulti))), \"bech32\" (wsh(sortedmulti)), \"bech32m\" (tr(musig) for n-of-n, tr(NUMS,sortedmulti_a) for m-of-n, or tr(musig,and_v(older,multi_a)) with fallback_older)."},
                     {"account", RPCArg::Type::NUM, RPCArg::Default{0}, "BIP48 account used when a key omits path."},
                     {"internal", RPCArg::Type::BOOL, RPCArg::DefaultHint{"Both receive and change"}, "If set, import only the receive (false) or change (true) branch instead of both."},
+                    {"fallback_older", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Bech32m only. Relative delay in blocks (miniscript older()) before an m-of-n script-path spend is valid. Immediate spends still use n-of-n MuSig2 on the key path. nrequired is the delayed threshold."},
                 },
             },
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
             {
-                {RPCResult::Type::NUM, "nrequired", "The threshold"},
+                {RPCResult::Type::NUM, "nrequired", "The threshold (delayed m-of-n when fallback_older is set)"},
+                {RPCResult::Type::NUM, "fallback_older", /*optional=*/true, "Relative recovery delay in blocks, if set"},
                 {RPCResult::Type::ARR, "descs", "The public descriptors that were added",
                     {{RPCResult::Type::STR, "", ""}}
                 },
@@ -933,6 +935,14 @@ static RPCMethod createmultisigdescriptor()
             const uint32_t account = options.exists("account") ? options["account"].getInt<int>() : 0;
             std::optional<bool> internal_only;
             if (options.exists("internal")) internal_only = options["internal"].get_bool();
+            std::optional<uint32_t> fallback_older;
+            if (options.exists("fallback_older")) {
+                const int v = options["fallback_older"].getInt<int>();
+                if (v < 0) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "fallback_older must be between 1 and 2^31-1 blocks");
+                }
+                fallback_older = static_cast<uint32_t>(v);
+            }
 
             std::vector<MultisigKeySpec> specs;
             specs.reserve(keys_param.size());
@@ -961,7 +971,7 @@ static RPCMethod createmultisigdescriptor()
                 EnsureWalletIsUnlocked(wallet);
             }
 
-            const auto created = CreateMultisigDescriptor(wallet, nrequired, specs, MultisigOptions{output_type, account, internal_only});
+            const auto created = CreateMultisigDescriptor(wallet, nrequired, specs, MultisigOptions{output_type, account, internal_only, fallback_older});
             if (!created) {
                 const std::string msg = util::ErrorString(created).original;
                 int code = RPC_WALLET_ERROR;
@@ -970,7 +980,8 @@ static RPCMethod createmultisigdescriptor()
                     msg.find("Derivation path") != std::string::npos ||
                     msg.find("fingerprint must") != std::string::npos ||
                     msg.find("Invalid BIP32") != std::string::npos ||
-                    msg.find("address type") != std::string::npos) {
+                    msg.find("address type") != std::string::npos ||
+                    msg.find("fallback_older") != std::string::npos) {
                     code = RPC_INVALID_PARAMETER;
                 } else if (msg.find("Private key") != std::string::npos ||
                            msg.find("Unable to parse") != std::string::npos ||
@@ -984,6 +995,7 @@ static RPCMethod createmultisigdescriptor()
             for (const auto& d : created->descs) descs.push_back(d);
             UniValue out{UniValue::VOBJ};
             out.pushKV("nrequired", created->nrequired);
+            if (fallback_older) out.pushKV("fallback_older", static_cast<int>(*fallback_older));
             out.pushKV("descs", std::move(descs));
             return out;
         },

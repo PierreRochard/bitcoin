@@ -52,7 +52,8 @@ static std::string StripMultipath(const std::string& key)
     return key;
 }
 
-std::string WrapSortedMulti(OutputType type, int nrequired, const std::vector<std::string>& keys)
+std::string WrapSortedMulti(OutputType type, int nrequired, const std::vector<std::string>& keys,
+                            std::optional<uint32_t> fallback_older)
 {
     auto sortedmulti = [&](const char* fn) {
         std::string inner = strprintf("%s(%d", fn, nrequired);
@@ -68,6 +69,18 @@ std::string WrapSortedMulti(OutputType type, int nrequired, const std::vector<st
     case OutputType::BECH32: return "wsh(" + sortedmulti("sortedmulti") + ")";
     case OutputType::BECH32M: {
         if (keys.empty()) return {};
+        if (fallback_older) {
+            if (keys.size() < 2) return {};
+            // 24861 vault: n-of-n MuSig2 key-path, m-of-n after a relative delay.
+            std::string musig{"musig("};
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (i) musig += ",";
+                musig += keys[i];
+            }
+            musig += ")";
+            // multi_a (not sortedmulti_a) is a miniscript fragment and can sit under older().
+            return strprintf("tr(%s,and_v(v:older(%u),%s))", musig, *fallback_older, sortedmulti("multi_a"));
+        }
         if (keys.size() == 1 && nrequired == 1) {
             return "tr(" + keys[0] + ")";
         }
@@ -119,7 +132,8 @@ std::string FormatMultisigTranscript(const std::string& wallet_name,
                                      int nrequired,
                                      const std::vector<MultisigKeySpec>& keys,
                                      OutputType type,
-                                     const std::vector<std::string>& public_descs)
+                                     const std::vector<std::string>& public_descs,
+                                     std::optional<uint32_t> fallback_older)
 {
     std::ostringstream out;
     out << "# Bitcoin Core multisig wallet\n";
@@ -128,7 +142,11 @@ std::string FormatMultisigTranscript(const std::string& wallet_name,
     out << "Policy: " << nrequired << " of " << keys.size() << "\n";
     out << "Script: " << TypeLabel(type) << "\n";
     if (type == OutputType::BECH32M) {
-        if (nrequired == static_cast<int>(keys.size()) && keys.size() >= 2) {
+        if (fallback_older) {
+            out << "Immediate: all " << keys.size() << " keys (tr(musig) key-path, BIP 327)\n";
+            out << "Fallback: " << nrequired << " of " << keys.size()
+                << " after " << *fallback_older << " blocks (older(), BIP 68)\n";
+        } else if (nrequired == static_cast<int>(keys.size()) && keys.size() >= 2) {
             out << "Construction: tr(musig) key-path (BIP 327 MuSig2)\n";
         } else if (keys.size() == 1) {
             out << "Construction: tr() Taproot singlesig\n";
@@ -255,6 +273,17 @@ util::Result<MultisigDescriptorResult> CreateMultisigDescriptor(CWallet& wallet,
     if (options.type == OutputType::UNKNOWN) {
         return util::Error{Untranslated("Unknown or unsupported address type")};
     }
+    if (options.fallback_older) {
+        if (options.type != OutputType::BECH32M) {
+            return util::Error{Untranslated("fallback_older is only valid with type bech32m")};
+        }
+        if (*options.fallback_older < 1 || *options.fallback_older >= (1u << 31)) {
+            return util::Error{Untranslated("fallback_older must be between 1 and 2^31-1 blocks")};
+        }
+        if (keys.size() < 2) {
+            return util::Error{Untranslated("fallback_older requires at least two keys")};
+        }
+    }
 
     const std::string default_path = DefaultMultisigPath(options.type, options.account);
     std::vector<std::string> key_exprs;
@@ -265,7 +294,7 @@ util::Result<MultisigDescriptorResult> CreateMultisigDescriptor(CWallet& wallet,
         key_exprs.push_back(*expr);
     }
 
-    std::string desc_str = WrapSortedMulti(options.type, nrequired, key_exprs);
+    std::string desc_str = WrapSortedMulti(options.type, nrequired, key_exprs, options.fallback_older);
     if (desc_str.empty()) {
         return util::Error{Untranslated("Unsupported address type")};
     }

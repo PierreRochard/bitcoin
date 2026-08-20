@@ -371,6 +371,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "createmultisigdescriptor", 2, "type"},
     { "createmultisigdescriptor", 2, "account"},
     { "createmultisigdescriptor", 2, "internal"},
+    { "createmultisigdescriptor", 2, "fallback_older"},
     { "restorewallet", 0, "wallet_name", ParamFormat::STRING },
     { "restorewallet", 1, "backup_file", ParamFormat::STRING },
     { "restorewallet", 2, "load_on_startup"},

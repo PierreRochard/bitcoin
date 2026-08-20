@@ -240,7 +240,7 @@ public:
         LOCK(m_wallet->cs_wallet);
         return m_wallet->DisplayAddress(dest, fingerprint);
     }
-    util::Result<std::vector<std::string>> createMultisigDescriptor(int nrequired, const std::vector<MultisigKey>& keys, OutputType type) override
+    util::Result<std::vector<std::string>> createMultisigDescriptor(int nrequired, const std::vector<MultisigKey>& keys, OutputType type, std::optional<uint32_t> fallback_older) override
     {
         std::vector<wallet::MultisigKeySpec> specs;
         specs.reserve(keys.size());
@@ -253,7 +253,7 @@ public:
             specs.push_back(std::move(spec));
         }
         LOCK(m_wallet->cs_wallet);
-        auto created = wallet::CreateMultisigDescriptor(*m_wallet, nrequired, specs, wallet::MultisigOptions{type, /*account=*/0, {}});
+        auto created = wallet::CreateMultisigDescriptor(*m_wallet, nrequired, specs, wallet::MultisigOptions{type, /*account=*/0, {}, fallback_older});
         if (!created) return util::Error{util::ErrorString(created)};
         return created->descs;
     }
