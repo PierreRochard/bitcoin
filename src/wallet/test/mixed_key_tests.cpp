@@ -13,6 +13,7 @@
 #include <outputtype.h>
 #include <primitives/transaction.h>
 #include <psbt.h>
+#include <pubkey.h>
 #include <script/descriptor.h>
 #include <script/script.h>
 #include <script/signingprovider.h>
@@ -34,6 +35,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace wallet {
@@ -84,21 +86,9 @@ static CExtKey NumberedMockMaster(size_t n)
 
 static std::vector<uint32_t> Bip48Path(OutputType type)
 {
-    uint32_t script = 2;
-    switch (type) {
-    case OutputType::LEGACY: script = 0; break;
-    case OutputType::P2SH_SEGWIT: script = 1; break;
-    case OutputType::BECH32: script = 2; break;
-    case OutputType::BECH32M:
-    case OutputType::UNKNOWN:
-        BOOST_FAIL("unsupported address type");
-    }
-    return {
-        48 | BIP32_HARDENED_FLAG,
-        BIP32_HARDENED_FLAG,
-        BIP32_HARDENED_FLAG,
-        script | BIP32_HARDENED_FLAG,
-    };
+    std::vector<uint32_t> path;
+    BOOST_REQUIRE(ParseHDKeypath(DefaultMultisigPath(type, /*account=*/0), path));
+    return path;
 }
 
 static std::string KeyExprLocal(const CExtKey& master, const std::vector<uint32_t>& path)
@@ -122,29 +112,11 @@ static std::string KeyExprHardware(hwi::MockRegistration& mock, const std::vecto
                      EncodeExtPubKey(xpub));
 }
 
-static std::string WrapSortedMulti(OutputType type, int nrequired, const std::vector<std::string>& keys)
-{
-    std::string inner = strprintf("sortedmulti(%d", nrequired);
-    for (const auto& key : keys) {
-        inner += "," + key;
-    }
-    inner += ")";
-    switch (type) {
-    case OutputType::LEGACY: return "sh(" + inner + ")";
-    case OutputType::P2SH_SEGWIT: return "sh(wsh(" + inner + "))";
-    case OutputType::BECH32: return "wsh(" + inner + ")";
-    case OutputType::BECH32M:
-    case OutputType::UNKNOWN:
-        break;
-    }
-    BOOST_FAIL("unsupported address type");
-    return {};
-}
-
 static void ImportSortedMulti(CWallet& wallet, int nrequired, const std::vector<std::string>& keys, OutputType type)
     EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
     std::string desc_str = WrapSortedMulti(type, nrequired, keys);
+    BOOST_REQUIRE_MESSAGE(!desc_str.empty(), "unsupported address type");
     const std::string checksum = GetDescriptorChecksum(desc_str);
     if (!checksum.empty()) desc_str += "#" + checksum;
 
@@ -509,6 +481,12 @@ BOOST_AUTO_TEST_CASE(transcript_and_policy)
     BOOST_CHECK(text.find("This computer") != std::string::npos);
     BOOST_CHECK(text.find("aabbccdd") != std::string::npos);
     BOOST_CHECK(text.find("wsh(sortedmulti") != std::string::npos);
+
+    const std::string tap = FormatMultisigTranscript("Family", "regtest", 2, keys, OutputType::BECH32M, {"tr(musig(a,b)/<0;1>/*)#xxxx"});
+    BOOST_CHECK(tap.find("bech32m (P2TR)") != std::string::npos);
+    BOOST_CHECK(tap.find("tr(musig)") != std::string::npos);
+    const std::string scriptpath = FormatMultisigTranscript("Family", "regtest", 2, std::vector<MultisigKeySpec>(3), OutputType::BECH32M, {});
+    BOOST_CHECK(scriptpath.find("sortedmulti_a") != std::string::npos);
 }
 
 BOOST_AUTO_TEST_CASE(create_descriptor_airgapped_xpub)
@@ -545,6 +523,89 @@ BOOST_AUTO_TEST_CASE(create_descriptor_airgapped_xpub)
     BOOST_REQUIRE_MESSAGE(created, util::ErrorString(created).original);
     BOOST_REQUIRE_EQUAL(created->descs.size(), 2U);
     BOOST_CHECK(created->descs[0].find("wsh(sortedmulti(2,") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(bech32m_descriptor_wrappers)
+{
+    BOOST_CHECK_EQUAL(DefaultMultisigPath(OutputType::BECH32, 0), "m/48h/0h/0h/2h");
+    BOOST_CHECK_EQUAL(DefaultMultisigPath(OutputType::BECH32M, 0), "m/48h/0h/0h/3h");
+    BOOST_CHECK_EQUAL(DefaultMultisigPath(OutputType::BECH32M, 1), "m/48h/0h/1h/3h");
+
+    const std::vector<std::string> two{
+        "[aaaaaaaa/48h/1h/0h/3h]xpub1/<0;1>/*",
+        "[bbbbbbbb/48h/1h/0h/3h]xpub2/<0;1>/*",
+    };
+    BOOST_CHECK_EQUAL(WrapSortedMulti(OutputType::BECH32M, 2, two),
+                      "tr(musig([aaaaaaaa/48h/1h/0h/3h]xpub1,[bbbbbbbb/48h/1h/0h/3h]xpub2)/<0;1>/*)");
+    BOOST_CHECK_EQUAL(WrapSortedMulti(OutputType::BECH32M, 1, {two[0]}), "tr(" + two[0] + ")");
+
+    const std::vector<std::string> three{
+        two[0], two[1], "[cccccccc/48h/1h/0h/3h]xpub3/<0;1>/*",
+    };
+    const std::string m_of_n = WrapSortedMulti(OutputType::BECH32M, 2, three);
+    BOOST_CHECK(m_of_n.find("tr(" + HexStr(XOnlyPubKey::NUMS_H) + ",sortedmulti_a(2,") == 0);
+    BOOST_CHECK(m_of_n.find(two[0]) != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(taproot_musig2)
+{
+    CheckComplete(ImportAndSign(2, {Role::Local, Role::Local}, OutputType::BECH32M, {}, LocalOnlyFlags()));
+    CheckComplete(ImportAndSign(2, {Role::Local, Role::Hardware}, OutputType::BECH32M));
+    CheckComplete(ImportAndSign(2, {Role::Hardware, Role::Hardware}, OutputType::BECH32M));
+    CheckComplete(ImportAndSign(3, {Role::Local, Role::Hardware, Role::Hardware}, OutputType::BECH32M));
+    CheckIncomplete(ImportAndSign(2, {Role::Local, Role::Hardware}, OutputType::BECH32M, {false}),
+                    PSBTError::EXTERNAL_SIGNER_NOT_FOUND);
+    CheckIncomplete(ImportAndSign(2, {Role::Hardware, Role::Hardware}, OutputType::BECH32M, {true, false}));
+    CheckIncomplete(ImportAndSign(3, {Role::Local, Role::Hardware, Role::Hardware}, OutputType::BECH32M, {true, false}));
+}
+
+BOOST_AUTO_TEST_CASE(taproot_sortedmulti_a)
+{
+    CheckComplete(ImportAndSign(2, {Role::Local, Role::Local, Role::Local}, OutputType::BECH32M, {}, LocalOnlyFlags()));
+    CheckComplete(ImportAndSign(2, {Role::Local, Role::Hardware, Role::Hardware}, OutputType::BECH32M));
+    CheckComplete(ImportAndSign(2, {Role::Local, Role::Hardware, Role::Hardware}, OutputType::BECH32M, {true, false}));
+    CheckComplete(ImportAndSign(1, {Role::Local, Role::Hardware}, OutputType::BECH32M, {false}));
+    CheckIncomplete(ImportAndSign(2, {Role::Local, Role::Hardware, Role::Hardware}, OutputType::BECH32M, {false, false}),
+                    PSBTError::EXTERNAL_SIGNER_NOT_FOUND);
+}
+
+BOOST_AUTO_TEST_CASE(create_descriptor_bech32m_musig)
+{
+    CExtKey local = RandomMaster();
+    CExtKey offline = RandomMaster();
+    const auto path = Bip48Path(OutputType::BECH32M);
+    auto child = DeriveExtKey(offline, path);
+    BOOST_REQUIRE(child);
+    const std::string fpr = HexStr(offline.id_key_fingerprint());
+
+    auto wallet = MakeBlankWallet(MixedFlags());
+    LOCK(wallet->cs_wallet);
+    {
+        std::string unused = "unused(" + EncodeExtKey(local) + ")";
+        FlatSigningProvider keys;
+        std::string error;
+        auto descs = Parse(unused, keys, error, false);
+        BOOST_REQUIRE(!descs.empty());
+        WalletDescriptor w(std::move(descs.at(0)), 1, 0, 0, 0);
+        BOOST_REQUIRE(wallet->AddWalletDescriptor(w, keys, "", false));
+    }
+
+    MultisigKeySpec k_local;
+    k_local.hdkey = EncodeExtPubKey(local.Neuter());
+    k_local.path = WriteHDKeypath(path);
+    MultisigKeySpec k_air;
+    k_air.fingerprint = fpr.size() == 8 ? fpr : fpr.substr(0, 8);
+    k_air.path = WriteHDKeypath(path);
+    k_air.xpub = EncodeExtPubKey(child->first.Neuter());
+
+    auto created = CreateMultisigDescriptor(*wallet, 2, {k_local, k_air}, MultisigOptions{OutputType::BECH32M, 0, {}});
+    BOOST_REQUIRE_MESSAGE(created, util::ErrorString(created).original);
+    BOOST_REQUIRE_EQUAL(created->descs.size(), 2U);
+    BOOST_CHECK(created->descs[0].find("tr(musig(") != std::string::npos);
+    BOOST_CHECK(created->descs[0].find(DefaultMultisigPath(OutputType::BECH32M, 0).substr(1) + "]") != std::string::npos);
+
+    const CTxDestination dest = *Assert(wallet->GetNewDestination(OutputType::BECH32M, ""));
+    BOOST_CHECK(std::holds_alternative<WitnessV1Taproot>(dest));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

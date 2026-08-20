@@ -19,6 +19,7 @@ from test_framework.wallet_util import WalletUnlock
 BIP48_BECH32 = "m/48h/1h/0h/2h"
 BIP48_P2SH = "m/48h/1h/0h/1h"
 BIP48_LEGACY = "m/48h/1h/0h/0h"
+BIP48_BECH32M = "m/48h/1h/0h/3h"
 
 
 class WalletCreateMultisigDescriptorTest(BitcoinTestFramework):
@@ -44,6 +45,8 @@ class WalletCreateMultisigDescriptorTest(BitcoinTestFramework):
         self.test_all_local_2of2()
         self.test_all_local_thresholds()
         self.test_address_types()
+        self.test_taproot_musig2()
+        self.test_taproot_sortedmulti_a()
         self.test_internal_and_account()
         self.test_multiple_hdkeys_require_explicit()
         self.test_encrypted()
@@ -82,10 +85,6 @@ class WalletCreateMultisigDescriptorTest(BitcoinTestFramework):
         assert_raises_rpc_error(
             -8, "Derivation path requires at least one hardened step",
             wallet.createmultisigdescriptor, 1, ["m/0/0/0"],
-        )
-        assert_raises_rpc_error(
-            -8, "Unknown or unsupported address type",
-            wallet.createmultisigdescriptor, 1, [BIP48_BECH32], {"type": "bech32m"},
         )
         assert_raises_rpc_error(
             -8, "Unknown or unsupported address type",
@@ -195,7 +194,7 @@ class WalletCreateMultisigDescriptorTest(BitcoinTestFramework):
         self.log.info("Test bech32, p2sh-segwit, and legacy wrappers")
         funding = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
         cases = [
-            ("bech32", BIP48_BECH32, "wsh(sortedmulti(2,", "bcrt1"),
+            ("bech32", BIP48_BECH32, "wsh(sortedmulti(2,", "bcrt1q"),
             ("p2sh-segwit", BIP48_P2SH, "sh(wsh(sortedmulti(2,", "2"),
             ("legacy", BIP48_LEGACY, "sh(sortedmulti(2,", None),
         ]
@@ -216,6 +215,49 @@ class WalletCreateMultisigDescriptorTest(BitcoinTestFramework):
         x1, x2 = self._two_hdkeys(wallet)
         res = wallet.createmultisigdescriptor(2, [{"hdkey": x1}, {"hdkey": x2}])
         assert "/48h/1h/0h/2h]" in res["descs"][0]
+
+    def test_taproot_musig2(self):
+        self.log.info("Test n-of-n bech32m as tr(musig)")
+        funding = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
+        wallet = self._blank("type_bech32m_musig")
+        x1, x2 = self._two_hdkeys(wallet)
+        res = wallet.createmultisigdescriptor(
+            2, self._keys([x1, x2], path=BIP48_BECH32M), {"type": "bech32m"},
+        )
+        assert res["descs"][0].startswith("tr(musig(")
+        assert "/48h/1h/0h/3h]" in res["descs"][0]
+        addr = wallet.getnewaddress("", "bech32m")
+        assert addr.startswith("bcrt1p")
+        info = wallet.getaddressinfo(addr)
+        assert_equal(info["ischange"], False)
+        funding.sendtoaddress(addr, 4)
+        self.generate(self.nodes[0], 1)
+        sent = wallet.send(outputs={funding.getnewaddress(): 1}, options={"change_type": "bech32m"})
+        assert sent["complete"]
+
+        default_path = self._blank("type_bech32m_default_path")
+        d1, d2 = self._two_hdkeys(default_path)
+        res = default_path.createmultisigdescriptor(2, [{"hdkey": d1}, {"hdkey": d2}], {"type": "bech32m"})
+        assert "/48h/1h/0h/3h]" in res["descs"][0]
+        assert res["descs"][0].startswith("tr(musig(")
+
+    def test_taproot_sortedmulti_a(self):
+        self.log.info("Test m-of-n bech32m as tr(NUMS,sortedmulti_a)")
+        funding = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
+        wallet = self._blank("type_bech32m_multi_a")
+        x1, x2, x3 = wallet.addhdkey()["xpub"], wallet.addhdkey()["xpub"], wallet.addhdkey()["xpub"]
+        res = wallet.createmultisigdescriptor(
+            2, self._keys([x1, x2, x3], path=BIP48_BECH32M), {"type": "bech32m"},
+        )
+        assert "sortedmulti_a(2," in res["descs"][0]
+        assert res["descs"][0].startswith("tr(")
+        assert "musig(" not in res["descs"][0]
+        addr = wallet.getnewaddress("", "bech32m")
+        assert addr.startswith("bcrt1p")
+        funding.sendtoaddress(addr, 4)
+        self.generate(self.nodes[0], 1)
+        sent = wallet.send(outputs={funding.getnewaddress(): 1}, options={"change_type": "bech32m"})
+        assert sent["complete"]
 
     def test_internal_and_account(self):
         self.log.info("Test internal and account options")
