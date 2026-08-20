@@ -181,6 +181,7 @@ BASE_SCRIPTS = [
     'wallet_createmultisigdescriptor.py',
     'wallet_taproot_multisig_edge.py',
     'wallet_taproot_vault_local.py',
+    'wallet_taproot_vault_mixed.py',
     'wallet_exported_watchonly.py',
     'interface_zmq.py',
     'rpc_invalid_address_message.py',
