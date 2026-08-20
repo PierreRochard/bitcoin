@@ -6,6 +6,8 @@
 #define BITCOIN_QT_MULTISIGWIZARD_H
 
 #include <addresstype.h>
+#include <cstdint>
+#include <optional>
 #include <outputtype.h>
 #include <util/result.h>
 #include <util/translation.h>
@@ -48,6 +50,7 @@ public:
 
     QString walletName() const { return m_wallet_name; }
     int nrequired() const { return m_nrequired; }
+    std::optional<uint32_t> fallbackOlder() const { return m_fallback_older; }
     const std::vector<wallet::MultisigKeySpec>& keys() const { return m_keys; }
     OutputType outputType() const { return m_type; }
     bool includeLocalKey() const { return m_include_local; }
@@ -57,6 +60,7 @@ public:
     void setIncludeLocalKey(bool include);
     void setOutputType(OutputType type);
     void setNRequired(int n);
+    void setFallbackOlder(std::optional<uint32_t> blocks);
     void addHardwareKey(const std::string& fingerprint, const std::string& label);
     void addAirgappedKey(const std::string& fingerprint, const std::string& path, const std::string& xpub, const std::string& label);
     void rebuildKeyList();
@@ -92,6 +96,7 @@ private:
     std::vector<wallet::MultisigKeySpec> m_airgapped;
     std::vector<wallet::MultisigKeySpec> m_keys;
     int m_nrequired{2};
+    std::optional<uint32_t> m_fallback_older;
     std::vector<std::string> m_public_descs;
     WalletModel* m_wallet_model{nullptr};
     QString m_create_error;

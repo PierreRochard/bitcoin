@@ -34,9 +34,12 @@ void MultisigWizardTests::wizardTests()
     QVERIFY(transcript.contains(QStringLiteral("This computer")));
 
     wizard.setOutputType(OutputType::BECH32M);
+    wizard.setFallbackOlder(144);
     const QString tap = wizard.transcript();
     QVERIFY(tap.contains(QStringLiteral("bech32m")));
     QVERIFY(tap.contains(QStringLiteral("MuSig2")));
+    QVERIFY(tap.contains(QStringLiteral("144")));
+    QVERIFY(tap.contains(QStringLiteral("older")));
 
     wizard.next();
     wizard.next();

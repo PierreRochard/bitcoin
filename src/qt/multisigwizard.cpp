@@ -105,7 +105,7 @@ public:
             "Typical setups:</p>"
             "<ul>"
             "<li><b>2 of 3</b> — this computer plus two hardware wallets (Sparrow/BlueWallet default).</li>"
-            "<li><b>2 of 2</b> — this computer and one device you keep elsewhere. Taproot n-of-n uses MuSig2.</li>"
+            "<li><b>Taproot vault</b> — all keys spend immediately as MuSig2; after a delay, fewer keys can recover.</li>"
             "<li>Air-gapped keys — paste an xpub now, sign later with a PSBT file.</li>"
             "</ul>"
             "<p>You will pick the keys, choose how many signatures are required, "
@@ -131,7 +131,7 @@ public:
     explicit MultisigSetupPage(MultisigWizard* wizard) : QWizardPage(wizard), m_wizard(wizard)
     {
         setTitle(tr("Name and address type"));
-        setSubTitle(tr("Native SegWit (P2WSH) is the usual choice. Taproot uses MuSig2 when every key must sign."));
+        setSubTitle(tr("Native SegWit (P2WSH) works on every device. Taproot is n-of-n MuSig2 now, with an optional delayed recovery path."));
         auto* form = new QFormLayout(this);
         name = new QLineEdit;
         name->setObjectName("walletNameEdit");
@@ -140,7 +140,7 @@ public:
         type = new QComboBox;
         type->setObjectName("scriptTypeCombo");
         type->addItem(tr("Native SegWit (bech32, P2WSH) — recommended"), QVariant::fromValue(static_cast<int>(OutputType::BECH32)));
-        type->addItem(tr("Taproot (bech32m, P2TR) — n-of-n is MuSig2; otherwise a NUMS script path"), QVariant::fromValue(static_cast<int>(OutputType::BECH32M)));
+        type->addItem(tr("Taproot (bech32m, P2TR) — MuSig2 key-path; delayed m-of-n recovery"), QVariant::fromValue(static_cast<int>(OutputType::BECH32M)));
         type->addItem(tr("Nested SegWit (p2sh-segwit, P2SH-P2WSH)"), QVariant::fromValue(static_cast<int>(OutputType::P2SH_SEGWIT)));
         type->addItem(tr("Legacy (P2SH)"), QVariant::fromValue(static_cast<int>(OutputType::LEGACY)));
         form->addRow(tr("Wallet name"), name);
@@ -331,6 +331,8 @@ class MultisigThresholdPage : public QWizardPage
 {
 public:
     QSpinBox* required{nullptr};
+    QSpinBox* delay{nullptr};
+    QLabel* delay_label{nullptr};
     QLabel* sentence{nullptr};
 
     explicit MultisigThresholdPage(MultisigWizard* wizard) : QWizardPage(wizard), m_wizard(wizard)
@@ -350,10 +352,26 @@ public:
         row->addWidget(required);
         row->addStretch();
         layout->addLayout(row);
+        auto* delay_row = new QHBoxLayout;
+        delay_label = new QLabel(tr("Recovery delay (blocks)"));
+        delay = new QSpinBox;
+        delay->setObjectName("fallbackOlderSpin");
+        delay->setMinimum(0);
+        delay->setMaximum((1 << 30) - 1);
+        delay->setSpecialValueText(tr("Off"));
+        delay_row->addWidget(delay_label);
+        delay_row->addWidget(delay);
+        delay_row->addStretch();
+        layout->addLayout(delay_row);
         layout->addWidget(sentence);
         layout->addStretch();
         connect(required, qOverload<int>(&QSpinBox::valueChanged), this, [this](int v) {
             m_wizard->setNRequired(v);
+            updateSentence();
+            Q_EMIT completeChanged();
+        });
+        connect(delay, qOverload<int>(&QSpinBox::valueChanged), this, [this](int v) {
+            m_wizard->setFallbackOlder(v > 0 ? std::optional<uint32_t>{static_cast<uint32_t>(v)} : std::nullopt);
             updateSentence();
             Q_EMIT completeChanged();
         });
@@ -367,6 +385,17 @@ public:
         if (def < 1 || def > n) def = std::min(2, n);
         required->setValue(def);
         m_wizard->setNRequired(def);
+        const bool taproot = m_wizard->outputType() == OutputType::BECH32M;
+        delay->setVisible(taproot);
+        delay_label->setVisible(taproot);
+        if (taproot) {
+            const int cur = m_wizard->fallbackOlder() ? static_cast<int>(*m_wizard->fallbackOlder()) : 144;
+            delay->setValue(cur);
+            m_wizard->setFallbackOlder(cur > 0 ? std::optional<uint32_t>{static_cast<uint32_t>(cur)} : std::nullopt);
+        } else {
+            delay->setValue(0);
+            m_wizard->setFallbackOlder(std::nullopt);
+        }
         updateSentence();
     }
     bool isComplete() const override
@@ -381,7 +410,12 @@ private:
         const int n = static_cast<int>(m_wizard->keys().size());
         QString extra = tr("Write this down. Changing the threshold later means a new wallet and moving funds.");
         if (m_wizard->outputType() == OutputType::BECH32M) {
-            if (m_wizard->nrequired() == n && n >= 2) {
+            if (m_wizard->fallbackOlder()) {
+                extra = tr("Immediately every key signs as one MuSig2 signature. After %1 blocks, %2 of %3 can recover.")
+                            .arg(*m_wizard->fallbackOlder())
+                            .arg(m_wizard->nrequired())
+                            .arg(n);
+            } else if (m_wizard->nrequired() == n && n >= 2) {
                 extra = tr("Taproot n-of-n spends as one MuSig2 signature (BIP 327). Every key still has to participate.");
             } else {
                 extra = tr("Taproot m-of-n uses an unspendable key-path and a sortedmulti_a script path (BIP 387).");
@@ -590,6 +624,7 @@ void MultisigWizard::setWalletName(const QString& name) { m_wallet_name = name; 
 void MultisigWizard::setIncludeLocalKey(bool include) { m_include_local = include; }
 void MultisigWizard::setOutputType(OutputType type) { m_type = type; }
 void MultisigWizard::setNRequired(int n) { m_nrequired = n; }
+void MultisigWizard::setFallbackOlder(std::optional<uint32_t> blocks) { m_fallback_older = blocks; }
 
 void MultisigWizard::addHardwareKey(const std::string& fingerprint, const std::string& label)
 {
@@ -640,7 +675,8 @@ QString MultisigWizard::transcript() const
         m_nrequired,
         m_keys,
         m_type,
-        m_public_descs));
+        m_public_descs,
+        m_fallback_older));
 }
 
 bilingual_str MultisigWizard::policyError() const
@@ -687,7 +723,7 @@ bool MultisigWizard::createWallet()
     for (const auto& k : m_keys) {
         iface_keys.push_back({k.path, k.fingerprint, k.hdkey, k.xpub});
     }
-    auto imported = m_wallet_model->wallet().createMultisigDescriptor(m_nrequired, iface_keys, m_type);
+    auto imported = m_wallet_model->wallet().createMultisigDescriptor(m_nrequired, iface_keys, m_type, m_fallback_older);
     if (!imported) {
         m_create_error = QString::fromStdString(util::ErrorString(imported).original);
         return false;
