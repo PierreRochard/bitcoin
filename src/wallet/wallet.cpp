@@ -2229,27 +2229,55 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, co
     }
     const PrecomputedTransactionData& txdata = *txdata_res;
 
-    // Fill in information from ScriptPubKeyMans
-    for (ScriptPubKeyMan* spk_man : GetAllScriptPubKeyMans()) {
-        int n_signed_this_spkm = 0;
-        const auto error{spk_man->FillPSBT(psbtx, txdata, options, &n_signed_this_spkm)};
-        if (error) {
-            return error;
+    auto CountMuSig2 = [&]() {
+        size_t nonces = 0;
+        size_t partial_sigs = 0;
+        for (const auto& input : psbtx.inputs) {
+            for (const auto& [_, m] : input.m_musig2_pubnonces) nonces += m.size();
+            for (const auto& [_, m] : input.m_musig2_partial_sigs) partial_sigs += m.size();
         }
+        return std::make_pair(nonces, partial_sigs);
+    };
 
-        if (n_signed) {
-            (*n_signed) += n_signed_this_spkm;
+    // MuSig2 is two-round (pubnonces, then partial signatures). Local keys and
+    // connected hardware each contribute one round per FillPSBT pass. Loop so a
+    // mixed-key tr(musig) wallet can finish in a single send()/FillPSBT when
+    // every participant is present. Separate-wallet MuSig2 still uses one pass
+    // (no progress after the nonce round).
+    std::optional<std::pair<size_t, size_t>> prev_musig;
+    const int max_rounds = options.sign ? 3 : 1;
+    for (int round = 0; round < max_rounds; ++round) {
+        for (ScriptPubKeyMan* spk_man : GetAllScriptPubKeyMans()) {
+            int n_signed_this_spkm = 0;
+            const auto error{spk_man->FillPSBT(psbtx, txdata, options, &n_signed_this_spkm)};
+            if (error) {
+                return error;
+            }
+            if (n_signed && round == 0) {
+                (*n_signed) += n_signed_this_spkm;
+            }
         }
-    }
 
 #ifdef ENABLE_EXTERNAL_SIGNER
-    if (options.sign && IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
-        const auto error{ExternalSignerScriptPubKeyMan::SignPSBT(psbtx, options.finalize)};
-        if (error) {
-            return error;
+        if (options.sign && IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
+            const auto error{ExternalSignerScriptPubKeyMan::SignPSBT(psbtx, options.finalize)};
+            if (error) {
+                return error;
+            }
         }
-    }
 #endif
+
+        complete = true;
+        for (size_t i = 0; i < psbtx.inputs.size(); ++i) {
+            complete &= PSBTInputSignedAndVerified(psbtx, i, &txdata);
+        }
+        if (complete) break;
+
+        const auto musig = CountMuSig2();
+        if (musig.first == 0 && musig.second == 0) break;
+        if (prev_musig && *prev_musig == musig) break;
+        prev_musig = musig;
+    }
 
     RemoveUnnecessaryTransactions(psbtx);
 

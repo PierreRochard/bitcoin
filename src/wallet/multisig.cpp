@@ -8,6 +8,7 @@
 #include <external_signer.h>
 #include <key_io.h>
 #include <outputtype.h>
+#include <pubkey.h>
 #include <script/descriptor.h>
 #include <tinyformat.h>
 #include <univalue.h>
@@ -24,12 +25,13 @@ namespace wallet {
 std::string DefaultMultisigPath(OutputType type, uint32_t account)
 {
     const uint32_t coin = Params().GetChainType() == ChainType::MAIN ? 0 : 1;
+    // BIP48 script types: 0=legacy, 1=p2sh-segwit, 2=bech32, 3=bech32m (Sparrow/Specter).
     uint32_t script = 2;
     switch (type) {
     case OutputType::LEGACY: script = 0; break;
     case OutputType::P2SH_SEGWIT: script = 1; break;
     case OutputType::BECH32: script = 2; break;
-    case OutputType::BECH32M:
+    case OutputType::BECH32M: script = 3; break;
     case OutputType::UNKNOWN:
         break;
     }
@@ -41,18 +43,47 @@ std::string DefaultMultisigPath(OutputType type, uint32_t account)
     });
 }
 
+static std::string StripMultipath(const std::string& key)
+{
+    static const std::string suffix{"/<0;1>/*"};
+    if (key.size() >= suffix.size() && key.ends_with(suffix)) {
+        return key.substr(0, key.size() - suffix.size());
+    }
+    return key;
+}
+
 std::string WrapSortedMulti(OutputType type, int nrequired, const std::vector<std::string>& keys)
 {
-    std::string inner = strprintf("sortedmulti(%d", nrequired);
-    for (const auto& key : keys) {
-        inner += "," + key;
-    }
-    inner += ")";
+    auto sortedmulti = [&](const char* fn) {
+        std::string inner = strprintf("%s(%d", fn, nrequired);
+        for (const auto& key : keys) {
+            inner += "," + key;
+        }
+        inner += ")";
+        return inner;
+    };
     switch (type) {
-    case OutputType::LEGACY: return "sh(" + inner + ")";
-    case OutputType::P2SH_SEGWIT: return "sh(wsh(" + inner + "))";
-    case OutputType::BECH32: return "wsh(" + inner + ")";
-    case OutputType::BECH32M:
+    case OutputType::LEGACY: return "sh(" + sortedmulti("sortedmulti") + ")";
+    case OutputType::P2SH_SEGWIT: return "sh(wsh(" + sortedmulti("sortedmulti") + "))";
+    case OutputType::BECH32: return "wsh(" + sortedmulti("sortedmulti") + ")";
+    case OutputType::BECH32M: {
+        if (keys.empty()) return {};
+        if (keys.size() == 1 && nrequired == 1) {
+            return "tr(" + keys[0] + ")";
+        }
+        if (nrequired == static_cast<int>(keys.size())) {
+            // n-of-n: BIP 327 MuSig2 key aggregation, then BIP 328 unhardened receive/change.
+            std::string inner{"musig("};
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (i) inner += ",";
+                inner += StripMultipath(keys[i]);
+            }
+            inner += ")";
+            return "tr(" + inner + "/<0;1>/*)";
+        }
+        // m-of-n: unspendable NUMS internal key, BIP 387 sortedmulti_a script path.
+        return strprintf("tr(%s,%s)", HexStr(XOnlyPubKey::NUMS_H), sortedmulti("sortedmulti_a"));
+    }
     case OutputType::UNKNOWN:
         break;
     }
@@ -76,7 +107,7 @@ static std::string TypeLabel(OutputType type)
     case OutputType::LEGACY: return "legacy (P2SH)";
     case OutputType::P2SH_SEGWIT: return "p2sh-segwit (P2SH-P2WSH)";
     case OutputType::BECH32: return "bech32 (P2WSH)";
-    case OutputType::BECH32M:
+    case OutputType::BECH32M: return "bech32m (P2TR)";
     case OutputType::UNKNOWN:
         break;
     }
@@ -96,6 +127,15 @@ std::string FormatMultisigTranscript(const std::string& wallet_name,
     out << "Network: " << chain << "\n";
     out << "Policy: " << nrequired << " of " << keys.size() << "\n";
     out << "Script: " << TypeLabel(type) << "\n";
+    if (type == OutputType::BECH32M) {
+        if (nrequired == static_cast<int>(keys.size()) && keys.size() >= 2) {
+            out << "Construction: tr(musig) key-path (BIP 327 MuSig2)\n";
+        } else if (keys.size() == 1) {
+            out << "Construction: tr() Taproot singlesig\n";
+        } else {
+            out << "Construction: tr(NUMS,sortedmulti_a) script-path (BIP 387)\n";
+        }
+    }
     out << "\n## Cosigners\n";
     for (size_t i = 0; i < keys.size(); ++i) {
         const MultisigKeySpec& k = keys[i];
@@ -212,7 +252,7 @@ util::Result<MultisigDescriptorResult> CreateMultisigDescriptor(CWallet& wallet,
     if (const auto err = ValidateMultisigPolicy(nrequired, keys.size()); !err.empty()) {
         return util::Error{err};
     }
-    if (options.type == OutputType::BECH32M || options.type == OutputType::UNKNOWN) {
+    if (options.type == OutputType::UNKNOWN) {
         return util::Error{Untranslated("Unknown or unsupported address type")};
     }
 

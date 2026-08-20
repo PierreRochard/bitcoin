@@ -16,7 +16,7 @@
 namespace wallet {
 class CWallet;
 
-//! One participant in a sorted-multisig descriptor.
+//! One participant in a multisig descriptor (sortedmulti, musig, or sortedmulti_a).
 struct MultisigKeySpec {
     //! BIP32 path from the master key. Empty means the default BIP48 path.
     std::optional<std::string> path;
@@ -44,7 +44,10 @@ struct MultisigDescriptorResult {
     std::vector<std::string> key_exprs;
 };
 
+//! BIP48 account path. Script type 0/1/2/3 = legacy / p2sh-segwit / bech32 / bech32m.
 std::string DefaultMultisigPath(OutputType type, uint32_t account);
+//! Wrap key expressions: sh/wsh(sortedmulti) for pre-taproot; for bech32m,
+//! n-of-n is tr(musig(...)/<0;1>/*), m-of-n is tr(NUMS,sortedmulti_a(...)).
 std::string WrapSortedMulti(OutputType type, int nrequired, const std::vector<std::string>& keys);
 
 bilingual_str ValidateMultisigPolicy(int nrequired, size_t nkeys);

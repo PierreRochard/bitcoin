@@ -860,7 +860,7 @@ static RPCMethod createmultisigdescriptor()
 {
     return RPCMethod{
         "createmultisigdescriptor",
-        "Create and import an active sorted-multisig descriptor from local HD keys and/or connected external signers.\n"
+        "Create and import an active multisig descriptor from local HD keys and/or connected external signers.\n"
         "Each key is either a local BIP32 path (derived with the wallet's HD seed), an 8-character signer fingerprint "
         "(xpub fetched from that device), or an object specifying path/fingerprint/hdkey/xpub. "
         "An object with fingerprint+xpub is an air-gapped key and does not require the device to be connected.\n"
@@ -883,7 +883,7 @@ static RPCMethod createmultisigdescriptor()
             },
             {"options", RPCArg::Type::OBJ_NAMED_PARAMS, RPCArg::Optional::OMITTED, "",
                 {
-                    {"type", RPCArg::Type::STR, RPCArg::Default{"bech32"}, "Address type. Options are \"legacy\" (sh(sortedmulti)), \"p2sh-segwit\" (sh(wsh(sortedmulti))), \"bech32\" (wsh(sortedmulti))."},
+                    {"type", RPCArg::Type::STR, RPCArg::Default{"bech32"}, "Address type. Options are \"legacy\" (sh(sortedmulti)), \"p2sh-segwit\" (sh(wsh(sortedmulti))), \"bech32\" (wsh(sortedmulti)), \"bech32m\" (tr(musig) for n-of-n, tr(NUMS,sortedmulti_a) for m-of-n)."},
                     {"account", RPCArg::Type::NUM, RPCArg::Default{0}, "BIP48 account used when a key omits path."},
                     {"internal", RPCArg::Type::BOOL, RPCArg::DefaultHint{"Both receive and change"}, "If set, import only the receive (false) or change (true) branch instead of both."},
                 },
@@ -925,7 +925,7 @@ static RPCMethod createmultisigdescriptor()
             OutputType output_type = OutputType::BECH32;
             if (options.exists("type")) {
                 auto parsed = ParseOutputType(options["type"].get_str());
-                if (!parsed || *parsed == OutputType::BECH32M || *parsed == OutputType::UNKNOWN) {
+                if (!parsed || *parsed == OutputType::UNKNOWN) {
                     throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown or unsupported address type");
                 }
                 output_type = *parsed;
