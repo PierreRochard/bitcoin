@@ -2734,7 +2734,7 @@ void ReserveDestination::ReturnDestination()
     address = CNoDestination();
 }
 
-util::Result<void> CWallet::DisplayAddress(const CTxDestination& dest)
+util::Result<void> CWallet::DisplayAddress(const CTxDestination& dest, const std::optional<std::string>& fingerprint)
 {
     CScript scriptPubKey = GetScriptForDestination(dest);
     const auto spk_mans = GetScriptPubKeyMans(scriptPubKey);
@@ -2745,9 +2745,14 @@ util::Result<void> CWallet::DisplayAddress(const CTxDestination& dest)
     auto signers = ExternalSignerScriptPubKeyMan::GetExternalSigners();
     if (!signers) throw std::runtime_error(util::ErrorString(signers).original);
 
+    auto matches = [&](const ExternalSigner& signer) {
+        return !fingerprint || signer.m_fingerprint == *fingerprint;
+    };
+
     for (const auto& spk_man : spk_mans) {
         if (auto* ext = dynamic_cast<ExternalSignerScriptPubKeyMan*>(spk_man)) {
             for (const ExternalSigner& signer : *signers) {
+                if (!matches(signer)) continue;
                 try {
                     auto result = ext->DisplayAddress(dest, signer);
                     if (result) return result;
@@ -2759,7 +2764,8 @@ util::Result<void> CWallet::DisplayAddress(const CTxDestination& dest)
             auto provider = spk_man->GetSolvingProvider(scriptPubKey);
             if (!provider) continue;
             const auto descriptor = InferDescriptor(scriptPubKey, *provider);
-            for (const ExternalSigner& signer : *signers) {
+            for (ExternalSigner& signer : *signers) {
+                if (!matches(signer)) continue;
                 try {
                     auto result = signer.DisplayAddress(descriptor->ToString());
                     const UniValue& error = result.find_value("error");
@@ -2774,7 +2780,8 @@ util::Result<void> CWallet::DisplayAddress(const CTxDestination& dest)
             }
         }
     }
-    return util::Error{_("No connected external signer matches this address")};
+    return util::Error{fingerprint ? strprintf(_("No connected external signer with fingerprint %s matches this address"), *fingerprint)
+                                   : _("No connected external signer matches this address")};
 }
 
 void CWallet::LoadLockedCoin(const COutPoint& coin, bool persistent)

@@ -22,6 +22,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <type_traits>
@@ -125,8 +126,23 @@ public:
     //! Save or remove receive request.
     virtual bool setAddressReceiveRequest(const CTxDestination& dest, const std::string& id, const std::string& value) = 0;
 
-    //! Display address on external signer
-    virtual util::Result<void> displayAddress(const CTxDestination& dest) = 0;
+    //! Display address on an external signer. If fingerprint is set, that
+    //! device is required (multisig verification). Otherwise any matching
+    //! connected signer is used.
+    virtual util::Result<void> displayAddress(const CTxDestination& dest, const std::optional<std::string>& fingerprint = {}) = 0;
+
+    //! One key for createMultisigDescriptor (mirrors wallet::MultisigKeySpec).
+    struct MultisigKey {
+        std::optional<std::string> path;
+        std::optional<std::string> fingerprint;
+        std::optional<std::string> hdkey;
+        std::optional<std::string> xpub;
+    };
+
+    //! Import an active sorted-multisig descriptor (see createmultisigdescriptor).
+    virtual util::Result<std::vector<std::string>> createMultisigDescriptor(int nrequired,
+        const std::vector<MultisigKey>& keys,
+        OutputType type) = 0;
 
     //! Lock coin.
     virtual bool lockCoin(const COutPoint& output, bool write_to_db) = 0;

@@ -25,6 +25,7 @@
 #include <wallet/feebumper.h>
 #include <wallet/fees.h>
 #include <wallet/load.h>
+#include <wallet/multisig.h>
 #include <wallet/receive.h>
 #include <wallet/rpc/wallet.h>
 #include <wallet/spend.h>
@@ -234,10 +235,27 @@ public:
         return value.empty() ? m_wallet->EraseAddressReceiveRequest(batch, dest, id)
                              : m_wallet->SetAddressReceiveRequest(batch, dest, id, value);
     }
-    util::Result<void> displayAddress(const CTxDestination& dest) override
+    util::Result<void> displayAddress(const CTxDestination& dest, const std::optional<std::string>& fingerprint) override
     {
         LOCK(m_wallet->cs_wallet);
-        return m_wallet->DisplayAddress(dest);
+        return m_wallet->DisplayAddress(dest, fingerprint);
+    }
+    util::Result<std::vector<std::string>> createMultisigDescriptor(int nrequired, const std::vector<MultisigKey>& keys, OutputType type) override
+    {
+        std::vector<wallet::MultisigKeySpec> specs;
+        specs.reserve(keys.size());
+        for (const auto& k : keys) {
+            wallet::MultisigKeySpec spec;
+            spec.path = k.path;
+            spec.fingerprint = k.fingerprint;
+            spec.hdkey = k.hdkey;
+            spec.xpub = k.xpub;
+            specs.push_back(std::move(spec));
+        }
+        LOCK(m_wallet->cs_wallet);
+        auto created = wallet::CreateMultisigDescriptor(*m_wallet, nrequired, specs, wallet::MultisigOptions{type, /*account=*/0, {}});
+        if (!created) return util::Error{util::ErrorString(created)};
+        return created->descs;
     }
     bool lockCoin(const COutPoint& output, const bool write_to_db) override
     {

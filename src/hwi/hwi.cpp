@@ -210,17 +210,20 @@ std::string DisplayAddress(const HardwareWalletClient& client, const std::string
     }
 
     const KeyFingerprint master{client.GetMasterFingerprint()};
+    bool ours = false;
     for (const auto& [id, origin_pair] : out.origins) {
         const KeyOriginInfo& origin = origin_pair.second;
-        if (origin.fingerprint != master) {
-            throw HWIError("Descriptor fingerprint does not match device", ErrorCode::BAD_ARGUMENT);
-        }
+        if (origin.fingerprint != master) continue;
+        ours = true;
         const CExtPubKey derived{client.GetPubkeyAtPath(WriteHDKeypath(origin.path))};
         const bool match_compressed{derived.pubkey.GetID() == id};
         const bool match_xonly{origin_pair.first.IsValid() && XOnlyPubKey(derived.pubkey) == XOnlyPubKey(origin_pair.first)};
         if (!match_compressed && !match_xonly) {
             throw HWIError("Key in descriptor does not match device", ErrorCode::BAD_ARGUMENT);
         }
+    }
+    if (!ours && !out.origins.empty()) {
+        throw HWIError("Descriptor fingerprint does not match device", ErrorCode::BAD_ARGUMENT);
     }
 
     CTxDestination dest;

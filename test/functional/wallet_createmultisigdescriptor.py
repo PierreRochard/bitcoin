@@ -49,6 +49,7 @@ class WalletCreateMultisigDescriptorTest(BitcoinTestFramework):
         self.test_encrypted()
         self.test_cross_wallet_2of2()
         self.test_mixed_key_wallet()
+        self.test_airgapped_xpub()
         self.test_watchonly()
 
     def _blank(self, name, node=0, **kwargs):
@@ -332,6 +333,33 @@ class WalletCreateMultisigDescriptorTest(BitcoinTestFramework):
             {"type": "bech32", "account": 1},
         )
         assert "00000001" in "".join(obj["descs"])
+
+    def test_airgapped_xpub(self):
+        self.log.info("Test air-gapped xpub (device not connected)")
+        funding = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
+        offline = self._blank("air_src")
+        offline.addhdkey()
+        derived = offline.derivehdkey(BIP48_BECH32)
+        origin = derived["origin"]
+        fpr = origin[1:9]
+        xpub = derived["xpub"]
+        wallet = self._blank("air_ms")
+        local = wallet.addhdkey()["xpub"]
+        res = wallet.createmultisigdescriptor(2, [
+            {"path": BIP48_BECH32, "hdkey": local},
+            {"path": BIP48_BECH32, "fingerprint": fpr, "xpub": xpub},
+        ])
+        assert_equal(res["nrequired"], 2)
+        assert fpr in "".join(res["descs"])
+        addr = wallet.getnewaddress("", "bech32")
+        funding.sendtoaddress(addr, 3)
+        self.generate(self.nodes[0], 1)
+        dest = funding.getnewaddress()
+        first = wallet.walletcreatefundedpsbt([], {dest: 1})["psbt"]
+        signed = wallet.walletprocesspsbt(first)
+        assert not signed["complete"]
+        # The other seed lives in `offline` but at a different descriptor; combine
+        # is covered by test_cross_wallet_2of2. Here we only need an incomplete PSBT.
 
     def test_watchonly(self):
         self.log.info("Test watch-only external-signer wallets cannot use local keys")

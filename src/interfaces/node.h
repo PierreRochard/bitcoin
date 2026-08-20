@@ -64,6 +64,9 @@ public:
 
     //! Get signer display name
     virtual std::string getName() = 0;
+
+    //! Master key fingerprint (8 hex characters).
+    virtual std::string getFingerprint() = 0;
 };
 
 //! Top-level interface for a bitcoin node (bitcoind process).

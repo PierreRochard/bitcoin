@@ -21,6 +21,7 @@
 #include <util/strencodings.h>
 #include <util/translation.h>
 #include <wallet/external_signer_scriptpubkeyman.h>
+#include <wallet/multisig.h>
 #include <wallet/wallet.h>
 
 #include <test/util/setup_common.h>
@@ -491,6 +492,59 @@ BOOST_AUTO_TEST_CASE(reversed_key_order)
     BOOST_REQUIRE(!wallet->FillPSBT(psbt, {.sign = false, .bip32_derivs = true}, complete));
     BOOST_REQUIRE(!wallet->FillPSBT(psbt, {.sign = true, .finalize = true, .bip32_derivs = false}, complete));
     BOOST_CHECK(complete);
+}
+
+BOOST_AUTO_TEST_CASE(transcript_and_policy)
+{
+    BOOST_CHECK(!ValidateMultisigPolicy(0, 2).empty());
+    BOOST_CHECK(!ValidateMultisigPolicy(3, 2).empty());
+    BOOST_CHECK(ValidateMultisigPolicy(2, 3).empty());
+
+    std::vector<MultisigKeySpec> keys(2);
+    keys[0].label = "This computer";
+    keys[1].fingerprint = "aabbccdd";
+    keys[1].label = "Trezor";
+    const std::string text = FormatMultisigTranscript("Family", "regtest", 2, keys, OutputType::BECH32, {"wsh(sortedmulti(2,a,b))#xxxx"});
+    BOOST_CHECK(text.find("Policy: 2 of 2") != std::string::npos);
+    BOOST_CHECK(text.find("This computer") != std::string::npos);
+    BOOST_CHECK(text.find("aabbccdd") != std::string::npos);
+    BOOST_CHECK(text.find("wsh(sortedmulti") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(create_descriptor_airgapped_xpub)
+{
+    CExtKey local = RandomMaster();
+    CExtKey offline = RandomMaster();
+    const auto path = Bip48Path(OutputType::BECH32);
+    auto child = DeriveExtKey(offline, path);
+    BOOST_REQUIRE(child);
+    const std::string fpr = HexStr(offline.id_key_fingerprint());
+
+    auto wallet = MakeBlankWallet(MixedFlags());
+    LOCK(wallet->cs_wallet);
+    {
+        std::string unused = "unused(" + EncodeExtKey(local) + ")";
+        FlatSigningProvider keys;
+        std::string error;
+        auto descs = Parse(unused, keys, error, false);
+        BOOST_REQUIRE(!descs.empty());
+        WalletDescriptor w(std::move(descs.at(0)), 1, 0, 0, 0);
+        BOOST_REQUIRE(wallet->AddWalletDescriptor(w, keys, "", false));
+    }
+
+    MultisigKeySpec k_local;
+    k_local.hdkey = EncodeExtPubKey(local.Neuter());
+    k_local.path = WriteHDKeypath(path);
+    MultisigKeySpec k_air;
+    k_air.fingerprint = fpr.size() == 8 ? fpr : fpr.substr(0, 8);
+    k_air.path = WriteHDKeypath(path);
+    k_air.xpub = EncodeExtPubKey(child->first.Neuter());
+    k_air.label = "offline";
+
+    auto created = CreateMultisigDescriptor(*wallet, 2, {k_local, k_air}, {});
+    BOOST_REQUIRE_MESSAGE(created, util::ErrorString(created).original);
+    BOOST_REQUIRE_EQUAL(created->descs.size(), 2U);
+    BOOST_CHECK(created->descs[0].find("wsh(sortedmulti(2,") != std::string::npos);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
