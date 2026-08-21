@@ -218,6 +218,24 @@ BOOST_AUTO_TEST_CASE(musig_64_of_64_keypath_spend)
     BOOST_CHECK_EQUAL(out.witness_stack, 1U);
 }
 
+BOOST_AUTO_TEST_CASE(musig_999_of_999_keypath_spend)
+{
+    // n-of-n MuSig2 key-path: one Schnorr signature. Relies on keyagg-cache
+    // reuse in SignMuSig2 and Pippenger scratch in musig_pubkey_agg.
+    constexpr int n = 999;
+    auto wallet = MakeWallet();
+    wallet->m_keypool_size = 1;
+    LOCK(wallet->cs_wallet);
+    std::vector<MultisigKeySpec> specs;
+    specs.reserve(n);
+    for (int i = 0; i < n; ++i) specs.push_back(XprvSpec(RandomMaster()));
+    const CScript spk = CreateAndDest(*wallet, n, specs);
+    const SignOut out = SignSpk(*wallet, spk, CTxIn::SEQUENCE_FINAL);
+    BOOST_REQUIRE_MESSAGE(!out.error, "999-of-999 MuSig2 FillPSBT error");
+    BOOST_REQUIRE_MESSAGE(out.complete, "999-of-999 MuSig2 key-path should complete");
+    BOOST_CHECK_EQUAL(out.witness_stack, 1U);
+}
+
 BOOST_AUTO_TEST_CASE(vault_1_of_max_recovers)
 {
     constexpr unsigned n = MAX_PUBKEYS_PER_MULTI_A;

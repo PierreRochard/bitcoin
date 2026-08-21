@@ -32,7 +32,7 @@ static bool GetMuSig2KeyAggCache(const std::vector<CPubKey>& pubkeys, secp256k1_
         pubkey_ptrs.push_back(&p);
     }
 
-    // Aggregate the pubkey
+    // Aggregate the pubkey (secp musig_pubkey_agg allocates scratch for Pippenger/Strauss)
     if (!secp256k1_musig_pubkey_agg(secp256k1_context_static, nullptr, &keyagg_cache, pubkey_ptrs.data(), pubkey_ptrs.size())) {
         return false;
     }
@@ -129,11 +129,21 @@ uint256 MuSig2SessionID(const CPubKey& script_pubkey, const CPubKey& part_pubkey
     return hasher.GetSHA256();
 }
 
-std::vector<uint8_t> CreateMuSig2Nonce(MuSig2SecNonce& secnonce, const uint256& sighash, const CKey& our_seckey, const CPubKey& aggregate_pubkey, const std::vector<CPubKey>& pubkeys)
+//! Copy a precomputed untweaked cache, or aggregate pubkeys into `out`.
+static bool ResolveMuSig2KeyAggCache(const std::vector<CPubKey>& pubkeys, const CPubKey& expected_aggregate, const secp256k1_musig_keyagg_cache* precomputed, secp256k1_musig_keyagg_cache& out)
 {
-    // Get the keyagg cache and aggregate pubkey
+    if (precomputed) {
+        out = *precomputed;
+        const std::optional<CPubKey> got = GetCPubKeyFromMuSig2KeyAggCache(out);
+        return got.has_value() && *got == expected_aggregate;
+    }
+    return MuSig2AggregatePubkeys(pubkeys, out, expected_aggregate).has_value();
+}
+
+std::vector<uint8_t> CreateMuSig2Nonce(MuSig2SecNonce& secnonce, const uint256& sighash, const CKey& our_seckey, const CPubKey& aggregate_pubkey, const std::vector<CPubKey>& pubkeys, const secp256k1_musig_keyagg_cache* precomputed_keyagg_cache)
+{
     secp256k1_musig_keyagg_cache keyagg_cache;
-    if (!MuSig2AggregatePubkeys(pubkeys, keyagg_cache, aggregate_pubkey)) return {};
+    if (!ResolveMuSig2KeyAggCache(pubkeys, aggregate_pubkey, precomputed_keyagg_cache, keyagg_cache)) return {};
 
     // Parse participant pubkey
     CPubKey our_pubkey = our_seckey.GetPubKey();
@@ -162,14 +172,13 @@ std::vector<uint8_t> CreateMuSig2Nonce(MuSig2SecNonce& secnonce, const uint256& 
     return out;
 }
 
-std::optional<uint256> CreateMuSig2PartialSig(const uint256& sighash, const CKey& our_seckey, const CPubKey& aggregate_pubkey, const std::vector<CPubKey>& pubkeys, const std::map<CPubKey, std::vector<uint8_t>>& pubnonces, MuSig2SecNonce& secnonce, const std::vector<std::pair<uint256, bool>>& tweaks)
+std::optional<uint256> CreateMuSig2PartialSig(const uint256& sighash, const CKey& our_seckey, const CPubKey& aggregate_pubkey, const std::vector<CPubKey>& pubkeys, const std::map<CPubKey, std::vector<uint8_t>>& pubnonces, MuSig2SecNonce& secnonce, const std::vector<std::pair<uint256, bool>>& tweaks, const secp256k1_musig_keyagg_cache* precomputed_keyagg_cache)
 {
     secp256k1_keypair keypair;
     if (!secp256k1_keypair_create(GetSecp256k1SignContext(), &keypair, UCharCast(our_seckey.begin()))) return std::nullopt;
 
-    // Get the keyagg cache and aggregate pubkey
     secp256k1_musig_keyagg_cache keyagg_cache;
-    if (!MuSig2AggregatePubkeys(pubkeys, keyagg_cache, aggregate_pubkey)) return std::nullopt;
+    if (!ResolveMuSig2KeyAggCache(pubkeys, aggregate_pubkey, precomputed_keyagg_cache, keyagg_cache)) return std::nullopt;
 
     // Check that there are enough pubnonces
     if (pubnonces.size() != pubkeys.size()) return std::nullopt;
@@ -251,13 +260,12 @@ std::optional<uint256> CreateMuSig2PartialSig(const uint256& sighash, const CKey
     return sig;
 }
 
-std::optional<std::vector<uint8_t>> CreateMuSig2AggregateSig(const std::vector<CPubKey>& part_pubkeys, const CPubKey& aggregate_pubkey, const std::vector<std::pair<uint256, bool>>& tweaks, const uint256& sighash, const std::map<CPubKey, std::vector<uint8_t>>& pubnonces, const std::map<CPubKey, uint256>& partial_sigs)
+std::optional<std::vector<uint8_t>> CreateMuSig2AggregateSig(const std::vector<CPubKey>& part_pubkeys, const CPubKey& aggregate_pubkey, const std::vector<std::pair<uint256, bool>>& tweaks, const uint256& sighash, const std::map<CPubKey, std::vector<uint8_t>>& pubnonces, const std::map<CPubKey, uint256>& partial_sigs, const secp256k1_musig_keyagg_cache* precomputed_keyagg_cache)
 {
     if (!part_pubkeys.size()) return std::nullopt;
 
-    // Get the keyagg cache and aggregate pubkey
     secp256k1_musig_keyagg_cache keyagg_cache;
-    if (!MuSig2AggregatePubkeys(part_pubkeys, keyagg_cache, aggregate_pubkey)) return std::nullopt;
+    if (!ResolveMuSig2KeyAggCache(part_pubkeys, aggregate_pubkey, precomputed_keyagg_cache, keyagg_cache)) return std::nullopt;
 
     // Check if enough pubnonces and partial sigs
     if (pubnonces.size() != part_pubkeys.size()) return std::nullopt;

@@ -95,6 +95,39 @@ BOOST_AUTO_TEST_CASE(empty_pubkey_list)
     BOOST_CHECK(!aggregate_pubkey.has_value());
 }
 
+BOOST_AUTO_TEST_CASE(aggregate_above_pippenger_threshold)
+{
+    // secp256k1 uses Pippenger when n >= 88 (ECMULT_PIPPENGER_THRESHOLD) if
+    // musig_pubkey_agg has a scratch space. Result must still be deterministic.
+    constexpr unsigned n = 200;
+    std::vector<CPubKey> pubkeys;
+    pubkeys.reserve(n);
+    for (unsigned i = 0; i < n; ++i) {
+        pubkeys.push_back(GenerateRandomKey().GetPubKey());
+    }
+    const std::optional<CPubKey> a = MuSig2AggregatePubkeys(pubkeys);
+    const std::optional<CPubKey> b = MuSig2AggregatePubkeys(pubkeys);
+    BOOST_REQUIRE(a.has_value());
+    BOOST_REQUIRE(b.has_value());
+    BOOST_CHECK(*a == *b);
+    BOOST_CHECK(a->IsValid());
+}
+
+BOOST_AUTO_TEST_CASE(aggregate_999_deterministic)
+{
+    constexpr unsigned n = 999;
+    std::vector<CPubKey> pubkeys;
+    pubkeys.reserve(n);
+    for (unsigned i = 0; i < n; ++i) {
+        pubkeys.push_back(GenerateRandomKey().GetPubKey());
+    }
+    const std::optional<CPubKey> a = MuSig2AggregatePubkeys(pubkeys);
+    const std::optional<CPubKey> b = MuSig2AggregatePubkeys(pubkeys);
+    BOOST_REQUIRE(a.has_value());
+    BOOST_REQUIRE(b.has_value());
+    BOOST_CHECK(*a == *b);
+}
+
 BOOST_AUTO_TEST_CASE(invalid_key)
 {
     std::vector<std::string> test_vectors = {
