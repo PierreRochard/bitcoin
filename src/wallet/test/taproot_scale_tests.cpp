@@ -100,9 +100,20 @@ struct SignOut {
     std::optional<PSBTError> error;
     bool complete{false};
     size_t witness_stack{0};
+    size_t n_vout{0};
+    bool has_op_return{false};
 };
 
-static SignOut SignSpk(CWallet& wallet, const CScript& spk, uint32_t sequence)
+//! Attribution memo used on the next 999-key script-path return.
+static const std::vector<unsigned char> ATTRIBUTION_MEMO{'X', ':', ' ', '"', '@', 'B', 'i', 't', 'c', 'o', 'i', 'n', 'P', 'i', 'e', 'r', 'r', 'e', '"'};
+
+static CTxOut AttributionOpReturn()
+{
+    return CTxOut{0, CScript() << OP_RETURN << ATTRIBUTION_MEMO};
+}
+
+static SignOut SignSpk(CWallet& wallet, const CScript& spk, uint32_t sequence,
+                       const std::vector<CTxOut>& extra_outs = {})
     EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
     CMutableTransaction prev_tx;
@@ -114,6 +125,7 @@ static SignOut SignSpk(CWallet& wallet, const CScript& spk, uint32_t sequence)
     tx.version = 2;
     tx.vin.emplace_back(COutPoint{prev_tx.GetHash(), 0}, CScript(), sequence);
     tx.vout.emplace_back(COIN - 10000, spk);
+    tx.vout.insert(tx.vout.end(), extra_outs.begin(), extra_outs.end());
 
     PartiallySignedTransaction psbt(tx, /*version=*/0);
     BOOST_REQUIRE_EQUAL(psbt.inputs.size(), 1U);
@@ -128,6 +140,10 @@ static SignOut SignSpk(CWallet& wallet, const CScript& spk, uint32_t sequence)
     if (complete) {
         CMutableTransaction extracted;
         FinalizeAndExtractPSBT(psbt, extracted);
+        out.n_vout = extracted.vout.size();
+        for (const auto& o : extracted.vout) {
+            if (o.scriptPubKey.size() && *o.scriptPubKey.begin() == OP_RETURN) out.has_op_return = true;
+        }
         if (!extracted.vin.empty()) {
             out.witness_stack = extracted.vin[0].scriptWitness.stack.size();
         }
@@ -249,10 +265,12 @@ BOOST_AUTO_TEST_CASE(vault_1_of_max_recovers)
     const CScript spk = CreateAndDest(*wallet, 1, specs, older);
     const SignOut too_soon = SignSpk(*wallet, spk, CTxIn::SEQUENCE_FINAL);
     BOOST_CHECK_MESSAGE(!too_soon.complete, "1-of-999 vault key-path incomplete without every participant");
-    const SignOut rec = SignSpk(*wallet, spk, older);
+    const SignOut rec = SignSpk(*wallet, spk, older, {AttributionOpReturn()});
     BOOST_REQUIRE_MESSAGE(!rec.error, "1-of-999 vault recovery FillPSBT error");
     BOOST_REQUIRE_MESSAGE(rec.complete, "1-of-999 vault recovers on script-path after older(1)");
     BOOST_CHECK_GT(rec.witness_stack, 1U);
+    BOOST_CHECK_EQUAL(rec.n_vout, 2U);
+    BOOST_CHECK(rec.has_op_return);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
