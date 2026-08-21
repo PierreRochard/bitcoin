@@ -187,13 +187,37 @@ int secp256k1_musig_pubkey_agg(const secp256k1_context* ctx, secp256k1_xonly_pub
     if (!secp256k1_musig_compute_pks_hash(ctx, ecmult_data.pks_hash, pubkeys, n_pubkeys)) {
         return 0;
     }
-    /* TODO: actually use optimized ecmult_multi algorithms by providing a
-     * scratch space */
-    if (!secp256k1_ecmult_multi_var(&ctx->error_callback, NULL, &pkj, NULL, secp256k1_musig_pubkey_agg_callback, (void *) &ecmult_data, n_pubkeys)) {
-        /* In order to reach this line with the current implementation of
-         * ecmult_multi_var one would need to provide a callback that can
-         * fail. */
-        return 0;
+    /* ecmult_multi_var with a NULL scratch space does n serial ECMULTs (Θ(n)
+     * scalar muls). Allocate a scratch space so Pippenger (n >= 88) or Strauss
+     * is used instead. Fall back to the simple path if allocation fails. */
+    {
+        secp256k1_scratch *scratch = NULL;
+        size_t scratch_size;
+        int ecmult_ok;
+        if (n_pubkeys >= ECMULT_PIPPENGER_THRESHOLD) {
+            int bucket_window = secp256k1_pippenger_bucket_window(n_pubkeys);
+            scratch_size = secp256k1_pippenger_scratch_size(n_pubkeys, bucket_window);
+            if (scratch_size <= SIZE_MAX - (size_t)PIPPENGER_SCRATCH_OBJECTS * ALIGNMENT) {
+                scratch_size += (size_t)PIPPENGER_SCRATCH_OBJECTS * ALIGNMENT;
+                scratch = secp256k1_scratch_create(&ctx->error_callback, scratch_size);
+            }
+        } else {
+            scratch_size = secp256k1_strauss_scratch_size(n_pubkeys);
+            if (scratch_size <= SIZE_MAX - (size_t)STRAUSS_SCRATCH_OBJECTS * ALIGNMENT) {
+                scratch_size += (size_t)STRAUSS_SCRATCH_OBJECTS * ALIGNMENT;
+                scratch = secp256k1_scratch_create(&ctx->error_callback, scratch_size);
+            }
+        }
+        ecmult_ok = secp256k1_ecmult_multi_var(&ctx->error_callback, scratch, &pkj, NULL, secp256k1_musig_pubkey_agg_callback, (void *) &ecmult_data, n_pubkeys);
+        if (scratch != NULL) {
+            secp256k1_scratch_destroy(&ctx->error_callback, scratch);
+        }
+        if (!ecmult_ok) {
+            /* In order to reach this line with the current implementation of
+             * ecmult_multi_var one would need to provide a callback that can
+             * fail. */
+            return 0;
+        }
     }
     secp256k1_ge_set_gej(&pkp, &pkj);
     secp256k1_fe_normalize_var(&pkp.y);
