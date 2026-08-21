@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <memory>
 
 namespace hwi {
 
@@ -85,24 +86,44 @@ std::vector<unsigned char> Sha256(std::span<const unsigned char> data)
 
 std::vector<unsigned char> Aes256Ctr(std::span<const unsigned char> key32, std::span<const unsigned char> data)
 {
+    Aes256CtrStream stream{key32};
+    return stream.Crypt(data);
+}
+
+struct Aes256CtrStream::Impl
+{
+    explicit Impl(std::span<const unsigned char> key32) : enc{key32.data()} {}
+
+    AES256Encrypt enc;
+    unsigned char counter[16] = {};
+    unsigned char keystream[16] = {};
+    size_t ks_off{16};
+};
+
+Aes256CtrStream::Aes256CtrStream(std::span<const unsigned char> key32)
+{
     if (key32.size() != 32) {
         throw HWIError("AES-256-CTR key must be 32 bytes", ErrorCode::BAD_ARGUMENT);
     }
-    AES256Encrypt enc{key32.data()};
+    m_impl = std::make_unique<Impl>(key32);
+}
+
+Aes256CtrStream::~Aes256CtrStream() = default;
+Aes256CtrStream::Aes256CtrStream(Aes256CtrStream&&) noexcept = default;
+Aes256CtrStream& Aes256CtrStream::operator=(Aes256CtrStream&&) noexcept = default;
+
+std::vector<unsigned char> Aes256CtrStream::Crypt(std::span<const unsigned char> data)
+{
     std::vector<unsigned char> out(data.size());
-    unsigned char counter[16] = {};
-    unsigned char keystream[16];
-    size_t offset = 0;
-    while (offset < data.size()) {
-        enc.Encrypt(keystream, counter);
-        const size_t n = std::min<size_t>(16, data.size() - offset);
-        for (size_t i = 0; i < n; ++i) {
-            out[offset + i] = data[offset + i] ^ keystream[i];
+    for (size_t i = 0; i < data.size(); ++i) {
+        if (m_impl->ks_off == 16) {
+            m_impl->enc.Encrypt(m_impl->keystream, m_impl->counter);
+            m_impl->ks_off = 0;
+            for (int c = 15; c >= 0; --c) {
+                if (++m_impl->counter[c] != 0) break;
+            }
         }
-        offset += n;
-        for (int i = 15; i >= 0; --i) {
-            if (++counter[i] != 0) break;
-        }
+        out[i] = data[i] ^ m_impl->keystream[m_impl->ks_off++];
     }
     return out;
 }
@@ -127,6 +148,19 @@ std::vector<unsigned char> EcdhUncompressedHash(const CKey& our_key, std::span<c
     unsigned char out[65];
     secp256k1_ec_pubkey_serialize(ctx, out, &len, &pk, SECP256K1_EC_UNCOMPRESSED);
     return Sha256({out + 1, 64});
+}
+
+bool VerifyEcdsaCompactRaw(const CPubKey& pub,
+                           std::span<const unsigned char> hash32,
+                           std::span<const unsigned char> sig65)
+{
+    if (!pub.IsValid() || hash32.size() != 32 || sig65.size() != 65) return false;
+    secp256k1_context* ctx = GetSecp256k1SignContext();
+    secp256k1_pubkey pk;
+    if (!secp256k1_ec_pubkey_parse(ctx, &pk, pub.data(), pub.size())) return false;
+    secp256k1_ecdsa_signature sig;
+    if (!secp256k1_ecdsa_signature_parse_compact(ctx, &sig, sig65.data() + 1)) return false;
+    return secp256k1_ecdsa_verify(ctx, &sig, hash32.data(), &pk) == 1;
 }
 
 bool IsP2SH(const CScript& script)

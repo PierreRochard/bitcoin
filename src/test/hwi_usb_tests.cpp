@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <hwi/coldcard.h>
 #include <hwi/hid.h>
 #include <hwi/hwi.h>
 #include <hwi/mock.h>
@@ -48,6 +49,38 @@ BOOST_AUTO_TEST_CASE(aes256_ctr_roundtrip)
     BOOST_CHECK(enc != plain);
     const auto dec = hwi::Aes256Ctr(key, enc);
     BOOST_CHECK_EQUAL_COLLECTIONS(dec.begin(), dec.end(), plain.begin(), plain.end());
+}
+
+BOOST_AUTO_TEST_CASE(aes256_ctr_session_does_not_reset_per_message)
+{
+    const std::vector<unsigned char> key(32, 0x5a);
+    const std::vector<unsigned char> first{'n', 'c', 'r', 'y', 1, 2, 3, 4};
+    const std::vector<unsigned char> second{'x', 'p', 'u', 'b', 'm', '/', '8', '4', '\'', '/', '0', '\'', '/', '0', '\''};
+    hwi::Aes256CtrStream tx{key};
+    hwi::Aes256CtrStream rx{key};
+    const auto e1 = tx.Crypt(first);
+    const auto d1 = rx.Crypt(e1);
+    BOOST_CHECK_EQUAL_COLLECTIONS(d1.begin(), d1.end(), first.begin(), first.end());
+    const auto e2 = tx.Crypt(second);
+    const auto d2 = rx.Crypt(e2);
+    BOOST_CHECK_EQUAL_COLLECTIONS(d2.begin(), d2.end(), second.begin(), second.end());
+    // A fresh counter (the old per-message bug) cannot decrypt the second frame.
+    const auto naive = hwi::Aes256Ctr(key, e2);
+    BOOST_CHECK(naive != second);
+}
+
+BOOST_AUTO_TEST_CASE(coldcard_vers_identifies_mk3_and_refuses_edge_taproot)
+{
+    const auto mk3 = hwi::ParseColdcardVersion(
+        "2026-07-31T12:48:28\n4.2.0\n2.0.1\n260731124828\nmk3\n");
+    BOOST_CHECK_EQUAL(mk3.hw_label, "mk3");
+    BOOST_CHECK_EQUAL(mk3.version, "4.2.0");
+    BOOST_CHECK(!mk3.is_edge);
+    BOOST_CHECK_EQUAL(hwi::ColdcardModelName(mk3), "coldcard_mk3");
+
+    const auto edge = hwi::ParseColdcardVersion("2026-01-01\n5.4.0X\n5.0.0\n260101000000\nmk4\n");
+    BOOST_CHECK(edge.is_edge);
+    BOOST_CHECK_EQUAL(hwi::ColdcardModelName(edge), "coldcard_edge");
 }
 
 BOOST_AUTO_TEST_CASE(xpub_any_version)

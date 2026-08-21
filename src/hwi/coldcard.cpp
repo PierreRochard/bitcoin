@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <thread>
 
@@ -53,6 +54,7 @@ public:
     {
         Resync();
         StartEncryption();
+        ReadVersion();
     }
 
     void Close()
@@ -60,17 +62,34 @@ public:
         if (m_link) m_link->Close();
     }
 
-    std::vector<unsigned char> SendRecv(const std::vector<unsigned char>& msg, int timeout_ms, bool encrypt = true)
+    const ColdcardVersion& Version() const { return m_version; }
+
+    void CheckMitm() const
+    {
+        if (m_mitm_ok) return;
+        if (m_xpub.empty() || m_session_key.size() != 32) {
+            throw HWIError("Coldcard has no secrets for a mitm check yet", ErrorCode::DEVICE_CONN_ERROR);
+        }
+        auto sig = SendRecv({'m', 'i', 't', 'm'}, 5000);
+        const CExtPubKey xpub = DecodeXpubAnyVersion(m_xpub);
+        if (sig.size() != 65 ||
+            !VerifyEcdsaCompactRaw(xpub.pubkey, m_session_key, sig)) {
+            throw HWIError("Possible active MiTM on the Coldcard USB link", ErrorCode::DEVICE_CONN_ERROR);
+        }
+        m_mitm_ok = true;
+    }
+
+    std::vector<unsigned char> SendRecv(const std::vector<unsigned char>& msg, int timeout_ms, bool encrypt = true) const
     {
         if (msg.size() < 4 || msg.size() > 4 + 4 + 4 + MAX_BLK) {
             throw HWIError("Coldcard message length invalid", ErrorCode::BAD_ARGUMENT);
         }
         std::vector<unsigned char> payload = msg;
         if (encrypt) {
-            if (m_session_key.empty()) {
+            if (!m_tx) {
                 encrypt = false;
             } else {
-                payload = Aes256Ctr(m_session_key, msg);
+                payload = m_tx->Crypt(msg);
             }
         }
 
@@ -105,8 +124,8 @@ public:
             if (flag & 0x80) break;
         }
         if (flag & 0x40) {
-            if (m_session_key.empty()) throw HWIError("Encrypted Coldcard reply without session", ErrorCode::DEVICE_CONN_ERROR);
-            resp = Aes256Ctr(m_session_key, resp);
+            if (!m_rx) throw HWIError("Encrypted Coldcard reply without session", ErrorCode::DEVICE_CONN_ERROR);
+            resp = m_rx->Crypt(resp);
         }
         return Decode(resp);
     }
@@ -114,7 +133,7 @@ public:
     uint32_t MasterFingerprint() const { return m_fingerprint; }
     [[maybe_unused]] const std::string& MasterXpub() const { return m_xpub; }
 
-    std::vector<unsigned char> Download(uint32_t length, const std::vector<unsigned char>& checksum, int file_number)
+    std::vector<unsigned char> Download(uint32_t length, const std::vector<unsigned char>& checksum, int file_number) const
     {
         std::vector<unsigned char> data;
         data.reserve(length);
@@ -181,10 +200,22 @@ private:
             throw HWIError("Invalid Coldcard ncry response", ErrorCode::DEVICE_CONN_ERROR);
         }
         m_session_key = EcdhUncompressedHash(our, {resp.data(), 64});
+        m_tx = std::make_unique<Aes256CtrStream>(m_session_key);
+        m_rx = std::make_unique<Aes256CtrStream>(m_session_key);
         m_fingerprint = ReadLe32({resp.data() + 64, 4});
         const uint32_t xpub_len = ReadLe32({resp.data() + 68, 4});
         if (resp.size() >= 72 + xpub_len) {
             m_xpub.assign(resp.begin() + 72, resp.begin() + 72 + xpub_len);
+        }
+    }
+
+    void ReadVersion()
+    {
+        try {
+            auto resp = SendRecv({'v', 'e', 'r', 's'}, 5000);
+            m_version = ParseColdcardVersion({reinterpret_cast<const char*>(resp.data()), resp.size()});
+        } catch (const HWIError&) {
+            // Simulator or locked unit may omit vers; leave hw_label empty.
         }
     }
 
@@ -212,8 +243,12 @@ private:
 
     std::unique_ptr<PacketLink> m_link;
     std::vector<unsigned char> m_session_key;
+    mutable std::unique_ptr<Aes256CtrStream> m_tx;
+    mutable std::unique_ptr<Aes256CtrStream> m_rx;
     uint32_t m_fingerprint{0};
     std::string m_xpub;
+    ColdcardVersion m_version;
+    mutable bool m_mitm_ok{false};
 };
 
 class ColdcardClient final : public HardwareWalletClient
@@ -239,6 +274,7 @@ public:
 
     CExtPubKey GetPubkeyAtPath(const std::string& bip32_path) const override
     {
+        m_dev.CheckMitm();
         std::string path = bip32_path;
         for (char& c : path) {
             if (c == 'h' || c == 'H') c = '\'';
@@ -252,6 +288,7 @@ public:
 
     PartiallySignedTransaction SignTx(PartiallySignedTransaction psbt) const override
     {
+        m_dev.CheckMitm();
         DataStream ss{};
         ss << psbt;
         const auto& raw = ss;
@@ -302,6 +339,7 @@ public:
 
     std::string SignMessage(const std::string& message, const std::string& bip32_path) const override
     {
+        m_dev.CheckMitm();
         std::string path = bip32_path;
         for (char& c : path) {
             if (c == 'h' || c == 'H') c = '\'';
@@ -331,6 +369,11 @@ public:
 
     std::string DisplaySinglesigAddress(const std::string& bip32_path, OutputType type) const override
     {
+        if (type == OutputType::BECH32M && !CanSignTaproot()) {
+            throw HWIError("This Coldcard does not support displaying Taproot addresses",
+                           ErrorCode::UNAVAILABLE_ACTION);
+        }
+        m_dev.CheckMitm();
         std::string path = bip32_path;
         for (char& c : path) {
             if (c == 'h' || c == 'H') c = '\'';
@@ -352,7 +395,8 @@ public:
         return HardwareWalletClient::DisplaySinglesigAddress(bip32_path, type);
     }
 
-    bool CanSignTaproot() const override { return true; }
+    bool CanSignTaproot() const override { return m_dev.Version().is_edge; }
+    const ColdcardVersion& Version() const { return m_dev.Version(); }
     void Close() override { m_dev.Close(); }
 
 private:
@@ -368,6 +412,12 @@ DeviceInfo ProbeColdcard(const std::string& path, const std::string& model)
     try {
         ColdcardClient client(path, ChainType::MAIN);
         info.fingerprint = FingerprintHex(client.GetMasterFingerprint());
+        info.model = ColdcardModelName(client.Version());
+        if (model.find("simulator") != std::string::npos && info.model == "coldcard") {
+            info.model = "coldcard_simulator";
+        } else if (model.find("simulator") != std::string::npos) {
+            info.model += "_simulator";
+        }
         client.Close();
     } catch (const std::exception& e) {
         info.error = e.what();
@@ -375,12 +425,84 @@ DeviceInfo ProbeColdcard(const std::string& path, const std::string& model)
     return info;
 }
 
+std::vector<HidInfo> DedupeColdcardHid(std::vector<HidInfo> hid)
+{
+    // One physical Mk3 can appear twice through a hub. Keep interface 0, else first path.
+    std::map<std::string, HidInfo> by_serial;
+    std::vector<HidInfo> no_serial;
+    for (HidInfo& item : hid) {
+        if (item.serial.empty()) {
+            no_serial.push_back(std::move(item));
+            continue;
+        }
+        auto it = by_serial.find(item.serial);
+        if (it == by_serial.end()) {
+            by_serial.emplace(item.serial, std::move(item));
+            continue;
+        }
+        if (it->second.interface_number != 0 && item.interface_number == 0) {
+            it->second = std::move(item);
+        }
+    }
+    std::vector<HidInfo> out;
+    out.reserve(by_serial.size() + no_serial.size());
+    for (auto& kv : by_serial) out.push_back(std::move(kv.second));
+    out.insert(out.end(), no_serial.begin(), no_serial.end());
+    return out;
+}
+
 } // namespace
+
+ColdcardVersion ParseColdcardVersion(std::string_view text)
+{
+    ColdcardVersion v;
+    std::vector<std::string> lines;
+    std::string cur;
+    for (char c : text) {
+        if (c == '\n') {
+            if (!cur.empty() && cur.back() == '\r') cur.pop_back();
+            lines.push_back(std::move(cur));
+            cur.clear();
+        } else {
+            cur.push_back(c);
+        }
+    }
+    if (!cur.empty()) {
+        if (cur.back() == '\r') cur.pop_back();
+        lines.push_back(std::move(cur));
+    }
+    if (lines.size() > 0) v.date = lines[0];
+    if (lines.size() > 1) v.version = lines[1];
+    if (lines.size() > 2) v.bootloader = lines[2];
+    if (lines.size() > 3) v.timestamp = lines[3];
+    for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
+        if (*it == "mk1" || *it == "mk2" || *it == "mk3" || *it == "mk4" ||
+            *it == "mk5" || *it == "q") {
+            v.hw_label = *it;
+            break;
+        }
+    }
+    if (!v.version.empty()) {
+        const char last = v.version.back();
+        v.is_edge = last == 'X' || last == 'x';
+    }
+    return v;
+}
+
+std::string ColdcardModelName(const ColdcardVersion& version)
+{
+    if (version.is_edge) return "coldcard_edge";
+    if (version.hw_label == "mk3") return "coldcard_mk3";
+    if (version.hw_label == "mk4") return "coldcard_mk4";
+    if (version.hw_label == "mk5") return "coldcard_mk5";
+    if (version.hw_label == "q") return "coldcard_q";
+    return "coldcard";
+}
 
 std::vector<DeviceInfo> EnumerateColdcard()
 {
     std::vector<DeviceInfo> out;
-    for (const HidInfo& hid : EnumerateHid(COINKITE_VID, CKCC_PID)) {
+    for (const HidInfo& hid : DedupeColdcardHid(EnumerateHid(COINKITE_VID, CKCC_PID))) {
         out.push_back(ProbeColdcard(hid.path, "coldcard"));
     }
     const std::string sock = DefaultColdcardUnixPath();
