@@ -47,6 +47,19 @@ private:
 
 std::vector<DeviceInfo> EnumerateMockDevices();
 std::unique_ptr<HardwareWalletClient> ConnectMock(const DeviceInfo& info);
+//! True while a UsbEnumerateSuppress is alive (mock-only unit tests).
+bool UsbEnumerateSuppressed();
+
+//! RAII: Enumerate() returns only mock devices. Lets wallet unit tests assert
+//! "signer unplugged" without a live Coldcard/Ledger/Trezor changing the set.
+class UsbEnumerateSuppress
+{
+public:
+    UsbEnumerateSuppress();
+    ~UsbEnumerateSuppress();
+    UsbEnumerateSuppress(const UsbEnumerateSuppress&) = delete;
+    UsbEnumerateSuppress& operator=(const UsbEnumerateSuppress&) = delete;
+};
 
 } // namespace hwi
 

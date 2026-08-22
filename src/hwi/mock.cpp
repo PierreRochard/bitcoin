@@ -17,6 +17,7 @@
 #include <util/bip32.h>
 #include <util/strencodings.h>
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <utility>
@@ -39,6 +40,7 @@ struct MockRecord {
 };
 
 std::vector<std::unique_ptr<MockRecord>> g_mocks GUARDED_BY(g_mocks_mutex);
+std::atomic<int> g_usb_enumerate_suppress{0};
 
 CExtPubKey DeriveXpub(const CExtKey& master, const std::string& bip32_path)
 {
@@ -214,6 +216,21 @@ std::unique_ptr<HardwareWalletClient> MockRegistration::Connect() const
     info.path = m_path;
     info.fingerprint = m_fingerprint;
     return ConnectMock(info);
+}
+
+bool UsbEnumerateSuppressed()
+{
+    return g_usb_enumerate_suppress.load(std::memory_order_acquire) > 0;
+}
+
+UsbEnumerateSuppress::UsbEnumerateSuppress()
+{
+    g_usb_enumerate_suppress.fetch_add(1, std::memory_order_acq_rel);
+}
+
+UsbEnumerateSuppress::~UsbEnumerateSuppress()
+{
+    g_usb_enumerate_suppress.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 std::vector<DeviceInfo> EnumerateMockDevices()

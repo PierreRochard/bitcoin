@@ -64,6 +64,29 @@ BOOST_AUTO_TEST_CASE(mock_enumerate_and_xpub)
                                                                 ->first.Neuter()));
 }
 
+BOOST_AUTO_TEST_CASE(usb_enumerate_suppress_hides_hardware)
+{
+    BOOST_CHECK(!hwi::UsbEnumerateSuppressed());
+    {
+        hwi::UsbEnumerateSuppress outer;
+        BOOST_CHECK(hwi::UsbEnumerateSuppressed());
+        {
+            hwi::UsbEnumerateSuppress inner;
+            BOOST_CHECK(hwi::UsbEnumerateSuppressed());
+        }
+        BOOST_CHECK(hwi::UsbEnumerateSuppressed());
+        for (const hwi::DeviceInfo& d : hwi::Enumerate()) {
+            BOOST_CHECK_EQUAL(d.type, "mock");
+        }
+        hwi::MockRegistration mock{MockMaster()};
+        const auto devices = hwi::Enumerate();
+        BOOST_REQUIRE_EQUAL(devices.size(), 1U);
+        BOOST_CHECK_EQUAL(devices[0].type, "mock");
+        BOOST_CHECK_EQUAL(devices[0].fingerprint, mock.Fingerprint());
+    }
+    BOOST_CHECK(!hwi::UsbEnumerateSuppressed());
+}
+
 BOOST_AUTO_TEST_CASE(mock_getdescriptors)
 {
     hwi::MockRegistration mock{MockMaster()};

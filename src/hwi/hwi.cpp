@@ -132,6 +132,7 @@ std::string HardwareWalletClient::DisplayMultisigAddress(const std::string& desc
 std::vector<DeviceInfo> Enumerate()
 {
     std::vector<DeviceInfo> devices = EnumerateMockDevices();
+    if (UsbEnumerateSuppressed()) return devices;
     auto append = [&](std::vector<DeviceInfo> extra) {
         devices.insert(devices.end(), extra.begin(), extra.end());
     };
