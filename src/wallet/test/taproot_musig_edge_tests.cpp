@@ -39,7 +39,10 @@
 #include <vector>
 
 namespace wallet {
-BOOST_FIXTURE_TEST_SUITE(taproot_musig_edge_tests, BasicTestingSetup)
+struct MockOnlyTestingSetup : BasicTestingSetup {
+    hwi::UsbEnumerateSuppress no_usb;
+};
+BOOST_FIXTURE_TEST_SUITE(taproot_musig_edge_tests, MockOnlyTestingSetup)
 
 using common::PSBTError;
 

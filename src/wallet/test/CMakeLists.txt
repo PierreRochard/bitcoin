@@ -28,6 +28,7 @@ target_sources(test_bitcoin
     taproot_musig_edge_tests.cpp
     taproot_vault_local_tests.cpp
     taproot_vault_mixed_tests.cpp
+    taproot_vault_send_tests.cpp
     taproot_scale_tests.cpp
 )
 target_link_libraries(test_bitcoin bitcoin_wallet)

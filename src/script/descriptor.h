@@ -182,8 +182,24 @@ struct Descriptor {
      */
     virtual std::optional<int64_t> MaxSatisfactionWeight(bool use_max_sig) const = 0;
 
+    /** Like MaxSatisfactionWeight, but prefer a tapscript satisfaction when
+     *  the descriptor has both a key path and a script path (BIP 68 recovery).
+     *  NUMS internal keys always use the script path. */
+    virtual std::optional<int64_t> MaxSatisfactionWeight(bool use_max_sig, bool script_path) const
+    {
+        (void)script_path;
+        return MaxSatisfactionWeight(use_max_sig);
+    }
+
     /** Get the maximum size number of stack elements for satisfying this descriptor. */
     virtual std::optional<int64_t> MaxSatisfactionElems() const = 0;
+
+    /** Like MaxSatisfactionElems, with the same script-path meaning as above. */
+    virtual std::optional<int64_t> MaxSatisfactionElems(bool script_path) const
+    {
+        (void)script_path;
+        return MaxSatisfactionElems();
+    }
 
     /** Return all (extended) public keys for this descriptor, including any from subdescriptors.
      *

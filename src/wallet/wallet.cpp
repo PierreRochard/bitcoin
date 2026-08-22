@@ -2168,19 +2168,15 @@ bool CWallet::SignTransaction(CMutableTransaction& tx) const
 {
     AssertLockHeld(cs_wallet);
 
-    // Build coins map
-    std::map<COutPoint, Coin> coins;
-    for (auto& input : tx.vin) {
-        const auto mi = mapWallet.find(input.prevout.hash);
-        if(mi == mapWallet.end() || input.prevout.n >= mi->second.GetTx()->vout.size()) {
-            return false;
-        }
-        const CWalletTx& wtx = mi->second;
-        int prev_height = wtx.state<TxStateConfirmed>() ? wtx.state<TxStateConfirmed>()->confirmed_block_height : 0;
-        coins[input.prevout] = Coin(wtx.GetTx()->vout[input.prevout.n], prev_height, wtx.IsCoinBase());
+    // MuSig2 is two-round. ProduceSignature (the 4-arg SignTransaction path) is a
+    // single pass and cannot finish tr(musig). FillPSBT loops nonce → partial →
+    // aggregate, which CreateTransaction/GUI send need for Scrooge vaults.
+    PartiallySignedTransaction psbtx(tx);
+    bool complete = false;
+    if (FillPSBTLocked(psbtx, {.sign = true, .finalize = true, .bip32_derivs = true}, complete, nullptr)) {
+        return false;
     }
-    std::map<int, bilingual_str> input_errors;
-    return SignTransaction(tx, coins, SIGHASH_DEFAULT, input_errors);
+    return complete && FinalizeAndExtractPSBT(psbtx, tx);
 }
 
 bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors) const
@@ -2200,10 +2196,16 @@ bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint,
 
 std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, const common::PSBTFillOptions& options, bool& complete, size_t* n_signed) const
 {
+    LOCK(cs_wallet);
+    return FillPSBTLocked(psbtx, options, complete, n_signed);
+}
+
+std::optional<PSBTError> CWallet::FillPSBTLocked(PartiallySignedTransaction& psbtx, const common::PSBTFillOptions& options, bool& complete, size_t* n_signed) const
+{
+    AssertLockHeld(cs_wallet);
     if (n_signed) {
         *n_signed = 0;
     }
-    LOCK(cs_wallet);
     // Get all of the previous transactions
     for (PSBTInput& input : psbtx.inputs) {
         if (PSBTInputSigned(input)) {
@@ -3798,10 +3800,11 @@ void CWallet::SetupDescriptorScriptPubKeyMans(const std::optional<std::string>& 
 void CWallet::SetupWalletGeneration(const std::optional<std::string>& signer_fingerprint)
 {
     AssertLockHeld(cs_wallet);
-    // Skip setup for non-external-signer wallets that are either blank
-    // or have private keys disabled (not having private keys implies blank).
-    if (!IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER) &&
-        (IsWalletFlagSet(WALLET_FLAG_BLANK_WALLET) || IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS))) {
+    // Blank wallets stay empty until descriptors are imported (wizard air-gapped
+    // / hardware-only). Skip generation for watch-only wallets that are not
+    // external-signer either.
+    if (IsWalletFlagSet(WALLET_FLAG_BLANK_WALLET) ||
+        (!IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER) && IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS))) {
         return;
     }
     SetupDescriptorScriptPubKeyMans(signer_fingerprint);

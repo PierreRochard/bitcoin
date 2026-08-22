@@ -40,7 +40,7 @@ BOOST_FIXTURE_TEST_SUITE(taproot_vault_mixed_tests, BasicTestingSetup)
 
 using common::PSBTError;
 
-//! Same 24861 vault matrix as taproot_vault_local_tests, but key 0 is a
+//! Same Scrooge vault matrix as taproot_vault_local_tests, but key 0 is a
 //! computer HD seed and keys 1…n-1 are C++ mock hardware wallets.
 
 static std::shared_ptr<CWallet> MakeMixedWallet()

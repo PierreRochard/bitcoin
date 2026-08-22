@@ -18,6 +18,7 @@
 #include <wallet/coincontrol.h>
 #include <wallet/feebumper.h>
 #include <wallet/fees.h>
+#include <wallet/multisig.h>
 #include <wallet/rpc/util.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
@@ -95,7 +96,8 @@ std::set<int> InterpretSubtractFeeFromOutputInstructions(const UniValue& sffo_in
 
 static UniValue FinishTransaction(const std::shared_ptr<CWallet> pwallet, const UniValue& options, CMutableTransaction& rawTx)
 {
-    bool can_anti_fee_snipe = !options.exists("locktime");
+    bool can_anti_fee_snipe = !options.exists("locktime") &&
+                              !(options.exists("vault_recovery") && options["vault_recovery"].get_bool());
 
     for (const CTxIn& tx_in : rawTx.vin) {
         // Checks sequence values consistent with DiscourageFeeSniping
@@ -515,6 +517,7 @@ CreatedTransactionResult FundTransaction(CWallet& wallet, const CMutableTransact
                     {"maxconf", UniValueType(UniValue::VNUM)},
                     {"input_weights", UniValueType(UniValue::VARR)},
                     {"max_tx_weight", UniValueType(UniValue::VNUM)},
+                    {"vault_recovery", UniValueType(UniValue::VBOOL)},
                 },
                 true, true);
 
@@ -592,6 +595,10 @@ CreatedTransactionResult FundTransaction(CWallet& wallet, const CMutableTransact
             if (coinControl.m_max_depth < coinControl.m_min_depth) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("maxconf can't be lower than minconf: %d < %d", coinControl.m_max_depth, coinControl.m_min_depth));
             }
+        }
+        if (options.exists("vault_recovery") && options["vault_recovery"].get_bool()) {
+            LOCK(wallet.cs_wallet);
+            ApplyVaultRecoveryToCoinControl(wallet, coinControl);
         }
         SetFeeEstimateMode(wallet, coinControl, options["conf_target"], options["estimate_mode"], options["fee_rate"], override_min_fee);
     }
@@ -1202,6 +1209,7 @@ RPCMethod send()
                                                           "If that happens, you will need to fund the transaction with different inputs and republish it."},
                     {"minconf", RPCArg::Type::NUM, RPCArg::Default{0}, "If add_inputs is specified, require inputs with at least this many confirmations."},
                     {"maxconf", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "If add_inputs is specified, require inputs with at most this many confirmations."},
+                    {"vault_recovery", RPCArg::Type::BOOL, RPCArg::Default{false}, "Scrooge vault only. Spend the delayed recovery script path (mature UTXOs only). Does not switch paths unless this is set."},
                     {"add_to_wallet", RPCArg::Type::BOOL, RPCArg::Default{true}, "When false, returns a serialized transaction which will not be added to the wallet or broadcast"},
                     {"change_address", RPCArg::Type::STR, RPCArg::DefaultHint{"automatic"}, "The bitcoin address to receive the change"},
                     {"change_position", RPCArg::Type::NUM, RPCArg::DefaultHint{"random"}, "The index of the change output"},

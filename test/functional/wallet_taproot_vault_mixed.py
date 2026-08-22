@@ -2,7 +2,7 @@
 # Copyright (c) 2026 The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Regtest: mixed-key Taproot vault (computer HD seed + external signer).
+"""Regtest: mixed-key Scrooge vault (computer HD seed + external signer).
 
 Python signer.py cannot complete MuSig2, so key-path send is not asserted.
 Recovery after older(N) uses only the computer keys that still sit in the

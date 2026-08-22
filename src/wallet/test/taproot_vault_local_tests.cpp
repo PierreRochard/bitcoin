@@ -17,7 +17,10 @@
 #include <util/check.h>
 #include <util/strencodings.h>
 #include <util/translation.h>
+#include <util/rbf.h>
+#include <wallet/coincontrol.h>
 #include <wallet/multisig.h>
+#include <wallet/spend.h>
 #include <wallet/wallet.h>
 
 #include <test/util/setup_common.h>
@@ -25,6 +28,8 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -37,7 +42,7 @@ BOOST_FIXTURE_TEST_SUITE(taproot_vault_local_tests, BasicTestingSetup)
 
 using common::PSBTError;
 
-//! All-local Taproot vault (bitcoin#24861) through CreateMultisigDescriptor:
+//! All-local Scrooge vault (bitcoin#24861) through CreateMultisigDescriptor:
 //! n computer HD seeds, n-of-n MuSig2 key-path now, m-of-n after older(N).
 
 static std::shared_ptr<CWallet> MakeWallet()
@@ -247,8 +252,8 @@ static void CheckPolicy(int m, int n, uint32_t older)
 
     {
         LOCK(vault.full->cs_wallet);
-        // Key-path does not need a relative lock. send() uses SEQUENCE_FINAL
-        // (or RBF) even after the UTXO is old enough for recovery.
+        // Key-path does not need a relative lock. send() uses RBF nSequence
+        // (MAX_BIP125_RBF_SEQUENCE) even after the UTXO is old enough for recovery.
         ExpectKeypath(SignSpk(*vault.full, vault.spk, CTxIn::SEQUENCE_FINAL), ctx + " full MuSig2 key-path");
     }
 
@@ -289,8 +294,91 @@ BOOST_AUTO_TEST_CASE(create_rejects_bad_fallback)
     AddUnused(*wallet, a);
     AddUnused(*wallet, b);
     std::vector<MultisigKeySpec> specs{LocalSpec(a), LocalSpec(b)};
+    BOOST_CHECK(!CreateMultisigDescriptor(*wallet, 2, specs, MultisigOptions{OutputType::UNKNOWN}));
     BOOST_CHECK(!CreateMultisigDescriptor(*wallet, 2, specs, MultisigOptions{OutputType::BECH32, 0, {}, 1}));
     BOOST_CHECK(!CreateMultisigDescriptor(*wallet, 2, specs, MultisigOptions{OutputType::BECH32M, 0, {}, 0}));
+    BOOST_CHECK(!CreateMultisigDescriptor(*wallet, 2, specs, MultisigOptions{OutputType::BECH32M, 0, {}, /*fallback_older=*/1, /*fallback_after=*/50}));
+    BOOST_CHECK(!CreateMultisigDescriptor(*wallet, 2, specs, MultisigOptions{OutputType::BECH32M, 0, {}, {}, uint32_t{0}}));
+    BOOST_CHECK(!CreateMultisigDescriptor(*wallet, 2, specs, MultisigOptions{OutputType::BECH32M, 0, {}, 1u << 31}));
+    auto heir = LocalSpec(a);
+    heir.recovery_only = true;
+    BOOST_CHECK(!CreateMultisigDescriptor(*wallet, 1, {LocalSpec(a), heir}, MultisigOptions{OutputType::BECH32M}));
+    auto bad_path = LocalSpec(a);
+    bad_path.path = "not-a-path";
+    BOOST_CHECK(!CreateMultisigDescriptor(*wallet, 2, {bad_path, LocalSpec(b)}, MultisigOptions{OutputType::BECH32M, 0, {}, 1}));
+    auto air = XpubSpec(b);
+    air.fingerprint.reset();
+    BOOST_CHECK(!CreateMultisigDescriptor(*wallet, 2, {LocalSpec(a), air}, MultisigOptions{OutputType::BECH32M, 0, {}, 1}));
+    auto soft = LocalSpec(a);
+    soft.path = "m/48/0/0/3";
+    BOOST_CHECK(!CreateMultisigDescriptor(*wallet, 2, {soft, LocalSpec(b)}, MultisigOptions{OutputType::BECH32M, 0, {}, 1}));
+    auto recv_only = MakeWallet();
+    LOCK(recv_only->cs_wallet);
+    AddUnused(*recv_only, a);
+    AddUnused(*recv_only, b);
+    auto recv = CreateMultisigDescriptor(*recv_only, 1, {LocalSpec(a), LocalSpec(b)},
+                                         MultisigOptions{OutputType::BECH32M, 0, /*internal_only=*/false, 1});
+    BOOST_REQUIRE_MESSAGE(recv, util::ErrorString(recv).original);
+    BOOST_CHECK_EQUAL(recv->descs.size(), 1U);
+    auto watch = std::shared_ptr<CWallet>(new CWallet(/*chain=*/nullptr, "vault_wo", CreateMockableWalletDatabase()));
+    watch->InitWalletFlags(WALLET_FLAG_DESCRIPTORS | WALLET_FLAG_DISABLE_PRIVATE_KEYS | WALLET_FLAG_LAST_HARDENED_XPUB_CACHED);
+    LOCK(watch->cs_wallet);
+    BOOST_CHECK(!CreateMultisigDescriptor(*watch, 2, {LocalSpec(a), LocalSpec(b)}, MultisigOptions{OutputType::BECH32M, 0, {}, 1}));
+    auto xpubs = CreateMultisigDescriptor(*watch, 1, {XpubSpec(a), XpubSpec(b)}, MultisigOptions{OutputType::BECH32M, 0, {}, 1});
+    BOOST_REQUIRE_MESSAGE(xpubs, util::ErrorString(xpubs).original);
+    BOOST_CHECK(!ValidateMultisigPolicy(2, 2, OutputType::BECH32M, /*fallback_older=*/1, /*fallback_after=*/1).empty());
+    BOOST_CHECK(!ValidateMultisigPolicy(1, 0).empty());
+    BOOST_CHECK(!ValidateMultisigPolicy(0, 2).empty());
+    BOOST_CHECK(!ValidateMultisigPolicy(1, 1, OutputType::BECH32M, /*fallback_older=*/1).empty());
+    BOOST_CHECK(!ValidateMultisigPolicy(1, 1, OutputType::BECH32M, {}, /*fallback_after=*/10).empty());
+    BOOST_CHECK(WrapSortedMulti(OutputType::UNKNOWN, 1, {"x"}).empty());
+    BOOST_CHECK(WrapSortedMulti(OutputType::BECH32M, 1, {}).empty());
+    BOOST_CHECK(WrapSortedMulti(OutputType::BECH32M, 1, {"a", "b"}, /*fallback_older=*/1, /*fallback_after=*/2).empty());
+    BOOST_CHECK(WrapSortedMulti(OutputType::BECH32M, 1, {"only"}, /*fallback_older=*/1).empty());
+    BOOST_CHECK_EQUAL(WrapSortedMulti(OutputType::LEGACY, 1, {"k"}), "sh(sortedmulti(1,k))");
+    BOOST_CHECK_EQUAL(WrapSortedMulti(OutputType::P2SH_SEGWIT, 1, {"k"}), "sh(wsh(sortedmulti(1,k)))");
+    BOOST_CHECK_EQUAL(WrapSortedMulti(OutputType::BECH32, 2, {"a", "b"}), "wsh(sortedmulti(2,a,b))");
+    const auto rec_wrap = WrapSortedMulti(OutputType::BECH32M, 1, {"act1", "act2"}, /*fallback_older=*/6, {}, {"act1", "act2", "heir"});
+    BOOST_CHECK(rec_wrap.find("musig(act1,act2)") != std::string::npos);
+    BOOST_CHECK(rec_wrap.find("older(6)") != std::string::npos);
+    BOOST_CHECK(rec_wrap.find("multi_a(1,act1,act2,heir)") != std::string::npos);
+    BOOST_CHECK_EQUAL(DefaultMultisigPath(OutputType::LEGACY, 0), "m/48h/0h/0h/0h");
+    BOOST_CHECK_EQUAL(DefaultMultisigPath(OutputType::P2SH_SEGWIT, 0), "m/48h/0h/0h/1h");
+    BOOST_CHECK_EQUAL(DefaultMultisigPath(OutputType::UNKNOWN, 0), "m/48h/0h/0h/2h");
+}
+
+BOOST_AUTO_TEST_CASE(vault_infer_and_duplicate_edges)
+{
+    BOOST_CHECK(!InferVaultPolicy("tr(musig(a,b)/<0;1>/*)").is_vault);
+    BOOST_CHECK(!InferVaultPolicy("tr(musig(a,b),and_v(v:older(0),multi_a(1,a,b)))").older);
+    BOOST_CHECK(!InferVaultPolicy("tr(musig(a,b),and_v(v:after(2147483648),multi_a(1,a,b)))").after);
+    BOOST_CHECK(!InferVaultPolicy("tr(musig(a,b),and_v(v:older(").older);
+    BOOST_CHECK(!InferVaultPolicy("wsh(sortedmulti(2,a,b))").is_vault);
+    BOOST_CHECK(!InferVaultPolicy("tr(pk(a),and_v(v:older(1),multi_a(1,a)))").is_vault);
+    BOOST_CHECK(!InferVaultPolicy("tr(musig(a,b),and_v(v:after(10),pk(a)))").is_vault);
+    BOOST_CHECK(!InferVaultPolicy("tr(musig(a,b),and_v(v:after(),multi_a(1,a,b)))").after);
+
+    InferredVaultPolicy unlocked;
+    unlocked.is_vault = true;
+    BOOST_CHECK(IsVaultUtxoMature(unlocked, /*depth=*/0, /*tip=*/0));
+
+    std::vector<MultisigKeySpec> same_xpub(2);
+    same_xpub[0].xpub = "tpub1";
+    same_xpub[1].xpub = "tpub1";
+    BOOST_CHECK(!DuplicateSignerWarning(same_xpub).empty());
+    same_xpub[1].xpub = "tpub2";
+    BOOST_CHECK(DuplicateSignerWarning(same_xpub).empty());
+    BOOST_CHECK(DuplicateSignerWarning({}).empty());
+    BOOST_CHECK(DuplicateSignerWarning({same_xpub[0]}).empty());
+
+    auto plain = MakeWallet();
+    LOCK(plain->cs_wallet);
+    CCoinControl cc;
+    ApplyVaultRecoveryToCoinControl(*plain, cc);
+    BOOST_CHECK(!cc.m_nSequence);
+    BOOST_CHECK(!cc.m_locktime);
+    BOOST_CHECK(!cc.m_script_path);
+    BOOST_CHECK(!InferWalletVaultPolicy(*plain).is_vault);
 }
 
 BOOST_AUTO_TEST_CASE(all_local_vault_matrix_older_1)
@@ -462,6 +550,238 @@ BOOST_AUTO_TEST_CASE(split_wallets_vault_recovery)
     CMutableTransaction mtx;
     BOOST_CHECK(FinalizeAndExtractPSBT(*combined, mtx));
     BOOST_CHECK_GT(mtx.vin[0].scriptWitness.stack.size(), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(infer_taproot_recovery_delay)
+{
+    BOOST_CHECK(!InferTaprootRecoveryDelay("tr(musig(a,b)/<0;1>/*)"));
+    BOOST_CHECK_EQUAL(*InferTaprootRecoveryDelay("tr(musig(a,b),and_v(v:older(144),multi_a(2,a,b)))"), 144U);
+    BOOST_CHECK_EQUAL(*InferTaprootRecoveryDelay("tr(...,and_v(v:older(1),pk(x)))"), 1U);
+    BOOST_CHECK(!InferTaprootRecoveryDelay("tr(...,and_v(v:older(0),pk(x)))"));
+
+    const auto rel = InferVaultPolicy("tr(musig(a,b),and_v(v:older(144),multi_a(2,a,b)))");
+    BOOST_CHECK(rel.is_vault);
+    BOOST_CHECK_EQUAL(*rel.older, 144U);
+    BOOST_CHECK(!rel.after);
+    BOOST_CHECK_EQUAL(rel.recovery_m, 2);
+    const auto abs = InferVaultPolicy("tr(musig(a,b),and_v(v:after(500),multi_a(1,a,b,c)))");
+    BOOST_CHECK(abs.is_vault);
+    BOOST_CHECK(!abs.older);
+    BOOST_CHECK_EQUAL(*abs.after, 500U);
+    BOOST_CHECK_EQUAL(abs.recovery_m, 1);
+    BOOST_CHECK(!InferVaultPolicy("tr(musig(a,b)/<0;1>/*)").is_vault);
+
+    const std::string id_a = VaultPolicyId("tr(musig(a,b),and_v(v:older(1),multi_a(1,a,b)))#checksum");
+    const std::string id_b = VaultPolicyId("tr(musig(a,b),and_v(v:older(1),multi_a(1,a,b)))#checksum");
+    const std::string id_c = VaultPolicyId("tr(musig(a,b),and_v(v:older(2),multi_a(1,a,b)))#checksum");
+    BOOST_CHECK_EQUAL(id_a.size(), 16U);
+    BOOST_CHECK_EQUAL(id_a, id_b);
+    BOOST_CHECK(id_a != id_c);
+
+    std::vector<MultisigKeySpec> dup(2);
+    dup[0].fingerprint = "aabbccdd";
+    dup[1].fingerprint = "aabbccdd";
+    BOOST_CHECK(!DuplicateSignerWarning(dup).empty());
+    dup[1].fingerprint = "11223344";
+    BOOST_CHECK(DuplicateSignerWarning(dup).empty());
+}
+
+BOOST_AUTO_TEST_CASE(vault_recovery_only_key_omitted_from_musig)
+{
+    auto wallet = MakeWallet();
+    LOCK(wallet->cs_wallet);
+    CExtKey a = RandomMaster(), b = RandomMaster(), heir = RandomMaster();
+    AddUnused(*wallet, a);
+    AddUnused(*wallet, b);
+    AddUnused(*wallet, heir);
+    auto ka = LocalSpec(a);
+    auto kb = LocalSpec(b);
+    auto kh = LocalSpec(heir);
+    kh.recovery_only = true;
+    kh.label = "heir";
+    auto created = CreateMultisigDescriptor(*wallet, /*nrequired=*/1, {ka, kb, kh},
+                                            MultisigOptions{OutputType::BECH32M, 0, {}, /*fallback_older=*/144});
+    BOOST_REQUIRE_MESSAGE(created, util::ErrorString(created).original);
+    BOOST_REQUIRE(!created->descs.empty());
+    BOOST_CHECK_EQUAL(created->key_exprs.size(), 2U);
+    const std::string& desc = created->descs[0];
+    BOOST_CHECK(desc.find("tr(musig(") != std::string::npos);
+    BOOST_CHECK(desc.find("older(144)") != std::string::npos);
+    BOOST_CHECK(desc.find("multi_a(1,") != std::string::npos);
+    BOOST_CHECK(!created->policy_id.empty());
+    BOOST_CHECK_EQUAL(created->policy_id, VaultPolicyId(desc));
+    const auto inf = InferVaultPolicy(desc);
+    BOOST_CHECK(inf.is_vault);
+    BOOST_CHECK_EQUAL(inf.recovery_m, 1);
+    BOOST_CHECK_EQUAL(*inf.older, 144U);
+    BOOST_CHECK(desc.find("musig(") != std::string::npos);
+    BOOST_CHECK(std::count(desc.begin(), desc.end(), ',') >= 2);
+
+    const auto tr = FormatMultisigTranscript("t", "regtest", 1, {ka, kb, kh}, OutputType::BECH32M,
+                                             created->descs, /*fallback_older=*/144);
+    BOOST_CHECK(tr.find("role=recovery-only") != std::string::npos);
+    BOOST_CHECK(tr.find("role=active") != std::string::npos);
+    BOOST_CHECK(tr.find("Scrooge vault") != std::string::npos);
+
+    auto after_w = MakeWallet();
+    LOCK(after_w->cs_wallet);
+    AddUnused(*after_w, a);
+    AddUnused(*after_w, b);
+    AddUnused(*after_w, heir);
+    auto after_created = CreateMultisigDescriptor(*after_w, /*nrequired=*/1, {ka, kb, kh},
+                                                  MultisigOptions{OutputType::BECH32M, 0, {}, {}, /*fallback_after=*/500});
+    BOOST_REQUIRE_MESSAGE(after_created, util::ErrorString(after_created).original);
+    BOOST_CHECK_EQUAL(after_created->key_exprs.size(), 2U);
+    BOOST_CHECK(after_created->descs[0].find("after(500)") != std::string::npos);
+    BOOST_CHECK(after_created->descs[0].find("older(") == std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(vault_after_policy_and_apply_coincontrol)
+{
+    auto wallet = MakeWallet();
+    LOCK(wallet->cs_wallet);
+    CExtKey a = RandomMaster(), b = RandomMaster();
+    AddUnused(*wallet, a);
+    AddUnused(*wallet, b);
+    auto created = CreateMultisigDescriptor(*wallet, 1, {LocalSpec(a), LocalSpec(b)},
+                                            MultisigOptions{OutputType::BECH32M, 0, {}, {}, /*fallback_after=*/500});
+    BOOST_REQUIRE_MESSAGE(created, util::ErrorString(created).original);
+    BOOST_CHECK(created->descs[0].find("after(500)") != std::string::npos);
+    BOOST_CHECK(created->descs[0].find("older(") == std::string::npos);
+    BOOST_CHECK_EQUAL(*created->fallback_after, 500U);
+    CCoinControl rec_cc;
+    ApplyVaultRecoveryToCoinControl(*wallet, rec_cc);
+    BOOST_CHECK(rec_cc.m_script_path);
+    BOOST_REQUIRE(rec_cc.m_locktime);
+    BOOST_CHECK_EQUAL(*rec_cc.m_locktime, 500U);
+    BOOST_CHECK_EQUAL(rec_cc.m_min_depth, std::numeric_limits<int>::max());
+    BOOST_CHECK(!rec_cc.m_nSequence);
+    const auto inf = InferWalletVaultPolicy(*wallet);
+    BOOST_CHECK(inf.is_vault);
+    BOOST_CHECK_EQUAL(*inf.after, 500U);
+    const auto tr = FormatMultisigTranscript("t", "regtest", 1, {LocalSpec(a), LocalSpec(b)}, OutputType::BECH32M,
+                                            created->descs, {}, /*fallback_after=*/500);
+    BOOST_CHECK(tr.find("after()") != std::string::npos);
+    BOOST_CHECK(tr.find("500") != std::string::npos);
+    BOOST_CHECK(tr.find("CLTV") != std::string::npos);
+    const auto pkg = ExportWalletVaultPolicy(*wallet);
+    BOOST_CHECK_EQUAL(*pkg.fallback_after, 500U);
+    BOOST_CHECK(!pkg.fallback_older);
+    BOOST_CHECK(FormatVaultPolicyPackage(pkg).find("xprv") == std::string::npos);
+    BOOST_CHECK(FormatVaultPolicyPackage(pkg).find("fallback_after") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(vault_policy_package_roundtrip)
+{
+    BOOST_CHECK(IsVaultUtxoMature(InferredVaultPolicy{}, /*depth=*/0, /*tip=*/0));
+    InferredVaultPolicy rel;
+    rel.is_vault = true;
+    rel.older = 2;
+    BOOST_CHECK(!IsVaultUtxoMature(rel, /*depth=*/1, /*tip=*/100));
+    BOOST_CHECK(IsVaultUtxoMature(rel, /*depth=*/2, /*tip=*/100));
+    InferredVaultPolicy abs;
+    abs.is_vault = true;
+    abs.after = 50;
+    BOOST_CHECK(!IsVaultUtxoMature(abs, /*depth=*/10, /*tip=*/49));
+    BOOST_CHECK(IsVaultUtxoMature(abs, /*depth=*/1, /*tip=*/50));
+
+    auto wallet = MakeWallet();
+    LOCK(wallet->cs_wallet);
+    CExtKey a = RandomMaster(), b = RandomMaster();
+    AddUnused(*wallet, a);
+    AddUnused(*wallet, b);
+    auto created = CreateMultisigDescriptor(*wallet, 1, {LocalSpec(a), LocalSpec(b)},
+                                            MultisigOptions{OutputType::BECH32M, 0, {}, 144});
+    BOOST_REQUIRE(created);
+    const auto pkg = ExportWalletVaultPolicy(*wallet);
+    BOOST_CHECK_EQUAL(pkg.format, "bitcoin-core-vault-policy");
+    BOOST_CHECK(!pkg.policy_id.empty());
+    BOOST_CHECK_EQUAL(*pkg.fallback_older, 144U);
+    BOOST_REQUIRE(!pkg.descs.empty());
+    const std::string json = FormatVaultPolicyPackage(pkg);
+    BOOST_CHECK(json.find("xprv") == std::string::npos);
+    auto parsed = ParseVaultPolicyPackage(json);
+    BOOST_REQUIRE_MESSAGE(parsed, util::ErrorString(parsed).original);
+    BOOST_CHECK_EQUAL(parsed->policy_id, pkg.policy_id);
+
+    auto watch = std::shared_ptr<CWallet>(new CWallet(/*chain=*/nullptr, "vault_watch", CreateMockableWalletDatabase()));
+    watch->InitWalletFlags(WALLET_FLAG_DESCRIPTORS | WALLET_FLAG_DISABLE_PRIVATE_KEYS | WALLET_FLAG_LAST_HARDENED_XPUB_CACHED);
+    LOCK(watch->cs_wallet);
+    auto imported = ImportWalletVaultPolicy(*watch, *parsed);
+    BOOST_REQUIRE_MESSAGE(imported, util::ErrorString(imported).original);
+    const auto again = ExportWalletVaultPolicy(*watch);
+    BOOST_CHECK_EQUAL(again.policy_id, pkg.policy_id);
+
+    BOOST_CHECK(!ParseVaultPolicyPackage("not-json"));
+    BOOST_CHECK(!ParseVaultPolicyPackage("{\"format\":\"other\"}"));
+    BOOST_CHECK(!ParseVaultPolicyPackage("{\"format\":\"bitcoin-core-vault-policy\",\"descs\":[]}"));
+    BOOST_CHECK(!ParseVaultPolicyPackage("{\"format\":\"bitcoin-core-vault-policy\"}"));
+    auto missing_fmt = ParseVaultPolicyPackage("{\"descs\":[\"tr(dummy)\"]}");
+    BOOST_REQUIRE(missing_fmt);
+    BOOST_CHECK_EQUAL(missing_fmt->format, "bitcoin-core-vault-policy");
+    auto auto_id = ParseVaultPolicyPackage("{\"format\":\"bitcoin-core-vault-policy\",\"descs\":[\"tr(dummy)\"]}");
+    BOOST_REQUIRE(auto_id);
+    BOOST_CHECK_EQUAL(auto_id->policy_id, VaultPolicyId("tr(dummy)"));
+    auto versioned = ParseVaultPolicyPackage("{\"format\":\"bitcoin-core-vault-policy\",\"version\":1,\"descs\":[\"d\"]}");
+    BOOST_REQUIRE(versioned);
+    BOOST_CHECK_EQUAL(versioned->version, 1);
+    auto both_locks = ParseVaultPolicyPackage("{\"format\":\"bitcoin-core-vault-policy\",\"fallback_older\":1,\"fallback_after\":2,\"descs\":[\"x\"]}");
+    BOOST_REQUIRE(both_locks);
+    BOOST_CHECK(both_locks->fallback_older);
+    BOOST_CHECK(both_locks->fallback_after);
+    VaultPolicyPackage bad_net = *parsed;
+    bad_net.network = pkg.network == "main" ? "regtest" : "main";
+    BOOST_CHECK(!ImportWalletVaultPolicy(*watch, bad_net));
+    VaultPolicyPackage no_csum;
+    no_csum.descs = {"tr(musig(a,b))"};
+    BOOST_CHECK(!ImportWalletVaultPolicy(*watch, no_csum));
+    VaultPolicyPackage empty_net = *parsed;
+    empty_net.network.clear();
+    auto watch2 = std::shared_ptr<CWallet>(new CWallet(/*chain=*/nullptr, "vault_watch2", CreateMockableWalletDatabase()));
+    watch2->InitWalletFlags(WALLET_FLAG_DESCRIPTORS | WALLET_FLAG_DISABLE_PRIVATE_KEYS | WALLET_FLAG_LAST_HARDENED_XPUB_CACHED);
+    LOCK(watch2->cs_wallet);
+    BOOST_REQUIRE(ImportWalletVaultPolicy(*watch2, empty_net));
+    BOOST_REQUIRE(ImportWalletVaultPolicy(*watch2, empty_net));
+    BOOST_CHECK_EQUAL(ExportWalletVaultPolicy(*watch2).policy_id, pkg.policy_id);
+}
+
+BOOST_AUTO_TEST_CASE(vault_fee_uses_script_path_vsize)
+{
+    auto vault = MakeVault(2, 3, 144, {0, 1});
+    LOCK(vault.full->cs_wallet);
+    CMutableTransaction tx;
+    tx.version = 2;
+    tx.vin.emplace_back(COutPoint{}, CScript(), MAX_BIP125_RBF_SEQUENCE);
+    tx.vout.emplace_back(COIN - 10000, vault.spk);
+    const std::vector<CTxOut> prev{CTxOut{COIN, vault.spk}};
+    const TxSize keypath = CalculateMaximumSignedTxSize(CTransaction(tx), vault.full.get(), prev, nullptr);
+    BOOST_REQUIRE_GT(keypath.vsize, 0);
+    tx.vin[0].nSequence = 144;
+    const TxSize scriptpath = CalculateMaximumSignedTxSize(CTransaction(tx), vault.full.get(), prev, nullptr);
+    BOOST_REQUIRE_GT(scriptpath.vsize, 0);
+    BOOST_CHECK_MESSAGE(keypath.vsize < scriptpath.vsize,
+                        strprintf("keypath vsize %d !< scriptpath %d", keypath.vsize, scriptpath.vsize));
+    BOOST_CHECK_LT(keypath.vsize, 150);
+    BOOST_CHECK_GT(scriptpath.vsize, 150);
+}
+
+BOOST_AUTO_TEST_CASE(nums_multi_a_fee_is_not_keypath)
+{
+    FlatSigningProvider provider;
+    std::string error;
+    const CKey a = GenerateRandomKey();
+    const CKey b = GenerateRandomKey();
+    const std::string desc = strprintf(
+        "tr(%s,sortedmulti_a(1,%s,%s))",
+        HexStr(XOnlyPubKey::NUMS_H),
+        HexStr(XOnlyPubKey(a.GetPubKey())),
+        HexStr(XOnlyPubKey(b.GetPubKey())));
+    const auto parsed = Parse(desc, provider, error);
+    BOOST_REQUIRE_MESSAGE(!parsed.empty(), error);
+    const auto w = parsed[0]->MaxSatisfactionWeight(true);
+    BOOST_REQUIRE(w);
+    BOOST_CHECK_GT(*w, 1 + 65);
+    BOOST_CHECK_EQUAL(*parsed[0]->MaxSatisfactionElems(), *parsed[0]->MaxSatisfactionElems(/*script_path=*/true));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

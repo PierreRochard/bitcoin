@@ -69,8 +69,10 @@ static bool UseMaxSig(const std::optional<CTxIn>& txin, const CCoinControl* coin
 static std::optional<int64_t> MaxInputWeight(const Descriptor& desc, const std::optional<CTxIn>& txin,
                                              const CCoinControl* coin_control, const bool tx_is_segwit,
                                              const bool can_grind_r) {
-    if (const auto sat_weight = desc.MaxSatisfactionWeight(!can_grind_r || UseMaxSig(txin, coin_control))) {
-        if (const auto elems_count = desc.MaxSatisfactionElems()) {
+    const bool script_path = (coin_control && coin_control->m_script_path) ||
+                             (txin && ((txin->nSequence & CTxIn::SEQUENCE_LOCKTIME_DISABLE_FLAG) == 0));
+    if (const auto sat_weight = desc.MaxSatisfactionWeight(!can_grind_r || UseMaxSig(txin, coin_control), script_path)) {
+        if (const auto elems_count = desc.MaxSatisfactionElems(script_path)) {
             const bool is_segwit = IsSegwit(desc);
             // Account for the size of the scriptsig and the number of elements on the witness stack. Note
             // that if any input in the transaction is spending a witness program, we need to specify the
@@ -89,12 +91,25 @@ static std::optional<int64_t> MaxInputWeight(const Descriptor& desc, const std::
     return {};
 }
 
+static CTxIn DummyTxInForSize(const COutPoint& outpoint, const CCoinControl* coin_control)
+{
+    CTxIn txin{outpoint};
+    if (coin_control) {
+        if (const auto seq = coin_control->GetSequence(outpoint)) {
+            txin.nSequence = *seq;
+        } else if (coin_control->m_nSequence) {
+            txin.nSequence = *coin_control->m_nSequence;
+        }
+    }
+    return txin;
+}
+
 int CalculateMaximumSignedInputSize(const CTxOut& txout, const COutPoint outpoint, const SigningProvider* provider, bool can_grind_r, const CCoinControl* coin_control)
 {
     if (!provider) return -1;
 
     if (const auto desc = InferDescriptor(txout.scriptPubKey, *provider)) {
-        if (const auto weight = MaxInputWeight(*desc, CTxIn{outpoint}, coin_control, true, can_grind_r)) {
+        if (const auto weight = MaxInputWeight(*desc, DummyTxInForSize(outpoint, coin_control), coin_control, true, can_grind_r)) {
             return static_cast<int>(GetVirtualTransactionSize(*weight, 0, 0));
         }
     }
@@ -277,9 +292,22 @@ util::Result<CoinsResult> FetchSelectedInputs(const CWallet& wallet, const CCoin
         if (auto txo = wallet.GetTXO(outpoint)) {
             txout = txo->GetTxOut();
             if (input_bytes == -1) {
-                input_bytes = CalculateMaximumSignedInputSize(txout, &wallet, &coin_control);
+                const std::unique_ptr<SigningProvider> provider = wallet.GetSolvingProvider(txout.scriptPubKey);
+                input_bytes = CalculateMaximumSignedInputSize(txout, outpoint, provider.get(), can_grind_r, &coin_control);
             }
             const CWalletTx& parent_tx = txo->GetWalletTx();
+            const int depth = wallet.GetTxDepthInMainChain(parent_tx);
+            const std::optional<uint32_t> seq = coin_control.GetSequence(outpoint).has_value()
+                                                   ? coin_control.GetSequence(outpoint)
+                                                   : coin_control.m_nSequence;
+            if (seq && ((*seq & CTxIn::SEQUENCE_LOCKTIME_DISABLE_FLAG) == 0) &&
+                depth < static_cast<int>(*seq & CTxIn::SEQUENCE_LOCKTIME_MASK)) {
+                return util::Error{Untranslated("This coin is not yet recoverable. The relative delay has not elapsed for the selected input.")};
+            }
+            if (coin_control.m_script_path && coin_control.m_locktime &&
+                wallet.GetLastBlockHeight() < static_cast<int>(*coin_control.m_locktime)) {
+                return util::Error{Untranslated("This coin is not yet recoverable. The absolute recovery height has not been reached.")};
+            }
             if (wallet.GetTxDepthInMainChain(parent_tx) == 0) {
                 if (parent_tx.GetTx()->version == TRUC_VERSION && coin_control.m_version != TRUC_VERSION) {
                     return util::Error{strprintf(_("Can't spend unconfirmed version 3 pre-selected input with a version %d tx"), coin_control.m_version)};
@@ -395,7 +423,8 @@ CoinsResult AvailableCoins(const CWallet& wallet,
             }
 
             if (nDepth == 0 && params.check_version_trucness) {
-                if (coinControl->m_version == TRUC_VERSION) {
+                const uint32_t tx_version = coinControl ? coinControl->m_version : DEFAULT_WALLET_TX_VERSION;
+                if (tx_version == TRUC_VERSION) {
                     if (wtx.GetTx()->version != TRUC_VERSION) continue;
                     // this unconfirmed v3 transaction already has a child
                     if (wtx.truc_child_in_mempool.has_value()) continue;
@@ -1300,7 +1329,13 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     // and in the spirit of "smallest possible change from prior
     // behavior."
     bool use_anti_fee_sniping = true;
-    const uint32_t default_sequence{coin_control.m_signal_bip125_rbf.value_or(wallet.m_signal_rbf) ? MAX_BIP125_RBF_SEQUENCE : CTxIn::MAX_SEQUENCE_NONFINAL};
+    const uint32_t default_sequence{coin_control.m_nSequence.value_or(
+        coin_control.m_signal_bip125_rbf.value_or(wallet.m_signal_rbf) ? MAX_BIP125_RBF_SEQUENCE : CTxIn::MAX_SEQUENCE_NONFINAL)};
+    // BIP68 recovery nSequence is not one of the two values DiscourageFeeSniping
+    // allows. The GUI / send path sets m_nSequence to older(N) for Scrooge vaults.
+    if (coin_control.m_nSequence) {
+        use_anti_fee_sniping = false;
+    }
     txNew.vin.reserve(selected_coins.size());
     for (const auto& coin : selected_coins) {
         std::optional<uint32_t> sequence = coin_control.GetSequence(coin->outpoint);
@@ -1505,8 +1540,10 @@ util::Result<CreatedTransactionResult> FundTransaction(CWallet& wallet, const CM
     // This sets us up to remove tx completely in a future PR in favor of passing the inputs directly.
     assert(tx.vout.empty());
 
-    // Set the user desired locktime
-    coinControl.m_locktime = tx.nLockTime;
+    // Set the user desired locktime. Keep a locktime already set by vault recovery.
+    if (tx.nLockTime != 0) {
+        coinControl.m_locktime = tx.nLockTime;
+    }
 
     // Set the user desired version
     coinControl.m_version = tx.version;

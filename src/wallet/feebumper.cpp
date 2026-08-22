@@ -202,6 +202,7 @@ Result CreateRateBumpTransaction(CWallet& wallet, const Txid& txid, const CCoinC
             return Result::MISC_ERROR;
         }
         PreselectedInput& preset_txin = new_coin_control.Select(txin.prevout);
+        preset_txin.SetSequence(txin.nSequence);
         if (!wallet.IsMine(txin.prevout)) {
             preset_txin.SetTxOut(coin.out);
         }

@@ -100,6 +100,10 @@ public:
     std::optional<unsigned int> m_confirm_target;
     //! Override the wallet's m_signal_rbf if set
     std::optional<bool> m_signal_bip125_rbf;
+    //! If set, every non-preselected input uses this nSequence (BIP68 recovery, RBF).
+    std::optional<uint32_t> m_nSequence;
+    //! Force Taproot script-path size/satisfaction (absolute after() recovery).
+    bool m_script_path{false};
     //! Avoid partial use of funds sent to a given address
     bool m_avoid_partial_spends = DEFAULT_AVOIDPARTIALSPENDS;
     //! Forbids inclusion of dirty (previously used) addresses

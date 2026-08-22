@@ -313,6 +313,13 @@ private:
 
     bool Unlock(const CKeyingMaterial& vMasterKeyIn);
 
+    //! FillPSBT body; caller holds cs_wallet (FillPSBT itself takes the lock).
+    std::optional<common::PSBTError> FillPSBTLocked(PartiallySignedTransaction& psbtx,
+                                                    const common::PSBTFillOptions& options,
+                                                    bool& complete,
+                                                    size_t* n_signed) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
     std::atomic<bool> fAbortRescan{false};
     std::atomic<bool> fScanningWallet{false}; // controlled by WalletRescanReserver
     std::atomic<bool> m_scanning_with_passphrase{false};
@@ -503,6 +510,15 @@ public:
 
     std::map<CTxDestination, CAddressBookData> m_address_book GUARDED_BY(cs_wallet);
     const CAddressBookData* FindAddressBookEntry(const CTxDestination&, bool allow_change = false) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    //! Local labels for vault signers believed permanently lost. Does not change on-chain policy.
+    std::set<std::string> m_lost_signers GUARDED_BY(cs_wallet);
+    void SetLostSigner(const std::string& fingerprint, bool lost) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        AssertLockHeld(cs_wallet);
+        if (lost) m_lost_signers.insert(fingerprint);
+        else m_lost_signers.erase(fingerprint);
+    }
 
     /** Set of Coins owned by this wallet that we won't try to spend from. A
      * Coin may be locked if it has already been used to fund a transaction

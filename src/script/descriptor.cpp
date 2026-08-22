@@ -1569,13 +1569,64 @@ public:
 
     std::optional<int64_t> ScriptSize() const override { return 1 + 1 + 32; }
 
-    std::optional<int64_t> MaxSatisfactionWeight(bool) const override {
-        // FIXME: We assume keypath spend, which can lead to very large underestimations.
-        return 1 + 65;
+    bool InternalKeyIsNums() const
+    {
+        FlatSigningProvider dummy;
+        const auto pk = m_pubkey_args.at(0)->GetPubKey(0, dummy, dummy);
+        if (!pk) return false;
+        return XOnlyPubKey(*pk) == XOnlyPubKey::NUMS_H;
     }
 
-    std::optional<int64_t> MaxSatisfactionElems() const override {
-        // FIXME: See above, we assume keypath spend.
+    //! Witness weight (1 WU / byte) of the largest script-path satisfaction.
+    std::optional<int64_t> ScriptPathWeight(bool use_max_sig) const
+    {
+        std::optional<int64_t> best;
+        for (size_t i = 0; i < m_subdescriptor_args.size(); ++i) {
+            const auto sat = m_subdescriptor_args[i]->MaxSatSize(use_max_sig);
+            const auto script_size = m_subdescriptor_args[i]->ScriptSize();
+            if (!sat || !script_size) continue;
+            const int64_t control = TAPROOT_CONTROL_BASE_SIZE + TAPROOT_CONTROL_NODE_SIZE * m_depths[i];
+            const int64_t weight = *sat + GetSizeOfCompactSize(*script_size) + *script_size
+                                   + GetSizeOfCompactSize(control) + control;
+            if (!best || weight > *best) best = weight;
+        }
+        return best;
+    }
+
+    std::optional<int64_t> ScriptPathElems() const
+    {
+        std::optional<int64_t> best;
+        for (const auto& leaf : m_subdescriptor_args) {
+            const auto elems = leaf->MaxSatisfactionElems();
+            if (!elems) continue;
+            const int64_t n = *elems + 2; // script + control block
+            if (!best || n > *best) best = n;
+        }
+        return best;
+    }
+
+    std::optional<int64_t> MaxSatisfactionWeight(bool use_max_sig) const override
+    {
+        return MaxSatisfactionWeight(use_max_sig, /*script_path=*/false);
+    }
+
+    std::optional<int64_t> MaxSatisfactionWeight(bool use_max_sig, bool script_path) const override
+    {
+        constexpr int64_t KEYPATH = 1 + 65;
+        if (m_subdescriptor_args.empty()) return KEYPATH;
+        if (script_path || InternalKeyIsNums()) return ScriptPathWeight(use_max_sig);
+        return KEYPATH;
+    }
+
+    std::optional<int64_t> MaxSatisfactionElems() const override
+    {
+        return MaxSatisfactionElems(/*script_path=*/false);
+    }
+
+    std::optional<int64_t> MaxSatisfactionElems(bool script_path) const override
+    {
+        if (m_subdescriptor_args.empty()) return 1;
+        if (script_path || InternalKeyIsNums()) return ScriptPathElems();
         return 1;
     }
 

@@ -36,7 +36,7 @@ BOOST_FIXTURE_TEST_SUITE(taproot_scale_tests, BasicTestingSetup)
 
 using common::PSBTError;
 
-//! Taproot key-count limits: script-path / vault fallback is BIP 342's 999
+//! Taproot key-count limits: script-path / Scrooge vault fallback is BIP 342's 999
 //! (MAX_PUBKEYS_PER_MULTI_A). n-of-n MuSig2 key-path has no consensus cap.
 
 static std::shared_ptr<CWallet> MakeWallet()

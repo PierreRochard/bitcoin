@@ -39,7 +39,10 @@
 #include <vector>
 
 namespace wallet {
-BOOST_FIXTURE_TEST_SUITE(mixed_key_tests, BasicTestingSetup)
+struct MockOnlyTestingSetup : BasicTestingSetup {
+    hwi::UsbEnumerateSuppress no_usb;
+};
+BOOST_FIXTURE_TEST_SUITE(mixed_key_tests, MockOnlyTestingSetup)
 
 using common::PSBTError;
 
@@ -559,6 +562,17 @@ BOOST_AUTO_TEST_CASE(bech32m_descriptor_wrappers)
     BOOST_CHECK(vault.find("older(144)") != std::string::npos);
     BOOST_CHECK(vault.find(two[0]) != std::string::npos);
     BOOST_CHECK(WrapSortedMulti(OutputType::BECH32, 2, two, /*fallback_older=*/1).find("older") == std::string::npos);
+
+    const std::string abs = WrapSortedMulti(OutputType::BECH32M, 2, two, /*fallback_older=*/{}, /*fallback_after=*/500);
+    BOOST_CHECK(abs.find("and_v(v:after(500),multi_a(2,") != std::string::npos);
+    BOOST_CHECK(abs.find("older") == std::string::npos);
+
+    const std::string heir = WrapSortedMulti(OutputType::BECH32M, 1, two, /*fallback_older=*/144, {}, {two[0], two[1], three[2]});
+    BOOST_CHECK(heir.find("musig(" + two[0] + "," + two[1] + ")") != std::string::npos);
+    BOOST_CHECK(heir.find("multi_a(1," + two[0] + "," + two[1] + "," + three[2] + ")") != std::string::npos);
+    BOOST_CHECK(heir.find("musig(" + two[0] + "," + two[1] + "," + three[2]) == std::string::npos);
+
+    BOOST_CHECK(WrapSortedMulti(OutputType::BECH32M, 2, two, /*fallback_older=*/1, /*fallback_after=*/1).empty());
 }
 
 BOOST_AUTO_TEST_CASE(taproot_musig2)
@@ -663,6 +677,45 @@ BOOST_AUTO_TEST_CASE(create_descriptor_bech32m_delayed_fallback)
 
     const CTxDestination dest = *Assert(wallet->GetNewDestination(OutputType::BECH32M, ""));
     BOOST_CHECK(std::holds_alternative<WitnessV1Taproot>(dest));
+}
+
+BOOST_AUTO_TEST_CASE(create_descriptor_watchonly_xpub_vault)
+{
+    CExtKey a = RandomMaster();
+    CExtKey b = RandomMaster();
+    const auto path = Bip48Path(OutputType::BECH32M);
+    auto child_a = DeriveExtKey(a, path);
+    auto child_b = DeriveExtKey(b, path);
+    BOOST_REQUIRE(child_a);
+    BOOST_REQUIRE(child_b);
+    auto fpr = [](const CExtKey& master) {
+        const std::string hex = HexStr(master.id_key_fingerprint());
+        return hex.size() == 8 ? hex : hex.substr(0, 8);
+    };
+
+    auto wallet = MakeBlankWallet(WALLET_FLAG_DESCRIPTORS | WALLET_FLAG_DISABLE_PRIVATE_KEYS);
+    LOCK(wallet->cs_wallet);
+    MultisigKeySpec ka, kb;
+    ka.fingerprint = fpr(a);
+    ka.path = WriteHDKeypath(path);
+    ka.xpub = EncodeExtPubKey(child_a->first.Neuter());
+    kb.fingerprint = fpr(b);
+    kb.path = WriteHDKeypath(path);
+    kb.xpub = EncodeExtPubKey(child_b->first.Neuter());
+
+    auto created = CreateMultisigDescriptor(*wallet, 2, {ka, kb}, MultisigOptions{OutputType::BECH32M, 0, {}, 1});
+    BOOST_REQUIRE_MESSAGE(created, util::ErrorString(created).original);
+    BOOST_REQUIRE_EQUAL(created->descs.size(), 2U);
+    BOOST_CHECK(created->descs[0].find("tr(musig(") != std::string::npos);
+    BOOST_CHECK(created->descs[0].find("older(1)") != std::string::npos);
+
+    const CTxDestination dest = *Assert(wallet->GetNewDestination(OutputType::BECH32M, ""));
+    BOOST_CHECK(std::holds_alternative<WitnessV1Taproot>(dest));
+
+    MultisigKeySpec local;
+    local.hdkey = EncodeExtPubKey(a.Neuter());
+    local.path = WriteHDKeypath(path);
+    BOOST_CHECK(!CreateMultisigDescriptor(*wallet, 2, {ka, local}, MultisigOptions{OutputType::BECH32M, 0, {}, 1}));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

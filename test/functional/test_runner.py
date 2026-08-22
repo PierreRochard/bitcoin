@@ -87,6 +87,7 @@ TEST_FRAMEWORK_UNIT_TESTS = 'feature_framework_unit_tests.py'
 EXTENDED_SCRIPTS = [
     # These tests are not run by default.
     # Longest test should go first, to favor running tests in parallel
+    'wallet_taproot_vault_999.py',
     'feature_pruning.py',
     'feature_dbcrash.py',
     'feature_index_prune.py',
@@ -182,6 +183,9 @@ BASE_SCRIPTS = [
     'wallet_taproot_multisig_edge.py',
     'wallet_taproot_vault_local.py',
     'wallet_taproot_vault_mixed.py',
+    'wallet_taproot_vault_send.py',
+    'wallet_taproot_vault_policy.py',
+    'wallet_taproot_vault_lifecycle.py',
     'wallet_exported_watchonly.py',
     'interface_zmq.py',
     'rpc_invalid_address_message.py',

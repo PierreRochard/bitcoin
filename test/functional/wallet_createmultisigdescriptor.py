@@ -48,6 +48,7 @@ class WalletCreateMultisigDescriptorTest(BitcoinTestFramework):
         self.test_taproot_musig2()
         self.test_taproot_sortedmulti_a()
         self.test_taproot_delayed_fallback()
+        self.test_taproot_after_and_recovery_only()
         self.test_internal_and_account()
         self.test_multiple_hdkeys_require_explicit()
         self.test_encrypted()
@@ -55,6 +56,7 @@ class WalletCreateMultisigDescriptorTest(BitcoinTestFramework):
         self.test_mixed_key_wallet()
         self.test_airgapped_xpub()
         self.test_watchonly()
+        self.test_watchonly_xpub_vault()
 
     def _blank(self, name, node=0, **kwargs):
         self.nodes[node].createwallet(wallet_name=name, blank=True, **kwargs)
@@ -275,6 +277,7 @@ class WalletCreateMultisigDescriptorTest(BitcoinTestFramework):
             {"type": "bech32m", "fallback_older": 1},
         )
         assert_equal(res["fallback_older"], 1)
+        assert "policy_id" in res
         desc = res["descs"][0]
         assert "tr(musig(" in desc
         assert "multi_a(2," in desc
@@ -290,6 +293,34 @@ class WalletCreateMultisigDescriptorTest(BitcoinTestFramework):
         assert_equal(len(witness), 1)
         # Full m-of-n computer-key vault matrix (recovery, split wallets, BIP68)
         # lives in wallet_taproot_vault_local.py.
+
+    def test_taproot_after_and_recovery_only(self):
+        self.log.info("Test after() lock and a recovery-only key omitted from musig")
+        wallet = self._blank("type_bech32m_after")
+        x1, x2, x3 = wallet.addhdkey()["xpub"], wallet.addhdkey()["xpub"], wallet.addhdkey()["xpub"]
+        assert_raises_rpc_error(
+            -8, "fallback_older and fallback_after cannot both be set",
+            wallet.createmultisigdescriptor, 2, self._keys([x1, x2], path=BIP48_BECH32M),
+            {"type": "bech32m", "fallback_older": 1, "fallback_after": 500},
+        )
+        abs_res = wallet.createmultisigdescriptor(
+            2, self._keys([x1, x2], path=BIP48_BECH32M),
+            {"type": "bech32m", "fallback_after": 500},
+        )
+        assert_equal(abs_res["fallback_after"], 500)
+        assert "fallback_older" not in abs_res
+        assert "after(500)" in abs_res["descs"][0]
+        assert "older(" not in abs_res["descs"][0]
+
+        heir = self._blank("type_bech32m_heir")
+        a, b, c = heir.addhdkey()["xpub"], heir.addhdkey()["xpub"], heir.addhdkey()["xpub"]
+        keys = self._keys([a, b], path=BIP48_BECH32M)
+        keys.append({"path": BIP48_BECH32M, "hdkey": c, "recovery_only": True})
+        rec = heir.createmultisigdescriptor(1, keys, {"type": "bech32m", "fallback_older": 144})
+        desc = rec["descs"][0]
+        assert "older(144)" in desc
+        assert "multi_a(1," in desc
+        assert rec["policy_id"]
 
     def test_internal_and_account(self):
         self.log.info("Test internal and account options")
@@ -448,6 +479,31 @@ class WalletCreateMultisigDescriptorTest(BitcoinTestFramework):
         res = wallet.createmultisigdescriptor(1, ["00000001"])
         assert_equal(res["nrequired"], 1)
         assert "00000001" in res["descs"][0]
+
+    def test_watchonly_xpub_vault(self):
+        self.log.info("Watch-only wallet without -signer can create a Scrooge vault from xpubs")
+        keys = []
+        for i in range(2):
+            src = self._blank(f"air_vault_src_{i}")
+            src.addhdkey()
+            derived = src.derivehdkey(BIP48_BECH32M)
+            origin = derived["origin"]
+            keys.append((origin[1:9], derived["xpub"]))
+        watch = self._blank("air_scrooge", disable_private_keys=True)
+        res = watch.createmultisigdescriptor(2, [
+            {"path": BIP48_BECH32M, "fingerprint": keys[0][0], "xpub": keys[0][1]},
+            {"path": BIP48_BECH32M, "fingerprint": keys[1][0], "xpub": keys[1][1]},
+        ], {"type": "bech32m", "fallback_older": 1})
+        assert_equal(res["nrequired"], 2)
+        assert_equal(res["fallback_older"], 1)
+        assert "tr(musig(" in res["descs"][0]
+        assert "older(1)" in res["descs"][0]
+        addr = watch.getnewaddress("", "bech32m")
+        assert addr.startswith("bcrt1p")
+        assert_raises_rpc_error(
+            -4, "createmultisigdescriptor requires a wallet with private keys or an external signer",
+            watch.createmultisigdescriptor, 2, [BIP48_BECH32M, BIP48_BECH32M], {"type": "bech32m"},
+        )
 
 
 if __name__ == "__main__":

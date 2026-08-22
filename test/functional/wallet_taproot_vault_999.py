@@ -2,7 +2,7 @@
 # Copyright (c) 2026 The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Regtest rehearsal: 999-key 24861 vault round-trip.
+"""Regtest rehearsal: 999-key Scrooge vault round-trip.
 
 Send-back is the 1-of-999 script-path after older(1) (safety hatch), plus an
 OP_RETURN attribution memo. n-of-n MuSig2 key-path is left for a later spend.

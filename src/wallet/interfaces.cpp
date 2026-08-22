@@ -28,6 +28,7 @@
 #include <wallet/multisig.h>
 #include <wallet/receive.h>
 #include <wallet/rpc/wallet.h>
+#include <wallet/scriptpubkeyman.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
 
@@ -240,7 +241,7 @@ public:
         LOCK(m_wallet->cs_wallet);
         return m_wallet->DisplayAddress(dest, fingerprint);
     }
-    util::Result<std::vector<std::string>> createMultisigDescriptor(int nrequired, const std::vector<MultisigKey>& keys, OutputType type, std::optional<uint32_t> fallback_older) override
+    util::Result<std::vector<std::string>> createMultisigDescriptor(int nrequired, const std::vector<MultisigKey>& keys, OutputType type, std::optional<uint32_t> fallback_older, std::optional<uint32_t> fallback_after) override
     {
         std::vector<wallet::MultisigKeySpec> specs;
         specs.reserve(keys.size());
@@ -250,10 +251,11 @@ public:
             spec.fingerprint = k.fingerprint;
             spec.hdkey = k.hdkey;
             spec.xpub = k.xpub;
+            spec.recovery_only = k.recovery_only;
             specs.push_back(std::move(spec));
         }
         LOCK(m_wallet->cs_wallet);
-        auto created = wallet::CreateMultisigDescriptor(*m_wallet, nrequired, specs, wallet::MultisigOptions{type, /*account=*/0, {}, fallback_older});
+        auto created = wallet::CreateMultisigDescriptor(*m_wallet, nrequired, specs, wallet::MultisigOptions{type, /*account=*/0, {}, fallback_older, fallback_after});
         if (!created) return util::Error{util::ErrorString(created)};
         return created->descs;
     }
@@ -400,6 +402,15 @@ public:
         result.immature_balance = bal.m_mine_immature;
         result.used_balance = bal.m_mine_used;
         result.nonmempool_balance = bal.m_mine_nonmempool;
+        {
+            LOCK(m_wallet->cs_wallet);
+            const auto vault = wallet::GetVaultBalanceBreakdown(*m_wallet);
+            result.is_vault = vault.is_vault;
+            result.vault_immediate = vault.immediate;
+            result.vault_recoverable = vault.recoverable_now;
+            result.vault_awaiting = vault.awaiting;
+            result.vault_blocks_remaining = vault.earliest_blocks_remaining;
+        }
         return result;
     }
     bool tryGetBalances(WalletBalances& balances, uint256& block_hash) override
@@ -505,6 +516,39 @@ public:
     bool taprootEnabled() override {
         auto spk_man = m_wallet->GetScriptPubKeyMan(OutputType::BECH32M, /*internal=*/false);
         return spk_man != nullptr;
+    }
+    std::optional<uint32_t> taprootRecoveryDelay() override {
+        LOCK(m_wallet->cs_wallet);
+        const auto policy = InferWalletVaultPolicy(*m_wallet);
+        return policy.older;
+    }
+    VaultStatus getVaultStatus() override {
+        LOCK(m_wallet->cs_wallet);
+        const auto br = GetVaultBalanceBreakdown(*m_wallet);
+        VaultStatus st;
+        st.is_vault = br.is_vault;
+        st.older = br.policy.older;
+        st.after = br.policy.after;
+        st.recovery_m = br.policy.recovery_m;
+        st.recoverable_now = br.recoverable_now;
+        st.awaiting_maturity = br.awaiting;
+        st.earliest_blocks_remaining = br.earliest_blocks_remaining;
+        st.lost_signers.assign(m_wallet->m_lost_signers.begin(), m_wallet->m_lost_signers.end());
+        return st;
+    }
+    void setLostSigner(const std::string& fingerprint, bool lost) override {
+        LOCK(m_wallet->cs_wallet);
+        m_wallet->SetLostSigner(fingerprint, lost);
+    }
+    std::string exportVaultPolicy() override {
+        LOCK(m_wallet->cs_wallet);
+        return FormatVaultPolicyPackage(ExportWalletVaultPolicy(*m_wallet));
+    }
+    util::Result<void> importVaultPolicy(const std::string& json) override {
+        auto pkg = ParseVaultPolicyPackage(json);
+        if (!pkg) return util::Error{util::ErrorString(pkg)};
+        LOCK(m_wallet->cs_wallet);
+        return ImportWalletVaultPolicy(*m_wallet, *pkg);
     }
     OutputType getDefaultAddressType() override { return m_wallet->m_default_address_type; }
     CAmount getDefaultMaxTxFee() override { return m_wallet->m_default_max_tx_fee; }

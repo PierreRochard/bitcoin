@@ -137,13 +137,15 @@ public:
         std::optional<std::string> fingerprint;
         std::optional<std::string> hdkey;
         std::optional<std::string> xpub;
+        bool recovery_only{false};
     };
 
     //! Import an active sorted-multisig descriptor (see createmultisigdescriptor).
     virtual util::Result<std::vector<std::string>> createMultisigDescriptor(int nrequired,
         const std::vector<MultisigKey>& keys,
         OutputType type,
-        std::optional<uint32_t> fallback_older = {}) = 0;
+        std::optional<uint32_t> fallback_older = {},
+        std::optional<uint32_t> fallback_after = {}) = 0;
 
     //! Lock coin.
     virtual bool lockCoin(const COutPoint& output, bool write_to_db) = 0;
@@ -277,6 +279,24 @@ public:
     // Return whether the wallet contains a Taproot scriptPubKeyMan
     virtual bool taprootEnabled() = 0;
 
+    //! BIP68 older(N) from an active Scrooge vault tr(musig,and_v(v:older(N),…)), if any.
+    virtual std::optional<uint32_t> taprootRecoveryDelay() = 0;
+
+    struct VaultStatus {
+        bool is_vault{false};
+        std::optional<uint32_t> older;
+        std::optional<uint32_t> after;
+        int recovery_m{0};
+        CAmount recoverable_now{0};
+        CAmount awaiting_maturity{0};
+        std::optional<int> earliest_blocks_remaining;
+        std::vector<std::string> lost_signers;
+    };
+    virtual VaultStatus getVaultStatus() = 0;
+    virtual void setLostSigner(const std::string& fingerprint, bool lost) = 0;
+    virtual std::string exportVaultPolicy() = 0;
+    virtual util::Result<void> importVaultPolicy(const std::string& json) = 0;
+
     // Return whether wallet uses an external signer.
     virtual bool hasExternalSigner() = 0;
 
@@ -386,12 +406,20 @@ struct WalletBalances
     CAmount immature_balance = 0;
     CAmount used_balance = 0;
     CAmount nonmempool_balance = 0;
+    bool is_vault{false};
+    CAmount vault_immediate{0};
+    CAmount vault_recoverable{0};
+    CAmount vault_awaiting{0};
+    std::optional<int> vault_blocks_remaining;
 
     bool balanceChanged(const WalletBalances& prev) const
     {
         return balance != prev.balance || unconfirmed_balance != prev.unconfirmed_balance ||
                immature_balance != prev.immature_balance ||
-               used_balance != prev.used_balance || nonmempool_balance != prev.nonmempool_balance;
+               used_balance != prev.used_balance || nonmempool_balance != prev.nonmempool_balance ||
+               is_vault != prev.is_vault || vault_immediate != prev.vault_immediate ||
+               vault_recoverable != prev.vault_recoverable ||
+               vault_awaiting != prev.vault_awaiting || vault_blocks_remaining != prev.vault_blocks_remaining;
     }
 };
 

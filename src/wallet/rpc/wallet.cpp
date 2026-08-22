@@ -877,24 +877,28 @@ static RPCMethod createmultisigdescriptor()
                             {"fingerprint", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "External signer master fingerprint. If omitted, the key is derived from this wallet."},
                             {"hdkey", RPCArg::Type::STR, RPCArg::DefaultHint{"The wallet's unused(KEY) or sole active HD key"}, "xpub or xprv of the local HD key to derive from (see gethdkeys). An xprv does not need a prior unused() import."},
                             {"xpub", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Public extended key for an air-gapped signer. Requires fingerprint. The device is not contacted."},
+                            {"recovery_only", RPCArg::Type::BOOL, RPCArg::Default{false}, "If true, this key is not in the MuSig2 key-path. It can only sign the delayed recovery script."},
                         },
                     },
                 },
             },
             {"options", RPCArg::Type::OBJ_NAMED_PARAMS, RPCArg::Optional::OMITTED, "",
                 {
-                    {"type", RPCArg::Type::STR, RPCArg::Default{"bech32"}, "Address type. Options are \"legacy\" (sh(sortedmulti), max 15 keys), \"p2sh-segwit\" / \"bech32\" (wsh(sortedmulti), max 20 keys), \"bech32m\" (tr(musig) n-of-n with no key-count cap; tr(NUMS,sortedmulti_a) m-of-n or tr(musig,and_v(older,multi_a)) vault, max 999 keys)."},
+                    {"type", RPCArg::Type::STR, RPCArg::Default{"bech32"}, "Address type. Options are \"legacy\" (sh(sortedmulti), max 15 keys), \"p2sh-segwit\" / \"bech32\" (wsh(sortedmulti), max 20 keys), \"bech32m\" (tr(musig) n-of-n with no key-count cap; tr(NUMS,sortedmulti_a) m-of-n or Scrooge vault tr(musig,and_v(older|after,multi_a)), max 999 keys)."},
                     {"account", RPCArg::Type::NUM, RPCArg::Default{0}, "BIP48 account used when a key omits path."},
                     {"internal", RPCArg::Type::BOOL, RPCArg::DefaultHint{"Both receive and change"}, "If set, import only the receive (false) or change (true) branch instead of both."},
-                    {"fallback_older", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Bech32m only. Relative delay in blocks (miniscript older()) before an m-of-n script-path spend is valid. Immediate spends still use n-of-n MuSig2 on the key path. nrequired is the delayed threshold."},
+                    {"fallback_older", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Bech32m only. Scrooge vault relative delay in blocks (miniscript older()) before an m-of-n script-path spend is valid. Immediate spends still use n-of-n MuSig2 on the key path. nrequired is the delayed threshold. Per-UTXO: a new deposit or change starts a new clock."},
+                    {"fallback_after", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Bech32m only. Absolute recovery height (miniscript after()). Mutually exclusive with fallback_older. Funds received after this height may already be recoverable."},
                 },
             },
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
             {
-                {RPCResult::Type::NUM, "nrequired", "The threshold (delayed m-of-n when fallback_older is set)"},
+                {RPCResult::Type::NUM, "nrequired", "The threshold (delayed m-of-n when a recovery lock is set; otherwise the immediate threshold)"},
                 {RPCResult::Type::NUM, "fallback_older", /*optional=*/true, "Relative recovery delay in blocks, if set"},
+                {RPCResult::Type::NUM, "fallback_after", /*optional=*/true, "Absolute recovery block height, if set"},
+                {RPCResult::Type::STR, "policy_id", /*optional=*/true, "Short identifier of the checksummed receive descriptor"},
                 {RPCResult::Type::ARR, "descs", "The public descriptors that were added",
                     {{RPCResult::Type::STR, "", ""}}
                 },
@@ -909,10 +913,6 @@ static RPCMethod createmultisigdescriptor()
             std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
             if (!pwallet) return UniValue::VNULL;
             CWallet& wallet{*pwallet};
-
-            if (!wallet.IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER) && wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
-                throw JSONRPCError(RPC_WALLET_ERROR, "createmultisigdescriptor requires a wallet with private keys or an external signer");
-            }
 
             const int nrequired = request.params[0].getInt<int>();
             const UniValue& keys_param = request.params[1];
@@ -943,6 +943,17 @@ static RPCMethod createmultisigdescriptor()
                 }
                 fallback_older = static_cast<uint32_t>(v);
             }
+            std::optional<uint32_t> fallback_after;
+            if (options.exists("fallback_after")) {
+                const int v = options["fallback_after"].getInt<int>();
+                if (v < 0) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "fallback_after must be between 1 and 2^31-1");
+                }
+                fallback_after = static_cast<uint32_t>(v);
+            }
+            if (fallback_older && fallback_after) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "fallback_older and fallback_after cannot both be set");
+            }
 
             std::vector<MultisigKeySpec> specs;
             specs.reserve(keys_param.size());
@@ -960,6 +971,7 @@ static RPCMethod createmultisigdescriptor()
                     if (key_val.exists("path")) spec.path = key_val["path"].get_str();
                     if (key_val.exists("hdkey")) spec.hdkey = key_val["hdkey"].get_str();
                     if (key_val.exists("xpub")) spec.xpub = key_val["xpub"].get_str();
+                    if (key_val.exists("recovery_only")) spec.recovery_only = key_val["recovery_only"].get_bool();
                 } else {
                     throw JSONRPCError(RPC_INVALID_PARAMETER, "Each key must be a string or object");
                 }
@@ -971,7 +983,7 @@ static RPCMethod createmultisigdescriptor()
                 EnsureWalletIsUnlocked(wallet);
             }
 
-            const auto created = CreateMultisigDescriptor(wallet, nrequired, specs, MultisigOptions{output_type, account, internal_only, fallback_older});
+            const auto created = CreateMultisigDescriptor(wallet, nrequired, specs, MultisigOptions{output_type, account, internal_only, fallback_older, fallback_after});
             if (!created) {
                 const std::string msg = util::ErrorString(created).original;
                 int code = RPC_WALLET_ERROR;
@@ -981,7 +993,9 @@ static RPCMethod createmultisigdescriptor()
                     msg.find("fingerprint must") != std::string::npos ||
                     msg.find("Invalid BIP32") != std::string::npos ||
                     msg.find("address type") != std::string::npos ||
-                    msg.find("fallback_older") != std::string::npos) {
+                    msg.find("fallback_older") != std::string::npos ||
+                    msg.find("fallback_after") != std::string::npos ||
+                    msg.find("recovery-only") != std::string::npos) {
                     code = RPC_INVALID_PARAMETER;
                 } else if (msg.find("Private key") != std::string::npos ||
                            msg.find("Unable to parse") != std::string::npos ||
@@ -995,13 +1009,147 @@ static RPCMethod createmultisigdescriptor()
             for (const auto& d : created->descs) descs.push_back(d);
             UniValue out{UniValue::VOBJ};
             out.pushKV("nrequired", created->nrequired);
-            if (fallback_older) out.pushKV("fallback_older", static_cast<int>(*fallback_older));
+            if (created->fallback_older) out.pushKV("fallback_older", static_cast<int>(*created->fallback_older));
+            if (created->fallback_after) out.pushKV("fallback_after", static_cast<int>(*created->fallback_after));
+            if (!created->policy_id.empty()) out.pushKV("policy_id", created->policy_id);
             out.pushKV("descs", std::move(descs));
             return out;
         },
     };
 }
 #endif // ENABLE_EXTERNAL_SIGNER
+
+static RPCMethod getvaultinfo()
+{
+    return RPCMethod{
+        "getvaultinfo",
+        "Return Scrooge vault policy, per-UTXO recovery maturity, and locally marked lost signers.\n",
+        {},
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::BOOL, "is_vault", "Whether this wallet is a Scrooge vault"},
+                {RPCResult::Type::NUM, "nrequired", /*optional=*/true, "Recovery threshold"},
+                {RPCResult::Type::NUM, "fallback_older", /*optional=*/true, "Relative recovery delay in blocks"},
+                {RPCResult::Type::NUM, "fallback_after", /*optional=*/true, "Absolute recovery height"},
+                {RPCResult::Type::STR_AMOUNT, "spendable_now", "Confirmed balance spendable with every active key (0 if a signer is marked lost)"},
+                {RPCResult::Type::STR_AMOUNT, "recoverable_now", "Confirmed balance whose recovery path is mature"},
+                {RPCResult::Type::STR_AMOUNT, "awaiting_maturity", "Confirmed balance still waiting for the recovery delay"},
+                {RPCResult::Type::NUM, "earliest_blocks_remaining", /*optional=*/true, "Blocks until the next UTXO becomes recoverable"},
+                {RPCResult::Type::ARR, "lost_signers", "Fingerprints locally marked lost (does not change on-chain policy)",
+                    {{RPCResult::Type::STR, "", ""}}},
+            },
+        },
+        RPCExamples{HelpExampleCli("getvaultinfo", "")},
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue {
+            const std::shared_ptr<const CWallet> pwallet = GetWalletForJSONRPCRequest(request);
+            if (!pwallet) return UniValue::VNULL;
+            LOCK(pwallet->cs_wallet);
+            const auto br = GetVaultBalanceBreakdown(*pwallet);
+            UniValue out(UniValue::VOBJ);
+            out.pushKV("is_vault", br.is_vault);
+            if (br.is_vault) {
+                out.pushKV("nrequired", br.policy.recovery_m);
+                if (br.policy.older) out.pushKV("fallback_older", static_cast<int>(*br.policy.older));
+                if (br.policy.after) out.pushKV("fallback_after", static_cast<int>(*br.policy.after));
+            }
+            out.pushKV("spendable_now", ValueFromAmount(br.immediate));
+            out.pushKV("recoverable_now", ValueFromAmount(br.recoverable_now));
+            out.pushKV("awaiting_maturity", ValueFromAmount(br.awaiting));
+            if (br.earliest_blocks_remaining) out.pushKV("earliest_blocks_remaining", *br.earliest_blocks_remaining);
+            UniValue lost(UniValue::VARR);
+            for (const auto& fpr : pwallet->m_lost_signers) lost.push_back(fpr);
+            out.pushKV("lost_signers", std::move(lost));
+            return out;
+        },
+    };
+}
+
+static RPCMethod exportvaultpolicy()
+{
+    return RPCMethod{
+        "exportvaultpolicy",
+        "Export the public Scrooge vault policy package (descriptors, policy id, network). Contains no private keys.\n"
+        "Anyone with this package can see addresses and transaction history. It cannot spend.\n",
+        {},
+        RPCResult{RPCResult::Type::STR, "", "JSON policy package"},
+        RPCExamples{HelpExampleCli("exportvaultpolicy", "")},
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue {
+            const std::shared_ptr<const CWallet> pwallet = GetWalletForJSONRPCRequest(request);
+            if (!pwallet) return UniValue::VNULL;
+            LOCK(pwallet->cs_wallet);
+            return FormatVaultPolicyPackage(ExportWalletVaultPolicy(*pwallet));
+        },
+    };
+}
+
+static RPCMethod importvaultpolicy()
+{
+    return RPCMethod{
+        "importvaultpolicy",
+        "Import a public Scrooge vault policy package into this wallet (typically a blank watch-only wallet).\n",
+        {
+            {"package", RPCArg::Type::STR, RPCArg::Optional::NO, "JSON produced by exportvaultpolicy"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR, "policy_id", "Identifier of the imported policy"},
+            },
+        },
+        RPCExamples{HelpExampleCli("importvaultpolicy", "'{\"format\":\"bitcoin-core-vault-policy\",...}'")},
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue {
+            std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+            if (!pwallet) return UniValue::VNULL;
+            auto pkg = ParseVaultPolicyPackage(request.params[0].get_str());
+            if (!pkg) throw JSONRPCError(RPC_INVALID_PARAMETER, util::ErrorString(pkg).original);
+            LOCK(pwallet->cs_wallet);
+            if (!pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+                EnsureWalletIsUnlocked(*pwallet);
+            }
+            const auto imported = ImportWalletVaultPolicy(*pwallet, *pkg);
+            if (!imported) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(imported).original);
+            UniValue out(UniValue::VOBJ);
+            out.pushKV("policy_id", pkg->policy_id);
+            return out;
+        },
+    };
+}
+
+static RPCMethod setlostsigner()
+{
+    return RPCMethod{
+        "setlostsigner",
+        "Mark or unmark a vault signer fingerprint as permanently lost. Local metadata only; existing UTXOs keep the original policy.\n",
+        {
+            {"fingerprint", RPCArg::Type::STR, RPCArg::Optional::NO, "8-character hex master fingerprint"},
+            {"lost", RPCArg::Type::BOOL, RPCArg::Default{true}, "True to mark lost, false to clear"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::ARR, "lost_signers", "", {{RPCResult::Type::STR, "", ""}}},
+            },
+        },
+        RPCExamples{HelpExampleCli("setlostsigner", "aabbccdd true")},
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue {
+            std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+            if (!pwallet) return UniValue::VNULL;
+            const std::string fpr = request.params[0].get_str();
+            if (fpr.size() != 8 || !IsHex(fpr)) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "fingerprint must be 8 hex characters");
+            }
+            const bool lost = request.params[1].isNull() || request.params[1].get_bool();
+            LOCK(pwallet->cs_wallet);
+            pwallet->SetLostSigner(fpr, lost);
+            UniValue arr(UniValue::VARR);
+            for (const auto& s : pwallet->m_lost_signers) arr.push_back(s);
+            UniValue out(UniValue::VOBJ);
+            out.pushKV("lost_signers", std::move(arr));
+            return out;
+        },
+    };
+}
 
 RPCMethod addhdkey()
 {
@@ -1316,6 +1464,10 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
 #ifdef ENABLE_EXTERNAL_SIGNER
         {"wallet", &createmultisigdescriptor},
 #endif
+        {"wallet", &exportvaultpolicy},
+        {"wallet", &getvaultinfo},
+        {"wallet", &importvaultpolicy},
+        {"wallet", &setlostsigner},
         {"wallet", &derivehdkey},
         {"wallet", &restorewallet},
         {"wallet", &encryptwallet},

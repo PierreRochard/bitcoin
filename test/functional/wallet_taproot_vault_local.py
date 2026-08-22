@@ -2,7 +2,7 @@
 # Copyright (c) 2026 The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Regtest matrix: Taproot vault from computer HD seeds only.
+"""Regtest matrix: Scrooge vault from computer HD seeds only.
 
 createmultisigdescriptor(type=bech32m, fallback_older=N) with n addhdkey
 seeds. Immediate spend is n-of-n MuSig2 (witness length 1). After older(N),
@@ -19,7 +19,6 @@ from test_framework.util import (
 
 PATH = "m/48h/1h/0h/3h"
 POLICIES = [(m, n) for n in (2, 3, 4) for m in range(1, n + 1)]
-NOT_FINAL = "non-BIP68-final"
 
 
 class WalletTaprootVaultLocalTest(BitcoinTestFramework):
@@ -268,7 +267,7 @@ class WalletTaprootVaultLocalTest(BitcoinTestFramework):
         self.generate(self.nodes[0], 1)
 
     def test_older_2_mempool_bip68(self):
-        self.log.info("older(2): recovery is signed at nSequence=2 but BIP68-invalid until 2 confirmations")
+        self.log.info("older(2): wallet refuses immature recovery; after 2 confirms the spend is BIP68-valid")
         coord, xpubs, specs = self._coord(3)
         coord.createmultisigdescriptor(2, specs, {"type": "bech32m", "fallback_older": 2})
         keys = self._derived(coord, xpubs)
@@ -281,6 +280,13 @@ class WalletTaprootVaultLocalTest(BitcoinTestFramework):
         self.generate(self.nodes[0], 1)
         utxo = rec.listunspent()[0]
         dest = self.def_wallet.getnewaddress()
+        assert_raises_rpc_error(-4, "not yet recoverable", rec.walletcreatefundedpsbt,
+            [{"txid": utxo["txid"], "vout": utxo["vout"], "sequence": 2}],
+            [{dest: utxo["amount"]}],
+            0,
+            {"change_type": "bech32m", "subtractFeeFromOutputs": [0], "replaceable": False},
+        )
+        extra = self.generate(self.nodes[0], 1)[0]
         psbt = rec.walletcreatefundedpsbt(
             [{"txid": utxo["txid"], "vout": utxo["vout"], "sequence": 2}],
             [{dest: utxo["amount"]}],
@@ -289,8 +295,12 @@ class WalletTaprootVaultLocalTest(BitcoinTestFramework):
         )["psbt"]
         proc = rec.walletprocesspsbt(psbt=psbt)
         assert proc["complete"]
-        assert_raises_rpc_error(-26, NOT_FINAL, self.nodes[0].sendrawtransaction, proc["hex"])
-        self.generate(self.nodes[0], 1)
+        txid = self.nodes[0].sendrawtransaction(proc["hex"])
+        assert txid in self.nodes[0].getrawmempool()
+        self.nodes[0].invalidateblock(extra)
+        assert txid not in self.nodes[0].getrawmempool()
+        # A replacement block must not recreate `extra` (same coinbase script + time).
+        self.generatetoaddress(self.nodes[0], 1, self.def_wallet.getnewaddress())
         self.nodes[0].sendrawtransaction(proc["hex"])
         self.generate(self.nodes[0], 1)
 
