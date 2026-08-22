@@ -18,6 +18,7 @@
 
 #include <chainparams.h>
 #include <interfaces/node.h>
+#include <node/context.h>
 #include <key_io.h>
 #include <node/interface_ui.h>
 #include <node/types.h>
@@ -31,9 +32,13 @@
 #include <array>
 #include <chrono>
 #include <fstream>
+#include <limits>
 #include <memory>
 
+#include <QCheckBox>
 #include <QFontMetrics>
+#include <QLabel>
+#include <QStringList>
 #include <QScrollBar>
 #include <QSettings>
 #include <QTextDocument>
@@ -132,6 +137,25 @@ SendCoinsDialog::SendCoinsDialog(const PlatformStyle *_platformStyle, QWidget *p
     minimizeFeeSection(settings.value("fFeeSectionMinimized").toBool());
 
     GUIUtil::ExceptionSafeConnect(ui->sendButton, &QPushButton::clicked, this, &SendCoinsDialog::sendButtonClicked);
+
+    m_vault_recovery = new QCheckBox(tr("Spend the same coins using delayed recovery (not automatic)"));
+    m_vault_recovery->setObjectName("vaultRecoveryCheck");
+    m_vault_recovery->setToolTip(tr("Immediate spending requires every active key. Recovery is used only when you check this box; it is never automatic."));
+    m_vault_recovery->hide();
+    m_vault_lost = new QLabel;
+    m_vault_lost->setObjectName("vaultLostSignerLabel");
+    m_vault_lost->setTextFormat(Qt::RichText);
+    m_vault_lost->setWordWrap(true);
+    m_vault_lost->setStyleSheet(QStringLiteral("QLabel { background-color: #F8D488; color: #000000; padding: 8px; }"));
+    m_vault_lost->hide();
+    const int fee_row = ui->verticalLayout->indexOf(ui->frameFee);
+    ui->verticalLayout->insertWidget(fee_row, m_vault_lost);
+    ui->verticalLayout->insertWidget(fee_row + 1, m_vault_recovery);
+    connect(m_vault_recovery, &QCheckBox::toggled, this, [this] {
+        coinControlUpdateLabels();
+        updateVaultSendState();
+        if (model) refreshBalance();
+    });
 }
 
 void SendCoinsDialog::setClientModel(ClientModel *_clientModel)
@@ -139,7 +163,10 @@ void SendCoinsDialog::setClientModel(ClientModel *_clientModel)
     this->clientModel = _clientModel;
 
     if (_clientModel) {
-        connect(_clientModel, &ClientModel::numBlocksChanged, this, &SendCoinsDialog::updateNumberOfBlocks);
+        // Block-tip notifications can arrive while validation still holds
+        // chain and mempool locks. Fee/vault refreshes acquire wallet locks,
+        // so defer the UI work until the notification stack has unwound.
+        connect(_clientModel, &ClientModel::numBlocksChanged, this, &SendCoinsDialog::updateNumberOfBlocks, Qt::QueuedConnection);
     }
 }
 
@@ -203,6 +230,8 @@ void SendCoinsDialog::setModel(WalletModel *_model)
             ui->sendButton->setText(tr("Cr&eate Unsigned"));
             ui->sendButton->setToolTip(tr("Creates a Partially Signed Bitcoin Transaction (PSBT) for use with e.g. an offline %1 wallet, or a PSBT-compatible hardware wallet.").arg(CLIENT_NAME));
         }
+        updateVaultSendState();
+        refreshBalance();
 
         // set the smartfee-sliders default value (wallets default conf.target or last stored value)
         QSettings settings;
@@ -318,6 +347,18 @@ bool SendCoinsDialog::PrepareSendText(QString& question_string, QString& informa
     /*: Message displayed when attempting to create a transaction. Cautionary text to prompt the user to verify
         that the displayed transaction details represent the transaction the user intends to create. */
     question_string.append(tr("Do you want to create this transaction?"));
+    if (m_vault_recovery && m_vault_recovery->isChecked()) {
+        question_string.append("<br /><span style='font-size:10pt;'>");
+        const auto st = model->wallet().getVaultStatus();
+        if (st.older) {
+            question_string.append(tr("Recovery spend: change is a new coin and its relative delay starts over. Prefer sweeping to a newly secured vault if a signer is lost."));
+        } else if (st.after) {
+            question_string.append(tr("Recovery spend: this policy uses an absolute block height. Change does not receive a new relative delay. Prefer sweeping to a newly secured vault if a signer is lost."));
+        } else {
+            question_string.append(tr("Recovery spend selected. Prefer sweeping to a newly secured vault if a signer is lost."));
+        }
+        question_string.append("</span>");
+    }
     question_string.append("<br /><span style='font-size:10pt;'>");
     if (model->wallet().privateKeysDisabled() && !model->wallet().hasExternalSigner()) {
         /*: Text to inform a user attempting to create a transaction of their current options. At this stage,
@@ -464,6 +505,15 @@ void SendCoinsDialog::sendButtonClicked([[maybe_unused]] bool checked)
     if(!model || !model->getOptionsModel())
         return;
 
+    // Recheck the local lost-signer state at action time so a stale view cannot
+    // start an immediate spend.
+    if (updateVaultSendState()) {
+        Q_EMIT message(tr("Send Coins"),
+                       tr("Immediate spending is frozen because a signer is marked lost. Reconnect or restore the signer, or explicitly select delayed recovery once the coins are mature."),
+                       CClientUIInterface::MSG_WARNING);
+        return;
+    }
+
     QString question_string, informative_text, detailed_text;
     if (!PrepareSendText(question_string, informative_text, detailed_text)) return;
     assert(m_current_transaction);
@@ -479,6 +529,17 @@ void SendCoinsDialog::sendButtonClicked([[maybe_unused]] bool checked)
     if(retval != QMessageBox::Yes && retval != QMessageBox::Save)
     {
         fNewRecipientAllowed = true;
+        return;
+    }
+
+    // The modal confirmation runs a nested event loop. Recheck after the user
+    // accepts so a signer marked lost while the dialog was open cannot slip an
+    // already-prepared immediate transaction past the action-time guard above.
+    if (updateVaultSendState()) {
+        fNewRecipientAllowed = true;
+        Q_EMIT message(tr("Send Coins"),
+                       tr("Immediate spending is frozen because a signer is marked lost. Reconnect or restore the signer, or explicitly select delayed recovery once the coins are mature."),
+                       CClientUIInterface::MSG_WARNING);
         return;
     }
 
@@ -547,6 +608,7 @@ void SendCoinsDialog::clear()
 
     // Clear coin control settings
     m_coin_control->UnSelectAll();
+    if (m_vault_recovery) m_vault_recovery->setChecked(false);
     ui->checkBoxCoinControlChange->setChecked(false);
     ui->lineEditCoinControlChange->clear();
     coinControlUpdateLabels();
@@ -694,13 +756,19 @@ void SendCoinsDialog::setBalance(const interfaces::WalletBalances& balances)
         if (model->wallet().hasExternalSigner()) {
             ui->labelBalanceName->setText(tr("External balance:"));
         }
+        if (balances.is_vault) {
+            const bool recovery = m_vault_recovery && m_vault_recovery->isChecked();
+            balance = recovery ? balances.vault_recoverable : balances.vault_immediate;
+            ui->labelBalanceName->setText(recovery ? tr("Recoverable now:") : tr("Spendable now:"));
+        }
         ui->labelBalance->setText(BitcoinUnits::formatWithUnit(model->getOptionsModel()->getDisplayUnit(), balance));
+        updateVaultSendState();
     }
 }
 
 void SendCoinsDialog::refreshBalance()
 {
-    setBalance(model->getCachedBalance());
+    setBalance(model->wallet().getBalances());
     ui->customFee->setDisplayUnit(model->getOptionsModel()->getDisplayUnit());
     updateSmartFeeLabel();
 }
@@ -809,6 +877,94 @@ void SendCoinsDialog::updateFeeMinimizedLabel()
     }
 }
 
+namespace {
+QString LostSignerLabel(WalletModel* model, const std::string& fingerprint)
+{
+    const QString hex = QString::fromStdString(fingerprint);
+    QString name;
+    try {
+        if (auto* ctx = model->node().context(); ctx && ctx->args) {
+            for (const auto& signer : model->node().listExternalSigners()) {
+                if (QString::fromStdString(signer->getFingerprint()).compare(hex, Qt::CaseInsensitive) == 0) {
+                    name = QString::fromStdString(signer->getName());
+                    break;
+                }
+            }
+        }
+    } catch (const std::exception&) {
+    }
+    if (!name.isEmpty() && name.compare(hex, Qt::CaseInsensitive) != 0) {
+        return QStringLiteral("%1 (%2)").arg(name, hex);
+    }
+    return hex;
+}
+} // namespace
+
+bool SendCoinsDialog::updateVaultSendState()
+{
+    if (!model || !model->getOptionsModel() || !m_vault_recovery) return false;
+    const auto st = model->wallet().getVaultStatus();
+    m_vault_recovery->setVisible(st.is_vault);
+    if (st.older) {
+        if (*st.older == 1) {
+            m_vault_recovery->setText(tr("Spend the same coins using delayed recovery after 1 block (not automatic)"));
+            m_vault_recovery->setToolTip(tr("Immediate spending requires every active key. Recovery is used only when you check this box; it is never automatic. Each coin matures after 1 block, and change starts a new relative delay."));
+        } else {
+            m_vault_recovery->setText(tr("Spend the same coins using delayed recovery after %1 blocks (not automatic)").arg(*st.older));
+            m_vault_recovery->setToolTip(tr("Immediate spending requires every active key. Recovery is used only when you check this box; it is never automatic. Each coin matures after %1 blocks, and change starts a new relative delay.").arg(*st.older));
+        }
+    } else if (st.after) {
+        m_vault_recovery->setText(tr("Spend the same coins using delayed recovery after height %1 (not automatic)").arg(*st.after));
+        m_vault_recovery->setToolTip(tr("Immediate spending requires every active key. Recovery is used only when you check this box; it is never automatic. Recovery becomes available at block height %1. This is an absolute height; change does not restart it.").arg(*st.after));
+    } else if (st.is_vault) {
+        m_vault_recovery->setText(tr("Spend the same coins using delayed recovery (not automatic)"));
+        m_vault_recovery->setToolTip(tr("Immediate spending requires every active key. Recovery is used only when you check this box; it is never automatic."));
+    }
+
+    const bool lost = st.is_vault && !st.lost_signers.empty();
+    if (m_vault_lost) {
+        m_vault_lost->setVisible(lost);
+        if (lost) {
+            QStringList names;
+            for (const auto& fpr : st.lost_signers) {
+                names << LostSignerLabel(model, fpr);
+            }
+            const bool one = names.size() == 1;
+            const QString title = (one ? tr("Signer marked lost: %1") : tr("Signers marked lost: %1")).arg(names.join(QStringLiteral(", ")));
+            const QString action = one
+                ? tr("Immediate spending is frozen. Reconnect or restore this signer, or select delayed recovery below once mature. Recovery never starts automatically.")
+                : tr("Immediate spending is frozen. Reconnect or restore the missing signers, or select delayed recovery below once mature. Recovery never starts automatically.");
+            m_vault_lost->setText(QStringLiteral("<b>%1</b><br>%2").arg(GUIUtil::HtmlEscape(title), GUIUtil::HtmlEscape(action)));
+        }
+    }
+
+    if (model->wallet().hasExternalSigner()) {
+        ui->sendButton->setText(tr("Sign on device"));
+        if (model->getOptionsModel()->hasSigner()) {
+            ui->sendButton->setEnabled(true);
+            ui->sendButton->setToolTip(tr("Connect your hardware wallet first."));
+        } else {
+            ui->sendButton->setEnabled(false);
+            ui->sendButton->setToolTip(tr("Set external signer script path in Options -> Wallet"));
+        }
+    } else if (model->wallet().privateKeysDisabled()) {
+        ui->sendButton->setText(tr("Cr&eate Unsigned"));
+        ui->sendButton->setEnabled(true);
+        ui->sendButton->setToolTip(tr("Creates a Partially Signed Bitcoin Transaction (PSBT) for use with e.g. an offline %1 wallet, or a PSBT-compatible hardware wallet.").arg(CLIENT_NAME));
+    } else {
+        ui->sendButton->setText(tr("S&end"));
+        ui->sendButton->setEnabled(true);
+        ui->sendButton->setToolTip(tr("Confirm the send action"));
+    }
+
+    const bool immediate_frozen = lost && !m_vault_recovery->isChecked();
+    if (immediate_frozen) {
+        ui->sendButton->setEnabled(false);
+        ui->sendButton->setToolTip(tr("Immediate spend needs every active key. Check delayed recovery if the coins are mature, or reconnect the missing signer."));
+    }
+    return immediate_frozen;
+}
+
 void SendCoinsDialog::updateCoinControlState()
 {
     if (ui->radioCustomFee->isChecked()) {
@@ -819,6 +975,26 @@ void SendCoinsDialog::updateCoinControlState()
     // Avoid using global defaults when sending money from the GUI
     // Either custom fee will be used or if not selected, the confirmation target from dropdown box
     m_coin_control->m_confirm_target = getConfTargetForIndex(ui->confTargetSelector->currentIndex());
+    // GUI sends always opt in to RBF so a key-path Scrooge vault spend can be bumped.
+    m_coin_control->m_signal_bip125_rbf = true;
+    m_coin_control->m_nSequence.reset();
+    m_coin_control->m_locktime.reset();
+    m_coin_control->m_script_path = false;
+    m_coin_control->m_min_depth = wallet::DEFAULT_MIN_DEPTH;
+    if (m_vault_recovery && m_vault_recovery->isChecked() && model) {
+        const auto st = model->wallet().getVaultStatus();
+        if (st.older) {
+            m_coin_control->m_nSequence = *st.older;
+            m_coin_control->m_min_depth = static_cast<int>(*st.older);
+            m_coin_control->m_script_path = true;
+        } else if (st.after) {
+            m_coin_control->m_locktime = *st.after;
+            m_coin_control->m_script_path = true;
+            if (st.recoverable_now == 0) {
+                m_coin_control->m_min_depth = std::numeric_limits<int>::max();
+            }
+        }
+    }
 }
 
 void SendCoinsDialog::updateNumberOfBlocks(int count, const QDateTime& blockDate, double nVerificationProgress, SyncType synctype, SynchronizationState sync_state) {

@@ -27,6 +27,8 @@ namespace Ui {
 }
 
 QT_BEGIN_NAMESPACE
+class QCheckBox;
+class QLabel;
 class QUrl;
 QT_END_NAMESPACE
 
@@ -73,6 +75,9 @@ private:
     bool fNewRecipientAllowed{true};
     bool fFeeMinimized{true};
     const PlatformStyle *platformStyle;
+    QCheckBox* m_vault_recovery{nullptr};
+    QLabel* m_vault_lost{nullptr};
+    bool updateVaultSendState();
 
     // Copy PSBT to clipboard and offer to save it.
     void presentPSBT(PartiallySignedTransaction& psbt);

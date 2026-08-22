@@ -19,6 +19,9 @@
 #include <QAbstractItemDelegate>
 #include <QApplication>
 #include <QDateTime>
+#include <QFrame>
+#include <QGridLayout>
+#include <QLabel>
 #include <QPainter>
 #include <QStatusTipEvent>
 
@@ -154,6 +157,39 @@ OverviewPage::OverviewPage(const PlatformStyle *platformStyle, QWidget *parent) 
     showOutOfSyncWarning(true);
     connect(ui->labelWalletStatus, &QPushButton::clicked, this, &OverviewPage::outOfSyncWarningClicked);
     connect(ui->labelTransactionsStatus, &QPushButton::clicked, this, &OverviewPage::outOfSyncWarningClicked);
+
+    if (auto* grid = ui->frame->findChild<QGridLayout*>("gridLayout")) {
+        auto* sep = new QFrame;
+        sep->setObjectName("labelVaultPathSep");
+        sep->setFrameShape(QFrame::HLine);
+        sep->setVisible(false);
+        auto* rec_text = new QLabel(tr("Recovery path (same coins):"));
+        rec_text->setObjectName("labelVaultRecoverableText");
+        rec_text->setVisible(false);
+        auto* rec = new QLabel(QStringLiteral("0"));
+        rec->setObjectName("labelVaultRecoverable");
+        rec->setAlignment(Qt::AlignRight | Qt::AlignTrailing | Qt::AlignVCenter);
+        rec->setVisible(false);
+        auto* wait_text = new QLabel(tr("Not yet mature (per coin):"));
+        wait_text->setObjectName("labelVaultAwaitingText");
+        wait_text->setToolTip(tr("Each coin has its own recovery maturity. The block count is an estimate for the earliest coin."));
+        wait_text->setVisible(false);
+        auto* wait = new QLabel(QStringLiteral("0"));
+        wait->setObjectName("labelVaultAwaiting");
+        wait->setAlignment(Qt::AlignRight | Qt::AlignTrailing | Qt::AlignVCenter);
+        wait->setVisible(false);
+        auto* note = new QLabel(tr("Recovery is another way to spend the same bitcoin, not extra funds."));
+        note->setObjectName("labelVaultPathNote");
+        note->setWordWrap(true);
+        note->setStyleSheet(QStringLiteral("QLabel { color: palette(window-text); }"));
+        note->setVisible(false);
+        grid->addWidget(sep, 5, 0, 1, 2);
+        grid->addWidget(rec_text, 6, 0);
+        grid->addWidget(rec, 6, 1);
+        grid->addWidget(wait_text, 7, 0);
+        grid->addWidget(wait, 7, 1);
+        grid->addWidget(note, 8, 0, 1, 2);
+    }
 }
 
 void OverviewPage::handleTransactionClicked(const QModelIndex &index)
@@ -187,7 +223,7 @@ OverviewPage::~OverviewPage()
 void OverviewPage::setBalance(const interfaces::WalletBalances& balances)
 {
     BitcoinUnit unit = walletModel->getOptionsModel()->getDisplayUnit();
-    ui->labelBalance->setText(BitcoinUnits::formatWithPrivacy(unit, balances.balance, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
+    ui->labelBalance->setText(BitcoinUnits::formatWithPrivacy(unit, balances.is_vault ? balances.vault_immediate : balances.balance, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
     ui->labelUnconfirmed->setText(BitcoinUnits::formatWithPrivacy(unit, balances.unconfirmed_balance, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
     ui->labelImmature->setText(BitcoinUnits::formatWithPrivacy(unit, balances.immature_balance, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
     ui->labelTotal->setText(BitcoinUnits::formatWithPrivacy(unit, balances.balance + balances.unconfirmed_balance + balances.immature_balance, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
@@ -197,6 +233,48 @@ void OverviewPage::setBalance(const interfaces::WalletBalances& balances)
 
     ui->labelImmature->setVisible(showImmature);
     ui->labelImmatureText->setVisible(showImmature);
+
+    if (balances.is_vault) {
+        ui->labelBalanceText->setText(tr("Spendable now (immediate path):"));
+        ui->labelBalance->setToolTip(tr("Spendable with every active key. Zero if a signer is marked lost. Does not use the delayed recovery path."));
+        ui->labelTotal->setToolTip(tr("Confirmed + pending + immature. Vault recovery amounts below are the same coins, not added to this total."));
+    } else {
+        ui->labelBalanceText->setText(tr("Available:"));
+        ui->labelBalance->setToolTip(tr("Your current spendable balance"));
+    }
+
+    if (auto* rec = findChild<QLabel*>("labelVaultRecoverable")) {
+        auto* rec_text = findChild<QLabel*>("labelVaultRecoverableText");
+        auto* wait = findChild<QLabel*>("labelVaultAwaiting");
+        auto* wait_text = findChild<QLabel*>("labelVaultAwaitingText");
+        auto* note = findChild<QLabel*>("labelVaultPathNote");
+        auto* sep = findChild<QFrame*>("labelVaultPathSep");
+        const bool show_vault = balances.is_vault;
+        rec->setVisible(show_vault);
+        if (rec_text) rec_text->setVisible(show_vault);
+        if (sep) sep->setVisible(show_vault);
+        if (note) note->setVisible(show_vault);
+        const bool show_wait = show_vault && balances.vault_awaiting != 0;
+        wait->setVisible(show_wait);
+        if (wait_text) wait_text->setVisible(show_wait);
+        if (show_vault) {
+            if (rec_text) rec_text->setText(tr("Recovery path (same coins):"));
+            rec->setText(BitcoinUnits::formatWithPrivacy(unit, balances.vault_recoverable, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
+            rec->setToolTip(tr("Mature coins that can be spent on the delayed path if you check recovery. Same UTXOs as spendable now, not extra bitcoin."));
+            if (show_wait) {
+                if (wait_text) wait_text->setText(tr("Not yet mature (per coin):"));
+                QString awaiting = BitcoinUnits::formatWithPrivacy(unit, balances.vault_awaiting, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy);
+                if (balances.vault_blocks_remaining) {
+                    if (*balances.vault_blocks_remaining == 1) {
+                        awaiting += tr(" (earliest: ~1 block)");
+                    } else {
+                        awaiting += tr(" (earliest: ~%1 blocks)").arg(*balances.vault_blocks_remaining);
+                    }
+                }
+                wait->setText(awaiting);
+            }
+        }
+    }
 }
 
 void OverviewPage::setClientModel(ClientModel *model)
@@ -297,4 +375,6 @@ void OverviewPage::setMonospacedFont(const QFont& f)
     ui->labelUnconfirmed->setFont(f);
     ui->labelImmature->setFont(f);
     ui->labelTotal->setFont(f);
+    if (auto* rec = findChild<QLabel*>("labelVaultRecoverable")) rec->setFont(f);
+    if (auto* wait = findChild<QLabel*>("labelVaultAwaiting")) wait->setFont(f);
 }
