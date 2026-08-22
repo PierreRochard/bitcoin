@@ -37,6 +37,7 @@ class WalletTaprootVaultSendTest(BitcoinTestFramework):
         self.test_send_keypath_rbf_and_bump()
         self.test_walletcreatefundedpsbt_sequence_fee()
         self.test_recovery_too_early_send()
+        self.test_two_stage_recovery_any_one_key()
         self.test_nums_send_not_keypath()
         self.test_send_two_outputs_and_sendall()
         self.test_fundrawtransaction_recovery_sequence()
@@ -71,8 +72,15 @@ class WalletTaprootVaultSendTest(BitcoinTestFramework):
             keys.append((info["origin"] + info["xprv"], info["origin"] + info["xpub"]))
         return keys
 
-    def _vault_pat(self, m, n, older):
+    def _vault_pat(self, m, n, older, one_key_older=None):
         inner = ",".join(f"${i}/<0;1>/*" for i in range(n))
+        if one_key_older is not None:
+            return (
+                f"tr(musig({inner}),{{"
+                f"and_v(v:older({older}),multi_a({m},{inner})),"
+                f"and_v(v:older({one_key_older}),multi_a(1,{inner}))"
+                "})"
+            )
         return f"tr(musig({inner}),and_v(v:older({older}),multi_a({m},{inner})))"
 
     def _subst(self, pat, keys, priv_mask=None):
@@ -192,6 +200,92 @@ class WalletTaprootVaultSendTest(BitcoinTestFramework):
         assert_equal(dec["vin"][0]["sequence"], 1)
         assert_greater_than(len(dec["vin"][0]["txinwitness"]), 1)
 
+    def test_two_stage_recovery_any_one_key(self):
+        self.log.info("Two-stage recovery: 2-of-3 after 2 blocks, any one key after 4")
+        coord, xpubs, specs = self._coord(3)
+        created = coord.createmultisigdescriptor(
+            2,
+            specs,
+            {"type": "bech32m", "fallback_older": 2, "fallback_older_one_key": 4},
+        )
+        assert_equal(created["fallback_older"], 2)
+        assert_equal(created["fallback_older_one_key"], 4)
+        assert "{and_v(v:older(2),multi_a(2," in created["descs"][0]
+        assert "and_v(v:older(4),multi_a(1," in created["descs"][0]
+
+        keys = self._derived(coord, xpubs)
+        recoverers = []
+        for i in range(3):
+            rec = self._blank(f"send_tiered_rec_{self.n}_{i}")
+            desc = self._subst(self._vault_pat(2, 3, 2, 4), keys, priv_mask={i})
+            assert_equal(rec.importdescriptors([{"desc": desc, "timestamp": "now", "active": True}])[0]["success"], True)
+            recoverers.append(rec)
+        self.n += 1
+
+        addr = coord.getnewaddress("", "bech32m")
+        assert_equal(recoverers[0].getnewaddress("", "bech32m"), addr)
+        self._fund(addr)
+        self.generate(self.nodes[0], 1)  # depth 2: primary stage only
+        dest = self.def_wallet.getnewaddress()
+
+        assert_raises_rpc_error(
+            -8,
+            "requires transaction version 2 or later",
+            coord.send,
+            outputs={dest: 1},
+            options={"change_type": "bech32m", "fee_rate": 1, "add_to_wallet": False, "vault_recovery": True},
+            version=1,
+        )
+        primary = coord.send(
+            outputs={dest: 1},
+            options={"change_type": "bech32m", "fee_rate": 1, "add_to_wallet": False, "vault_recovery": True},
+        )
+        assert primary["complete"]
+        assert_equal(self._decode_send(coord, primary)["vin"][0]["sequence"], 2)
+        one_key_primary = recoverers[0].send(
+            outputs={dest: 1},
+            options={"change_type": "bech32m", "fee_rate": 1, "add_to_wallet": False, "vault_recovery": True},
+        )
+        assert_equal(one_key_primary["complete"], False)
+        assert_raises_rpc_error(
+            -4,
+            "Insufficient funds",
+            recoverers[0].send,
+            outputs={dest: 1},
+            options={"change_type": "bech32m", "fee_rate": 1, "add_to_wallet": False, "vault_recovery": True, "vault_recovery_older": 4},
+        )
+        assert_raises_rpc_error(
+            -8,
+            "requires vault_recovery=true",
+            coord.send,
+            outputs={dest: 1},
+            options={"fee_rate": 1, "add_to_wallet": False, "vault_recovery_older": 4},
+        )
+        assert_raises_rpc_error(
+            -8,
+            "does not have a recovery stage at older(3)",
+            coord.send,
+            outputs={dest: 1},
+            options={"fee_rate": 1, "add_to_wallet": False, "vault_recovery": True, "vault_recovery_older": 3},
+        )
+
+        self.generate(self.nodes[0], 2)  # depth 4: any one recovery key
+        for rec in recoverers:
+            recovered = rec.send(
+                outputs={dest: 1},
+                options={
+                    "change_type": "bech32m",
+                    "fee_rate": 1,
+                    "add_to_wallet": False,
+                    "vault_recovery": True,
+                    "vault_recovery_older": 4,
+                },
+            )
+            assert recovered["complete"]
+            decoded = self._decode_send(rec, recovered)
+            assert_equal(decoded["vin"][0]["sequence"], 4)
+            assert_greater_than(len(decoded["vin"][0]["txinwitness"]), 1)
+
     def test_nums_send_not_keypath(self):
         self.log.info("NUMS sortedmulti_a send is not charged as a 1-signature key-path")
         w, xpubs, specs = self._coord(2)
@@ -226,6 +320,14 @@ class WalletTaprootVaultSendTest(BitcoinTestFramework):
         assert_equal(dec["vin"][0]["sequence"], RBF_SEQUENCE)
         assert_equal(len(dec["vin"][0]["txinwitness"]), 1)
         assert_greater_than(len(dec["vout"]), 1)
+        assert "vault_recovery" not in self.nodes[0].help("sendall")
+        assert_raises_rpc_error(
+            -8,
+            "sendall does not support vault recovery options",
+            w.sendall,
+            recipients=[self.def_wallet.getnewaddress()],
+            options={"vault_recovery": True},
+        )
         swept = w.sendall(
             recipients=[self.def_wallet.getnewaddress()],
             fee_rate=1,

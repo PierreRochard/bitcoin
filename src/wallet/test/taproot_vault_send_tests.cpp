@@ -143,7 +143,7 @@ struct VaultSend {
     CTxDestination dest;
 };
 
-static VaultSend MakeFundedVault(TestChain100Setup& test, int m, int n, std::optional<uint32_t> older, const std::set<int>& recover_priv, CAmount amount, size_t coinbase_index, std::optional<uint32_t> after = {})
+static VaultSend MakeFundedVault(TestChain100Setup& test, int m, int n, std::optional<uint32_t> older, const std::set<int>& recover_priv, CAmount amount, size_t coinbase_index, std::optional<uint32_t> after = {}, std::optional<uint32_t> fallback_older_one_key = {})
 {
     BOOST_REQUIRE(n >= 2);
     BOOST_REQUIRE(coinbase_index < test.m_coinbase_txns.size());
@@ -162,7 +162,7 @@ static VaultSend MakeFundedVault(TestChain100Setup& test, int m, int n, std::opt
             full_specs.push_back(LocalSpec(masters[i]));
         }
         auto created = CreateMultisigDescriptor(*out.full, m, full_specs,
-                                                MultisigOptions{OutputType::BECH32M, 0, {}, older, after});
+                                                MultisigOptions{OutputType::BECH32M, 0, {}, older, after, fallback_older_one_key});
         BOOST_REQUIRE_MESSAGE(created, util::ErrorString(created).original);
         out.dest = *Assert(out.full->GetNewDestination(OutputType::BECH32M, ""));
         out.spk = GetScriptForDestination(out.dest);
@@ -178,7 +178,7 @@ static VaultSend MakeFundedVault(TestChain100Setup& test, int m, int n, std::opt
             }
         }
         auto created = CreateMultisigDescriptor(*out.recover, m, rec_specs,
-                                                MultisigOptions{OutputType::BECH32M, 0, {}, older, after});
+                                                MultisigOptions{OutputType::BECH32M, 0, {}, older, after, fallback_older_one_key});
         BOOST_REQUIRE_MESSAGE(created, util::ErrorString(created).original);
         BOOST_CHECK(GetScriptForDestination(*Assert(out.recover->GetNewDestination(OutputType::BECH32M, ""))) == out.spk);
     }
@@ -593,7 +593,7 @@ BOOST_AUTO_TEST_CASE(vault_after_create_transaction)
     CCoinControl too_early = FeeCC();
     {
         LOCK(vault.full->cs_wallet);
-        ApplyVaultRecoveryToCoinControl(*vault.full, too_early);
+        BOOST_REQUIRE(ApplyVaultRecoveryToCoinControl(*vault.full, too_early));
         const auto br = GetVaultBalanceBreakdown(*vault.full);
         BOOST_CHECK(br.is_vault);
         BOOST_CHECK(*br.policy.after == after_h);
@@ -616,7 +616,7 @@ BOOST_AUTO_TEST_CASE(vault_after_create_transaction)
     CCoinControl rec = FeeCC();
     {
         LOCK(vault.full->cs_wallet);
-        ApplyVaultRecoveryToCoinControl(*vault.full, rec);
+        BOOST_REQUIRE(ApplyVaultRecoveryToCoinControl(*vault.full, rec));
     }
     BOOST_CHECK_NE(rec.m_min_depth, std::numeric_limits<int>::max());
     BOOST_CHECK_EQUAL(rec.m_min_depth, DEFAULT_MIN_DEPTH);
@@ -794,12 +794,54 @@ BOOST_AUTO_TEST_CASE(vault_apply_recovery_relative)
     CCoinControl cc = FeeCC();
     {
         LOCK(vault.full->cs_wallet);
-        ApplyVaultRecoveryToCoinControl(*vault.full, cc);
+        BOOST_REQUIRE(ApplyVaultRecoveryToCoinControl(*vault.full, cc));
     }
     BOOST_REQUIRE(cc.m_nSequence);
     BOOST_CHECK_EQUAL(*cc.m_nSequence, 2U);
     BOOST_CHECK_EQUAL(cc.m_min_depth, 2);
     BOOST_CHECK(cc.m_script_path);
+}
+
+BOOST_AUTO_TEST_CASE(vault_two_stage_balances_and_one_key_send)
+{
+    mineBlocks(1);
+    auto vault = MakeFundedVault(*this, /*m=*/2, /*n=*/3, /*older=*/2, /*recover_priv=*/{0},
+                                 10 * COIN, /*coinbase_index=*/0, /*after=*/{}, /*fallback_older_one_key=*/4);
+    {
+        LOCK(vault.full->cs_wallet);
+        const auto br = GetVaultBalanceBreakdown(*vault.full);
+        BOOST_REQUIRE_EQUAL(br.recovery_stages.size(), 2U);
+        BOOST_CHECK_EQUAL(br.recovery_stages[0].stage.nrequired, 2);
+        BOOST_CHECK_EQUAL(br.recovery_stages[1].stage.nrequired, 1);
+        BOOST_CHECK_GT(br.recovery_stages[0].awaiting, 0);
+        BOOST_CHECK_GT(br.recovery_stages[1].awaiting, 0);
+    }
+
+    mineBlocks(1);
+    ScanWallet(*vault.full, *Assert(m_node.chainman));
+    ScanWallet(*vault.recover, *Assert(m_node.chainman));
+    {
+        LOCK(vault.full->cs_wallet);
+        const auto br = GetVaultBalanceBreakdown(*vault.full);
+        BOOST_CHECK_GT(br.recovery_stages[0].recoverable_now, 0);
+        BOOST_CHECK_GT(br.recovery_stages[1].awaiting, 0);
+    }
+
+    mineBlocks(2);
+    ScanWallet(*vault.full, *Assert(m_node.chainman));
+    ScanWallet(*vault.recover, *Assert(m_node.chainman));
+    CCoinControl one_key = FeeCC();
+    {
+        LOCK(vault.recover->cs_wallet);
+        const auto br = GetVaultBalanceBreakdown(*vault.recover);
+        BOOST_CHECK_GT(br.recovery_stages[1].recoverable_now, 0);
+        BOOST_CHECK_EQUAL(br.recovery_stages[1].awaiting, 0);
+        BOOST_REQUIRE(ApplyVaultRecoveryToCoinControl(*vault.recover, one_key, 4));
+    }
+    auto recovered = SendFrom(*vault.recover, 1 * COIN, one_key);
+    BOOST_REQUIRE_MESSAGE(recovered, util::ErrorString(recovered).original);
+    BOOST_CHECK_EQUAL(recovered->tx->vin[0].nSequence, 4U);
+    BOOST_CHECK_GT(recovered->tx->vin[0].scriptWitness.stack.size(), 1U);
 }
 
 BOOST_AUTO_TEST_CASE(vault_recovery_change_restarts_relative_clock)

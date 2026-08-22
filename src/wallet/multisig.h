@@ -50,6 +50,10 @@ struct MultisigOptions {
     //! Absolute CLTV height (miniscript after()). Mutually exclusive with
     //! fallback_older. Recovery is valid at and after this block height.
     std::optional<uint32_t> fallback_after;
+    //! Optional second relative recovery stage. When set, any one recovery
+    //! key can spend after this many confirmations. Requires fallback_older
+    //! and must be strictly later than it.
+    std::optional<uint32_t> fallback_older_one_key;
 };
 
 struct MultisigDescriptorResult {
@@ -58,12 +62,22 @@ struct MultisigDescriptorResult {
     std::vector<std::string> key_exprs;
     std::optional<uint32_t> fallback_older;
     std::optional<uint32_t> fallback_after;
+    std::optional<uint32_t> fallback_older_one_key;
     std::string policy_id;
+};
+
+struct VaultRecoveryStage {
+    int nrequired{0};
+    std::optional<uint32_t> older;
+    std::optional<uint32_t> after;
 };
 
 //! Parsed Scrooge vault fields from a descriptor string.
 struct InferredVaultPolicy {
     bool is_vault{false};
+    //! Ordered recovery stages. Relative stages are ordered by increasing
+    //! delay. The legacy fields below mirror the first stage.
+    std::vector<VaultRecoveryStage> recovery_stages;
     std::optional<uint32_t> older;
     std::optional<uint32_t> after;
     int recovery_m{0};
@@ -78,7 +92,8 @@ std::string DefaultMultisigPath(OutputType type, uint32_t account);
 std::string WrapSortedMulti(OutputType type, int nrequired, const std::vector<std::string>& keys,
                             std::optional<uint32_t> fallback_older = {},
                             std::optional<uint32_t> fallback_after = {},
-                            const std::vector<std::string>& recovery_keys = {});
+                            const std::vector<std::string>& recovery_keys = {},
+                            std::optional<uint32_t> fallback_older_one_key = {});
 
 //! Type-aware key-count limits: 15 (P2SH), 20 (P2WSH), 999 (Taproot multi_a /
 //! Scrooge vault fallback). n-of-n bech32m MuSig2 has no consensus cap.
@@ -86,7 +101,8 @@ bilingual_str ValidateMultisigPolicy(int nrequired, size_t nkeys,
                                      OutputType type = OutputType::BECH32,
                                      std::optional<uint32_t> fallback_older = {},
                                      std::optional<uint32_t> fallback_after = {},
-                                     size_t n_recovery_keys = 0);
+                                     size_t n_recovery_keys = 0,
+                                     std::optional<uint32_t> fallback_older_one_key = {});
 
 //! Parse older(N) out of a Scrooge vault descriptor, if present.
 std::optional<uint32_t> InferTaprootRecoveryDelay(const std::string& desc);
@@ -105,7 +121,8 @@ std::string FormatMultisigTranscript(const std::string& wallet_name,
                                      OutputType type,
                                      const std::vector<std::string>& public_descs,
                                      std::optional<uint32_t> fallback_older = {},
-                                     std::optional<uint32_t> fallback_after = {});
+                                     std::optional<uint32_t> fallback_after = {},
+                                     std::optional<uint32_t> fallback_older_one_key = {});
 
 //! Import an active sorted-multisig descriptor. Caller must hold cs_wallet
 //! and, for wallets with private keys, have unlocked the wallet.
@@ -127,6 +144,13 @@ struct VaultBalanceBreakdown {
     CAmount recoverable_now{0};
     CAmount awaiting{0};
     std::optional<int> earliest_blocks_remaining;
+    struct RecoveryStageBalance {
+        VaultRecoveryStage stage;
+        CAmount recoverable_now{0};
+        CAmount awaiting{0};
+        std::optional<int> earliest_blocks_remaining;
+    };
+    std::vector<RecoveryStageBalance> recovery_stages;
 };
 
 //! Confirmed coins: key-path (immediate, 0 if a signer is marked lost),
@@ -134,7 +158,9 @@ struct VaultBalanceBreakdown {
 VaultBalanceBreakdown GetVaultBalanceBreakdown(const CWallet& wallet);
 
 //! Set nSequence/min_depth (older) or nLockTime/script_path (after) for recovery.
-void ApplyVaultRecoveryToCoinControl(const CWallet& wallet, CCoinControl& coin_control);
+util::Result<void> ApplyVaultRecoveryToCoinControl(const CWallet& wallet,
+                                                   CCoinControl& coin_control,
+                                                   std::optional<uint32_t> selected_older = {});
 
 struct VaultPolicyPackage {
     std::string format{"bitcoin-core-vault-policy"};
@@ -144,6 +170,8 @@ struct VaultPolicyPackage {
     int nrequired{0};
     std::optional<uint32_t> fallback_older;
     std::optional<uint32_t> fallback_after;
+    std::optional<uint32_t> fallback_older_one_key;
+    std::vector<VaultRecoveryStage> recovery_stages;
     std::vector<std::string> descs;
 };
 

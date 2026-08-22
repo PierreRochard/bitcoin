@@ -191,7 +191,8 @@ struct VaultWallets {
     std::vector<std::string> descs;
 };
 
-static VaultWallets MakeVault(int m, int n, uint32_t older, const std::set<int>& recover_priv)
+static VaultWallets MakeVault(int m, int n, uint32_t older, const std::set<int>& recover_priv,
+                              std::optional<uint32_t> fallback_older_one_key = {})
 {
     BOOST_REQUIRE(n >= 2);
     BOOST_REQUIRE(m >= 1 && m <= n);
@@ -212,12 +213,16 @@ static VaultWallets MakeVault(int m, int n, uint32_t older, const std::set<int>&
             full_specs.push_back(LocalSpec(masters[i]));
         }
         auto created = CreateMultisigDescriptor(*out.full, m, full_specs,
-                                                MultisigOptions{OutputType::BECH32M, 0, {}, older});
+                                                MultisigOptions{OutputType::BECH32M, 0, {}, older, {}, fallback_older_one_key});
         BOOST_REQUIRE_MESSAGE(created, strprintf("%d-of-%d create: %s", m, n, util::ErrorString(created).original));
         BOOST_REQUIRE_EQUAL(created->descs.size(), 2U);
         BOOST_CHECK(created->descs[0].find("tr(musig(") != std::string::npos);
         BOOST_CHECK(created->descs[0].find(strprintf("older(%u)", older)) != std::string::npos);
         BOOST_CHECK(created->descs[0].find(strprintf("multi_a(%d,", m)) != std::string::npos);
+        if (fallback_older_one_key) {
+            BOOST_CHECK(created->descs[0].find(strprintf("older(%u)", *fallback_older_one_key)) != std::string::npos);
+            BOOST_CHECK(created->descs[0].find("multi_a(1,") != std::string::npos);
+        }
         out.descs = created->descs;
         const CTxDestination dest = *Assert(out.full->GetNewDestination(OutputType::BECH32M, ""));
         BOOST_CHECK(std::holds_alternative<WitnessV1Taproot>(dest));
@@ -234,7 +239,7 @@ static VaultWallets MakeVault(int m, int n, uint32_t older, const std::set<int>&
             }
         }
         auto created = CreateMultisigDescriptor(*out.recover, m, rec_specs,
-                                                MultisigOptions{OutputType::BECH32M, 0, {}, older});
+                                                MultisigOptions{OutputType::BECH32M, 0, {}, older, {}, fallback_older_one_key});
         BOOST_REQUIRE_MESSAGE(created, strprintf("%d-of-%d recover create: %s", m, n, util::ErrorString(created).original));
         const CTxDestination dest = *Assert(out.recover->GetNewDestination(OutputType::BECH32M, ""));
         BOOST_CHECK_MESSAGE(GetScriptForDestination(dest) == out.spk,
@@ -300,6 +305,11 @@ BOOST_AUTO_TEST_CASE(create_rejects_bad_fallback)
     BOOST_CHECK(!CreateMultisigDescriptor(*wallet, 2, specs, MultisigOptions{OutputType::BECH32M, 0, {}, /*fallback_older=*/1, /*fallback_after=*/50}));
     BOOST_CHECK(!CreateMultisigDescriptor(*wallet, 2, specs, MultisigOptions{OutputType::BECH32M, 0, {}, {}, uint32_t{0}}));
     BOOST_CHECK(!CreateMultisigDescriptor(*wallet, 2, specs, MultisigOptions{OutputType::BECH32M, 0, {}, 1u << 31}));
+    BOOST_CHECK(!CreateMultisigDescriptor(*wallet, 2, specs, MultisigOptions{OutputType::BECH32M, 0, {}, 65536}));
+    BOOST_CHECK(!CreateMultisigDescriptor(*wallet, 2, specs, MultisigOptions{OutputType::BECH32M, 0, {}, {}, {}, 4}));
+    BOOST_CHECK(!CreateMultisigDescriptor(*wallet, 2, specs, MultisigOptions{OutputType::BECH32M, 0, {}, 2, {}, 2}));
+    BOOST_CHECK(!CreateMultisigDescriptor(*wallet, 2, specs, MultisigOptions{OutputType::BECH32M, 0, {}, 2, {}, 65536}));
+    BOOST_CHECK(!CreateMultisigDescriptor(*wallet, 1, specs, MultisigOptions{OutputType::BECH32M, 0, {}, 2, {}, 4}));
     auto heir = LocalSpec(a);
     heir.recovery_only = true;
     BOOST_CHECK(!CreateMultisigDescriptor(*wallet, 1, {LocalSpec(a), heir}, MultisigOptions{OutputType::BECH32M}));
@@ -331,10 +341,14 @@ BOOST_AUTO_TEST_CASE(create_rejects_bad_fallback)
     BOOST_CHECK(!ValidateMultisigPolicy(0, 2).empty());
     BOOST_CHECK(!ValidateMultisigPolicy(1, 1, OutputType::BECH32M, /*fallback_older=*/1).empty());
     BOOST_CHECK(!ValidateMultisigPolicy(1, 1, OutputType::BECH32M, {}, /*fallback_after=*/10).empty());
+    BOOST_CHECK(!ValidateMultisigPolicy(2, 2, OutputType::BECH32M, 2, {}, 2, /*fallback_older_one_key=*/2).empty());
+    BOOST_CHECK(!ValidateMultisigPolicy(2, 2, OutputType::BECH32M, {}, {}, 2, /*fallback_older_one_key=*/4).empty());
     BOOST_CHECK(WrapSortedMulti(OutputType::UNKNOWN, 1, {"x"}).empty());
     BOOST_CHECK(WrapSortedMulti(OutputType::BECH32M, 1, {}).empty());
     BOOST_CHECK(WrapSortedMulti(OutputType::BECH32M, 1, {"a", "b"}, /*fallback_older=*/1, /*fallback_after=*/2).empty());
     BOOST_CHECK(WrapSortedMulti(OutputType::BECH32M, 1, {"only"}, /*fallback_older=*/1).empty());
+    BOOST_CHECK(WrapSortedMulti(OutputType::BECH32M, 2, {"a", "b"}, /*fallback_older=*/65536).empty());
+    BOOST_CHECK(WrapSortedMulti(OutputType::BECH32M, 2, {"a", "b"}, 2, {}, {}, /*fallback_older_one_key=*/65536).empty());
     BOOST_CHECK_EQUAL(WrapSortedMulti(OutputType::LEGACY, 1, {"k"}), "sh(sortedmulti(1,k))");
     BOOST_CHECK_EQUAL(WrapSortedMulti(OutputType::P2SH_SEGWIT, 1, {"k"}), "sh(wsh(sortedmulti(1,k)))");
     BOOST_CHECK_EQUAL(WrapSortedMulti(OutputType::BECH32, 2, {"a", "b"}), "wsh(sortedmulti(2,a,b))");
@@ -342,6 +356,9 @@ BOOST_AUTO_TEST_CASE(create_rejects_bad_fallback)
     BOOST_CHECK(rec_wrap.find("musig(act1,act2)") != std::string::npos);
     BOOST_CHECK(rec_wrap.find("older(6)") != std::string::npos);
     BOOST_CHECK(rec_wrap.find("multi_a(1,act1,act2,heir)") != std::string::npos);
+    const auto staged_wrap = WrapSortedMulti(OutputType::BECH32M, 2, {"act1", "act2"}, 2, {}, {"act1", "act2", "heir"}, 4);
+    BOOST_CHECK_EQUAL(staged_wrap,
+        "tr(musig(act1,act2),{and_v(v:older(2),multi_a(2,act1,act2,heir)),and_v(v:older(4),multi_a(1,act1,act2,heir))})");
     BOOST_CHECK_EQUAL(DefaultMultisigPath(OutputType::LEGACY, 0), "m/48h/0h/0h/0h");
     BOOST_CHECK_EQUAL(DefaultMultisigPath(OutputType::P2SH_SEGWIT, 0), "m/48h/0h/0h/1h");
     BOOST_CHECK_EQUAL(DefaultMultisigPath(OutputType::UNKNOWN, 0), "m/48h/0h/0h/2h");
@@ -374,7 +391,8 @@ BOOST_AUTO_TEST_CASE(vault_infer_and_duplicate_edges)
     auto plain = MakeWallet();
     LOCK(plain->cs_wallet);
     CCoinControl cc;
-    ApplyVaultRecoveryToCoinControl(*plain, cc);
+    BOOST_REQUIRE(ApplyVaultRecoveryToCoinControl(*plain, cc));
+    BOOST_CHECK(!ApplyVaultRecoveryToCoinControl(*plain, cc, 4));
     BOOST_CHECK(!cc.m_nSequence);
     BOOST_CHECK(!cc.m_locktime);
     BOOST_CHECK(!cc.m_script_path);
@@ -400,6 +418,66 @@ BOOST_AUTO_TEST_CASE(all_local_vault_2of3_older_144)
     LOCK(vault.recover->cs_wallet);
     ExpectIncomplete(SignSpk(*vault.recover, vault.spk, 143), "2-of-3 older(144) with nSequence=143");
     ExpectScriptpath(SignSpk(*vault.recover, vault.spk, 144), "2-of-3 older(144) with nSequence=144");
+}
+
+BOOST_AUTO_TEST_CASE(vault_two_stage_2of3_then_any_one)
+{
+    auto vault = MakeVault(/*m=*/2, /*n=*/3, /*older=*/2, /*recover_priv=*/{0}, /*fallback_older_one_key=*/4);
+    {
+        LOCK(vault.full->cs_wallet);
+        const auto policy = InferWalletVaultPolicy(*vault.full);
+        BOOST_REQUIRE(policy.is_vault);
+        BOOST_REQUIRE_EQUAL(policy.recovery_stages.size(), 2U);
+        BOOST_CHECK_EQUAL(policy.recovery_stages[0].nrequired, 2);
+        BOOST_CHECK_EQUAL(*policy.recovery_stages[0].older, 2U);
+        BOOST_CHECK_EQUAL(policy.recovery_stages[1].nrequired, 1);
+        BOOST_CHECK_EQUAL(*policy.recovery_stages[1].older, 4U);
+        const auto pkg = ExportWalletVaultPolicy(*vault.full);
+        BOOST_REQUIRE(pkg.fallback_older_one_key);
+        BOOST_CHECK_EQUAL(*pkg.fallback_older_one_key, 4U);
+        BOOST_REQUIRE_EQUAL(pkg.recovery_stages.size(), 2U);
+        const std::string json = FormatVaultPolicyPackage(pkg);
+        BOOST_CHECK(json.find("fallback_older_one_key") != std::string::npos);
+        BOOST_CHECK(json.find("recovery_stages") != std::string::npos);
+        auto parsed = ParseVaultPolicyPackage(json);
+        BOOST_REQUIRE_MESSAGE(parsed, util::ErrorString(parsed).original);
+        BOOST_REQUIRE_EQUAL(parsed->recovery_stages.size(), 2U);
+        VaultPolicyPackage tampered = pkg;
+        tampered.fallback_older_one_key = 5;
+        BOOST_CHECK(!ParseVaultPolicyPackage(FormatVaultPolicyPackage(tampered)));
+        tampered = pkg;
+        tampered.recovery_stages[1].nrequired = 2;
+        BOOST_CHECK(!ParseVaultPolicyPackage(FormatVaultPolicyPackage(tampered)));
+        tampered = pkg;
+        tampered.policy_id = "0000000000000000";
+        BOOST_CHECK(!ParseVaultPolicyPackage(FormatVaultPolicyPackage(tampered)));
+        ExpectKeypath(SignSpk(*vault.full, vault.spk, CTxIn::SEQUENCE_FINAL), "two-stage immediate key-path");
+        const auto stage_two = SignSpk(*vault.full, vault.spk, 4);
+        ExpectScriptpath(stage_two, "explicit later stage with every recovery key");
+        const auto& witness = stage_two.extracted.vin.at(0).scriptWitness.stack;
+        BOOST_REQUIRE_EQUAL(witness.size(), 5U); // Three multi_a slots, tapscript, control block.
+        BOOST_CHECK_EQUAL(std::count_if(witness.begin(), witness.begin() + 3,
+                                        [](const auto& element) { return !element.empty(); }),
+                          1U);
+    }
+    {
+        LOCK(vault.recover->cs_wallet);
+        ExpectIncomplete(SignSpk(*vault.recover, vault.spk, 2), "one key cannot use 2-of-3 stage");
+        ExpectIncomplete(SignSpk(*vault.recover, vault.spk, 3), "1-of-3 stage remains timelocked");
+        ExpectScriptpath(SignSpk(*vault.recover, vault.spk, 4), "any one key uses later recovery stage");
+
+        CCoinControl primary;
+        BOOST_REQUIRE(ApplyVaultRecoveryToCoinControl(*vault.recover, primary));
+        BOOST_REQUIRE(primary.m_nSequence);
+        BOOST_CHECK_EQUAL(*primary.m_nSequence, 2U);
+        CCoinControl one_key;
+        BOOST_REQUIRE(ApplyVaultRecoveryToCoinControl(*vault.recover, one_key, 4));
+        BOOST_REQUIRE(one_key.m_nSequence);
+        BOOST_CHECK_EQUAL(*one_key.m_nSequence, 4U);
+        BOOST_CHECK_EQUAL(one_key.m_min_depth, 4);
+        BOOST_CHECK(one_key.m_script_path);
+        BOOST_CHECK(!ApplyVaultRecoveryToCoinControl(*vault.recover, one_key, 3));
+    }
 }
 
 BOOST_AUTO_TEST_CASE(split_wallets_vault_keypath)
@@ -564,6 +642,19 @@ BOOST_AUTO_TEST_CASE(infer_taproot_recovery_delay)
     BOOST_CHECK_EQUAL(*rel.older, 144U);
     BOOST_CHECK(!rel.after);
     BOOST_CHECK_EQUAL(rel.recovery_m, 2);
+    BOOST_REQUIRE_EQUAL(rel.recovery_stages.size(), 1U);
+    BOOST_CHECK_EQUAL(rel.recovery_stages[0].nrequired, 2);
+    const auto staged = InferVaultPolicy(
+        "tr(musig(a,b,c),{and_v(v:older(4),multi_a(1,a,b,c)),and_v(v:older(2),multi_a(2,a,b,c))})");
+    BOOST_REQUIRE(staged.is_vault);
+    BOOST_REQUIRE_EQUAL(staged.recovery_stages.size(), 2U);
+    BOOST_CHECK_EQUAL(*staged.older, 2U);
+    BOOST_CHECK_EQUAL(staged.recovery_m, 2);
+    BOOST_CHECK_EQUAL(*staged.recovery_stages[0].older, 2U);
+    BOOST_CHECK_EQUAL(staged.recovery_stages[0].nrequired, 2);
+    BOOST_CHECK_EQUAL(*staged.recovery_stages[1].older, 4U);
+    BOOST_CHECK_EQUAL(staged.recovery_stages[1].nrequired, 1);
+    BOOST_CHECK(!InferVaultPolicy("tr(musig(a,b),and_v(v:older(65536),multi_a(1,a,b)))").is_vault);
     const auto abs = InferVaultPolicy("tr(musig(a,b),and_v(v:after(500),multi_a(1,a,b,c)))");
     BOOST_CHECK(abs.is_vault);
     BOOST_CHECK(!abs.older);
@@ -650,7 +741,7 @@ BOOST_AUTO_TEST_CASE(vault_after_policy_and_apply_coincontrol)
     BOOST_CHECK(created->descs[0].find("older(") == std::string::npos);
     BOOST_CHECK_EQUAL(*created->fallback_after, 500U);
     CCoinControl rec_cc;
-    ApplyVaultRecoveryToCoinControl(*wallet, rec_cc);
+    BOOST_REQUIRE(ApplyVaultRecoveryToCoinControl(*wallet, rec_cc));
     BOOST_CHECK(rec_cc.m_script_path);
     BOOST_REQUIRE(rec_cc.m_locktime);
     BOOST_CHECK_EQUAL(*rec_cc.m_locktime, 500U);
@@ -693,16 +784,37 @@ BOOST_AUTO_TEST_CASE(vault_policy_package_roundtrip)
     auto created = CreateMultisigDescriptor(*wallet, 1, {LocalSpec(a), LocalSpec(b)},
                                             MultisigOptions{OutputType::BECH32M, 0, {}, 144});
     BOOST_REQUIRE(created);
+    auto ordinary = CreateMultisigDescriptor(*wallet, 2, {LocalSpec(a), LocalSpec(b)},
+                                             MultisigOptions{OutputType::BECH32});
+    BOOST_REQUIRE(ordinary);
     const auto pkg = ExportWalletVaultPolicy(*wallet);
     BOOST_CHECK_EQUAL(pkg.format, "bitcoin-core-vault-policy");
     BOOST_CHECK(!pkg.policy_id.empty());
     BOOST_CHECK_EQUAL(*pkg.fallback_older, 144U);
-    BOOST_REQUIRE(!pkg.descs.empty());
+    BOOST_REQUIRE_EQUAL(pkg.descs.size(), 2U); // Unrelated active bech32 descriptors are excluded.
     const std::string json = FormatVaultPolicyPackage(pkg);
     BOOST_CHECK(json.find("xprv") == std::string::npos);
     auto parsed = ParseVaultPolicyPackage(json);
     BOOST_REQUIRE_MESSAGE(parsed, util::ErrorString(parsed).original);
     BOOST_CHECK_EQUAL(parsed->policy_id, pkg.policy_id);
+    BOOST_REQUIRE_EQUAL(parsed->recovery_stages.size(), 1U);
+    BOOST_CHECK_EQUAL(parsed->recovery_stages[0].nrequired, 1);
+    BOOST_CHECK_EQUAL(*parsed->recovery_stages[0].older, 144U);
+    VaultPolicyPackage ordinary_pkg;
+    ordinary_pkg.nrequired = 2;
+    ordinary_pkg.descs = ordinary->descs;
+    auto ordinary_parsed = ParseVaultPolicyPackage(FormatVaultPolicyPackage(ordinary_pkg));
+    BOOST_REQUIRE_MESSAGE(ordinary_parsed, util::ErrorString(ordinary_parsed).original);
+    BOOST_CHECK_EQUAL(ordinary_parsed->nrequired, 2);
+    VaultPolicyPackage single_desc = pkg;
+    single_desc.descs.resize(1);
+    BOOST_REQUIRE(ParseVaultPolicyPackage(FormatVaultPolicyPackage(single_desc)));
+    VaultPolicyPackage wrong_change = pkg;
+    wrong_change.descs[1] = wrong_change.descs[0];
+    BOOST_CHECK(!ParseVaultPolicyPackage(FormatVaultPolicyPackage(wrong_change)));
+    VaultPolicyPackage too_many = pkg;
+    too_many.descs.push_back(pkg.descs[0]);
+    BOOST_CHECK(!ParseVaultPolicyPackage(FormatVaultPolicyPackage(too_many)));
 
     auto watch = std::shared_ptr<CWallet>(new CWallet(/*chain=*/nullptr, "vault_watch", CreateMockableWalletDatabase()));
     watch->InitWalletFlags(WALLET_FLAG_DESCRIPTORS | WALLET_FLAG_DISABLE_PRIVATE_KEYS | WALLET_FLAG_LAST_HARDENED_XPUB_CACHED);
@@ -725,10 +837,11 @@ BOOST_AUTO_TEST_CASE(vault_policy_package_roundtrip)
     auto versioned = ParseVaultPolicyPackage("{\"format\":\"bitcoin-core-vault-policy\",\"version\":1,\"descs\":[\"d\"]}");
     BOOST_REQUIRE(versioned);
     BOOST_CHECK_EQUAL(versioned->version, 1);
-    auto both_locks = ParseVaultPolicyPackage("{\"format\":\"bitcoin-core-vault-policy\",\"fallback_older\":1,\"fallback_after\":2,\"descs\":[\"x\"]}");
-    BOOST_REQUIRE(both_locks);
-    BOOST_CHECK(both_locks->fallback_older);
-    BOOST_CHECK(both_locks->fallback_after);
+    BOOST_CHECK(!ParseVaultPolicyPackage("{\"format\":\"bitcoin-core-vault-policy\",\"version\":2,\"descs\":[\"d\"]}"));
+    BOOST_CHECK(!ParseVaultPolicyPackage("{\"format\":\"bitcoin-core-vault-policy\",\"fallback_older\":-1,\"descs\":[\"d\"]}"));
+    BOOST_CHECK(!ParseVaultPolicyPackage("{\"format\":\"bitcoin-core-vault-policy\",\"recovery_stages\":[{\"nrequired\":1,\"fallback_older\":-1}],\"descs\":[\"d\"]}"));
+    BOOST_CHECK(!ParseVaultPolicyPackage("{\"format\":\"bitcoin-core-vault-policy\",\"descs\":[\"tr(musig(a,b),and_v(v:older(65536),multi_a(1,a,b)))\"]}"));
+    BOOST_CHECK(!ParseVaultPolicyPackage("{\"format\":\"bitcoin-core-vault-policy\",\"fallback_older\":1,\"fallback_after\":2,\"descs\":[\"x\"]}"));
     VaultPolicyPackage bad_net = *parsed;
     bad_net.network = pkg.network == "main" ? "regtest" : "main";
     BOOST_CHECK(!ImportWalletVaultPolicy(*watch, bad_net));

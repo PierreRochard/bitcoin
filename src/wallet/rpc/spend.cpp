@@ -437,7 +437,7 @@ RPCMethod sendmany()
 }
 
 // Only includes key documentation where the key is snake_case in all RPC methods. MixedCase keys can be added later.
-static std::vector<RPCArg> FundTxDoc(bool solving_data = true)
+static std::vector<RPCArg> FundTxDoc(bool solving_data = true, bool vault_recovery = true)
 {
     std::vector<RPCArg> args = {
         {"conf_target", RPCArg::Type::NUM, RPCArg::DefaultHint{"wallet -txconfirmtarget"}, "Confirmation target in blocks", RPCArgOptions{.also_positional = true}},
@@ -448,6 +448,10 @@ static std::vector<RPCArg> FundTxDoc(bool solving_data = true)
             "Allows this transaction to be replaced by a transaction with higher fees"
         },
     };
+    if (vault_recovery) {
+        args.push_back({"vault_recovery", RPCArg::Type::BOOL, RPCArg::Default{false}, "Scrooge vault only. Spend the primary delayed recovery stage. Recovery is never selected unless this is true."});
+        args.push_back({"vault_recovery_older", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "With vault_recovery=true, select the exact relative recovery stage by its older() delay in blocks."});
+    }
     if (solving_data) {
         args.push_back({"solving_data", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Keys and scripts needed for producing a final transaction with a dummy signature.\n"
         "Used for fee estimation during coin selection.",
@@ -487,6 +491,7 @@ CreatedTransactionResult FundTransaction(CWallet& wallet, const CMutableTransact
 
     std::optional<unsigned int> change_position;
     bool lockUnspents = false;
+    bool vault_recovery = false;
     if (!options.isNull()) {
         RPCTypeCheckObj(options,
                 {
@@ -518,6 +523,7 @@ CreatedTransactionResult FundTransaction(CWallet& wallet, const CMutableTransact
                     {"input_weights", UniValueType(UniValue::VARR)},
                     {"max_tx_weight", UniValueType(UniValue::VNUM)},
                     {"vault_recovery", UniValueType(UniValue::VBOOL)},
+                    {"vault_recovery_older", UniValueType(UniValue::VNUM)},
                 },
                 true, true);
 
@@ -596,9 +602,40 @@ CreatedTransactionResult FundTransaction(CWallet& wallet, const CMutableTransact
                 throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("maxconf can't be lower than minconf: %d < %d", coinControl.m_max_depth, coinControl.m_min_depth));
             }
         }
-        if (options.exists("vault_recovery") && options["vault_recovery"].get_bool()) {
+        vault_recovery = options.exists("vault_recovery") && options["vault_recovery"].get_bool();
+        std::optional<uint32_t> vault_recovery_older;
+        if (options.exists("vault_recovery_older")) {
+            if (!vault_recovery) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "vault_recovery_older requires vault_recovery=true");
+            }
+            const int value = options["vault_recovery_older"].getInt<int>();
+            if (value < 1 || value > static_cast<int>(CTxIn::SEQUENCE_LOCKTIME_MASK)) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("vault_recovery_older must be between 1 and %u blocks", CTxIn::SEQUENCE_LOCKTIME_MASK));
+            }
+            vault_recovery_older = static_cast<uint32_t>(value);
+        }
+        if (vault_recovery) {
             LOCK(wallet.cs_wallet);
-            ApplyVaultRecoveryToCoinControl(wallet, coinControl);
+            if (auto applied = ApplyVaultRecoveryToCoinControl(wallet, coinControl, vault_recovery_older); !applied) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, util::ErrorString(applied).original);
+            }
+            if (coinControl.m_nSequence && tx.version < 2) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "Relative vault recovery requires transaction version 2 or later");
+            }
+            if (coinControl.m_locktime && tx.nLockTime != 0) {
+                const bool selected_is_height = *coinControl.m_locktime < LOCKTIME_THRESHOLD;
+                const bool provided_is_height = tx.nLockTime < LOCKTIME_THRESHOLD;
+                if (selected_is_height != provided_is_height || tx.nLockTime < *coinControl.m_locktime) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "Explicit transaction locktime conflicts with the selected vault recovery stage");
+                }
+            }
+            if (coinControl.m_nSequence && options.exists("inputs")) {
+                for (const UniValue& input : options["inputs"].getValues()) {
+                    if (input.exists("sequence") && input["sequence"].getInt<uint32_t>() != *coinControl.m_nSequence) {
+                        throw JSONRPCError(RPC_INVALID_PARAMETER, "An explicit input sequence conflicts with the selected vault recovery stage");
+                    }
+                }
+            }
         }
         SetFeeEstimateMode(wallet, coinControl, options["conf_target"], options["estimate_mode"], options["fee_rate"], override_min_fee);
     }
@@ -689,7 +726,11 @@ CreatedTransactionResult FundTransaction(CWallet& wallet, const CMutableTransact
     if (recipients.empty())
         throw JSONRPCError(RPC_INVALID_PARAMETER, "TX must have at least one output");
 
-    auto txr = FundTransaction(wallet, tx, recipients, change_position, lockUnspents, coinControl);
+    CMutableTransaction tx_to_fund{tx};
+    if (vault_recovery && coinControl.m_nSequence) {
+        for (CTxIn& input : tx_to_fund.vin) input.nSequence = *coinControl.m_nSequence;
+    }
+    auto txr = FundTransaction(wallet, tx_to_fund, recipients, change_position, lockUnspents, coinControl);
     if (!txr) {
         throw JSONRPCError(RPC_WALLET_ERROR, ErrorString(txr).original);
     }
@@ -1209,7 +1250,6 @@ RPCMethod send()
                                                           "If that happens, you will need to fund the transaction with different inputs and republish it."},
                     {"minconf", RPCArg::Type::NUM, RPCArg::Default{0}, "If add_inputs is specified, require inputs with at least this many confirmations."},
                     {"maxconf", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "If add_inputs is specified, require inputs with at most this many confirmations."},
-                    {"vault_recovery", RPCArg::Type::BOOL, RPCArg::Default{false}, "Scrooge vault only. Spend the delayed recovery script path (mature UTXOs only). Does not switch paths unless this is set."},
                     {"add_to_wallet", RPCArg::Type::BOOL, RPCArg::Default{true}, "When false, returns a serialized transaction which will not be added to the wallet or broadcast"},
                     {"change_address", RPCArg::Type::STR, RPCArg::DefaultHint{"automatic"}, "The bitcoin address to receive the change"},
                     {"change_position", RPCArg::Type::NUM, RPCArg::DefaultHint{"random"}, "The index of the change output"},
@@ -1356,7 +1396,7 @@ RPCMethod sendall()
                         {"maxconf", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Require inputs with at most this many confirmations."},
                         {"version", RPCArg::Type::NUM, RPCArg::Default{DEFAULT_WALLET_TX_VERSION}, "Transaction version"},
                     },
-                    FundTxDoc()
+                    FundTxDoc(/*solving_data=*/true, /*vault_recovery=*/false)
                 ),
                 RPCArgOptions{.oneline_description="options"}
             },
@@ -1393,6 +1433,9 @@ RPCMethod sendall()
             UniValue options{request.params[4].isNull() ? UniValue::VOBJ : request.params[4]};
             InterpretFeeEstimationInstructions(/*conf_target=*/request.params[1], /*estimate_mode=*/request.params[2], /*fee_rate=*/request.params[3], options);
             PreventOutdatedOptions(options);
+            if (options.exists("vault_recovery") || options.exists("vault_recovery_older")) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "sendall does not support vault recovery options");
+            }
 
 
             std::set<std::string> addresses_without_amount;

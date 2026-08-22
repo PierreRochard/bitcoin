@@ -241,7 +241,7 @@ public:
         LOCK(m_wallet->cs_wallet);
         return m_wallet->DisplayAddress(dest, fingerprint);
     }
-    util::Result<std::vector<std::string>> createMultisigDescriptor(int nrequired, const std::vector<MultisigKey>& keys, OutputType type, std::optional<uint32_t> fallback_older, std::optional<uint32_t> fallback_after) override
+    util::Result<std::vector<std::string>> createMultisigDescriptor(int nrequired, const std::vector<MultisigKey>& keys, OutputType type, std::optional<uint32_t> fallback_older, std::optional<uint32_t> fallback_after, std::optional<uint32_t> fallback_older_one_key) override
     {
         std::vector<wallet::MultisigKeySpec> specs;
         specs.reserve(keys.size());
@@ -255,7 +255,7 @@ public:
             specs.push_back(std::move(spec));
         }
         LOCK(m_wallet->cs_wallet);
-        auto created = wallet::CreateMultisigDescriptor(*m_wallet, nrequired, specs, wallet::MultisigOptions{type, /*account=*/0, {}, fallback_older, fallback_after});
+        auto created = wallet::CreateMultisigDescriptor(*m_wallet, nrequired, specs, wallet::MultisigOptions{type, /*account=*/0, {}, fallback_older, fallback_after, fallback_older_one_key});
         if (!created) return util::Error{util::ErrorString(created)};
         return created->descs;
     }
@@ -534,6 +534,16 @@ public:
         st.awaiting_maturity = br.awaiting;
         st.earliest_blocks_remaining = br.earliest_blocks_remaining;
         st.lost_signers.assign(m_wallet->m_lost_signers.begin(), m_wallet->m_lost_signers.end());
+        for (const auto& stage : br.recovery_stages) {
+            st.recovery_stages.push_back({
+                stage.stage.nrequired,
+                stage.stage.older,
+                stage.stage.after,
+                stage.recoverable_now,
+                stage.awaiting,
+                stage.earliest_blocks_remaining,
+            });
+        }
         return st;
     }
     void setLostSigner(const std::string& fingerprint, bool lost) override {

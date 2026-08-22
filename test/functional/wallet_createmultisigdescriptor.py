@@ -291,6 +291,44 @@ class WalletCreateMultisigDescriptorTest(BitcoinTestFramework):
         raw = sent.get("hex") or wallet.gettransaction(sent["txid"])["hex"]
         witness = self.nodes[0].decoderawtransaction(raw)["vin"][0]["txinwitness"]
         assert_equal(len(witness), 1)
+
+        staged = self._blank("type_bech32m_staged")
+        sx = [staged.addhdkey()["xpub"] for _ in range(3)]
+        skeys = self._keys(sx, path=BIP48_BECH32M)
+        assert_raises_rpc_error(
+            -8, "requires fallback_older",
+            staged.createmultisigdescriptor, 2, skeys,
+            {"type": "bech32m", "fallback_older_one_key": 4},
+        )
+        assert_raises_rpc_error(
+            -8, "must be greater than fallback_older",
+            staged.createmultisigdescriptor, 2, skeys,
+            {"type": "bech32m", "fallback_older": 2, "fallback_older_one_key": 2},
+        )
+        assert_raises_rpc_error(
+            -8, "fallback_older and fallback_after cannot both be set",
+            staged.createmultisigdescriptor, 2, skeys,
+            {"type": "bech32m", "fallback_older": 2, "fallback_after": 10, "fallback_older_one_key": 20},
+        )
+        assert_raises_rpc_error(
+            -8, "requires nrequired of at least 2",
+            staged.createmultisigdescriptor, 1, skeys,
+            {"type": "bech32m", "fallback_older": 2, "fallback_older_one_key": 4},
+        )
+        assert_raises_rpc_error(
+            -8, "between 1 and 65535",
+            staged.createmultisigdescriptor, 2, skeys,
+            {"type": "bech32m", "fallback_older": 65536},
+        )
+        staged_res = staged.createmultisigdescriptor(
+            2, skeys,
+            {"type": "bech32m", "fallback_older": 2, "fallback_older_one_key": 4},
+        )
+        assert_equal(staged_res["fallback_older"], 2)
+        assert_equal(staged_res["fallback_older_one_key"], 4)
+        staged_desc = staged_res["descs"][0]
+        assert "{and_v(v:older(2),multi_a(2," in staged_desc
+        assert "and_v(v:older(4),multi_a(1," in staged_desc
         # Full m-of-n computer-key vault matrix (recovery, split wallets, BIP68)
         # lives in wallet_taproot_vault_local.py.
 

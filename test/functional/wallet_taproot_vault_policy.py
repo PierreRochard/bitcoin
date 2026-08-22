@@ -30,6 +30,7 @@ class WalletTaprootVaultPolicyTest(BitcoinTestFramework):
         self.funding = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
         self.test_journey1_keypath_hides_policy()
         self.test_package_roundtrip()
+        self.test_two_stage_policy_status()
         self.test_restore_core_key()
         self.test_package_errors()
         self.test_getvaultinfo_nonvault_and_unload_lost()
@@ -84,6 +85,74 @@ class WalletTaprootVaultPolicyTest(BitcoinTestFramework):
         dec = node.decoderawtransaction(spent["hex"])
         assert_equal(len(dec["vin"][0]["txinwitness"]), 1)
 
+    def test_two_stage_policy_status(self):
+        self.log.info("Two-stage policy package and per-stage maturity status")
+        node = self.nodes[0]
+        node.createwallet(wallet_name="tiered_policy", blank=True)
+        src = node.get_wallet_rpc("tiered_policy")
+        specs = [{"path": PATH, "hdkey": src.addhdkey()["xpub"]} for _ in range(3)]
+        created = src.createmultisigdescriptor(
+            2,
+            specs,
+            {"type": "bech32m", "fallback_older": 2, "fallback_older_one_key": 4},
+        )
+        # Export must select only the vault pair even when unrelated active
+        # receive/change descriptors exist in the same wallet.
+        src.createmultisigdescriptor(2, specs, {"type": "bech32"})
+        addr = src.getnewaddress("", "bech32m")
+        self.funding.sendtoaddress(addr, 5)
+        self.generate(node, 1)
+
+        info = src.getvaultinfo()
+        assert_equal(info["fallback_older"], 2)
+        assert_equal(info["fallback_older_one_key"], 4)
+        assert_equal(len(info["recovery_stages"]), 2)
+        assert_equal(info["recovery_stages"][0]["nrequired"], 2)
+        assert_equal(info["recovery_stages"][0]["fallback_older"], 2)
+        assert_equal(info["recovery_stages"][1]["nrequired"], 1)
+        assert_equal(info["recovery_stages"][1]["fallback_older"], 4)
+        assert_greater_than(float(info["recovery_stages"][0]["awaiting_maturity"]), 0)
+        assert_greater_than(float(info["recovery_stages"][1]["awaiting_maturity"]), 0)
+
+        package_text = src.exportvaultpolicy()
+        package = json.loads(package_text)
+        assert_equal(package["version"], 1)
+        assert_equal(package["fallback_older_one_key"], 4)
+        assert_equal(len(package["recovery_stages"]), 2)
+        assert_equal(len(package["descs"]), 2)
+        node.createwallet(wallet_name="tiered_policy_watch", blank=True, disable_private_keys=True)
+        watch = node.get_wallet_rpc("tiered_policy_watch")
+        assert_equal(watch.importvaultpolicy(package_text)["policy_id"], created["policy_id"])
+        assert_equal(watch.getnewaddress("", "bech32m"), addr)
+
+        tampered = dict(package)
+        tampered["fallback_older_one_key"] = 5
+        assert_raises_rpc_error(-8, "recovery metadata does not match", watch.importvaultpolicy, json.dumps(tampered))
+        tampered = dict(package)
+        tampered["policy_id"] = "0000000000000000"
+        assert_raises_rpc_error(-8, "policy_id does not match", watch.importvaultpolicy, json.dumps(tampered))
+        node.createwallet(wallet_name="tiered_policy_attacker", blank=True)
+        attacker = node.get_wallet_rpc("tiered_policy_attacker")
+        attacker_specs = [{"path": PATH, "hdkey": attacker.addhdkey()["xpub"]} for _ in range(3)]
+        attacker.createmultisigdescriptor(
+            2,
+            attacker_specs,
+            {"type": "bech32m", "fallback_older": 2, "fallback_older_one_key": 4},
+        )
+        attacker_package = json.loads(attacker.exportvaultpolicy())
+        tampered = dict(package)
+        tampered["descs"] = [package["descs"][0], attacker_package["descs"][1]]
+        assert_raises_rpc_error(-8, "do not form a matching vault pair", watch.importvaultpolicy, json.dumps(tampered))
+
+        self.generate(node, 1)
+        info = src.getvaultinfo()
+        assert_greater_than(float(info["recovery_stages"][0]["recoverable_now"]), 0)
+        assert_greater_than(float(info["recovery_stages"][1]["awaiting_maturity"]), 0)
+        self.generate(node, 2)
+        info = src.getvaultinfo()
+        assert_greater_than(float(info["recovery_stages"][1]["recoverable_now"]), 0)
+        assert_equal(float(info["recovery_stages"][1]["awaiting_maturity"]), 0)
+
     def test_restore_core_key(self):
         self.log.info("Journey 5: restore Core keys via addhdkey xprv; same policy_id, address, and spend")
         node = self.nodes[0]
@@ -116,6 +185,8 @@ class WalletTaprootVaultPolicyTest(BitcoinTestFramework):
         assert_raises_rpc_error(-8, "Unknown vault policy package format", w.importvaultpolicy, '{"format":"other"}')
         assert_raises_rpc_error(-8, "missing descriptors", w.importvaultpolicy, '{"format":"bitcoin-core-vault-policy","descs":[]}')
         assert_raises_rpc_error(-8, "missing descriptors", w.importvaultpolicy, '{"format":"bitcoin-core-vault-policy"}')
+        assert_raises_rpc_error(-8, "Unsupported vault policy package version", w.importvaultpolicy, '{"format":"bitcoin-core-vault-policy","version":2,"descs":["d"]}')
+        assert_raises_rpc_error(-8, "fallback_older is out of range", w.importvaultpolicy, '{"format":"bitcoin-core-vault-policy","fallback_older":-1,"descs":["d"]}')
         assert_raises_rpc_error(-4, None, w.importvaultpolicy, '{"format":"bitcoin-core-vault-policy","descs":["tr(musig(a,b))"]}')
         assert_raises_rpc_error(-8, "fingerprint must be 8 hex", w.setlostsigner, "zz", True)
         assert_raises_rpc_error(-8, "fingerprint must be 8 hex", w.setlostsigner, "aabbccddee", True)
@@ -250,6 +321,20 @@ class WalletTaprootVaultPolicyTest(BitcoinTestFramework):
                                 outputs={dest: 1},
                                 options={"change_type": "bech32m", "fee_rate": 1, "add_to_wallet": False, "vault_recovery": True})
         self.generate(node, 3)
+        assert_raises_rpc_error(
+            -8,
+            "locktime conflicts with the selected vault recovery stage",
+            w.send,
+            outputs={dest: 1},
+            options={"change_type": "bech32m", "fee_rate": 1, "add_to_wallet": False, "vault_recovery": True, "locktime": after_h - 1},
+        )
+        assert_raises_rpc_error(
+            -8,
+            "locktime conflicts with the selected vault recovery stage",
+            w.send,
+            outputs={dest: 1},
+            options={"change_type": "bech32m", "fee_rate": 1, "add_to_wallet": False, "vault_recovery": True, "locktime": 500000000},
+        )
         rec = w.send(
             outputs={dest: 1},
             options={"change_type": "bech32m", "fee_rate": 1, "add_to_wallet": False, "vault_recovery": True},
@@ -350,7 +435,7 @@ class WalletTaprootVaultPolicyTest(BitcoinTestFramework):
         many = w.sendmany("", {dest: 1})
         many_dec = node.decoderawtransaction(w.gettransaction(many)["hex"])
         assert_equal(len(many_dec["vin"][0]["txinwitness"]), 1)
-        assert_raises_rpc_error(-8, "fallback_older must be between 1 and 2^31-1",
+        assert_raises_rpc_error(-8, "fallback_older must be between 1 and 65535",
                                 w.createmultisigdescriptor, 1, specs, {"type": "bech32m", "fallback_older": 0})
         node.createwallet(wallet_name="opt_watch", blank=True, disable_private_keys=True)
         watch = node.get_wallet_rpc("opt_watch")

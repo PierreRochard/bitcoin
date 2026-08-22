@@ -9,6 +9,7 @@
 #include <hash.h>
 #include <key_io.h>
 #include <outputtype.h>
+#include <primitives/transaction.h>
 #include <pubkey.h>
 #include <script/descriptor.h>
 #include <script/script.h>
@@ -25,6 +26,7 @@
 #include <wallet/wallet.h>
 
 #include <algorithm>
+#include <cctype>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -63,10 +65,11 @@ static std::string StripMultipath(const std::string& key)
 std::string WrapSortedMulti(OutputType type, int nrequired, const std::vector<std::string>& keys,
                             std::optional<uint32_t> fallback_older,
                             std::optional<uint32_t> fallback_after,
-                            const std::vector<std::string>& recovery_keys)
+                            const std::vector<std::string>& recovery_keys,
+                            std::optional<uint32_t> fallback_older_one_key)
 {
-    auto sortedmulti = [&](const char* fn, const std::vector<std::string>& inner_keys) {
-        std::string inner = strprintf("%s(%d", fn, nrequired);
+    auto sortedmulti = [&](const char* fn, int threshold, const std::vector<std::string>& inner_keys) {
+        std::string inner = strprintf("%s(%d", fn, threshold);
         for (const auto& key : inner_keys) {
             inner += "," + key;
         }
@@ -74,12 +77,15 @@ std::string WrapSortedMulti(OutputType type, int nrequired, const std::vector<st
         return inner;
     };
     switch (type) {
-    case OutputType::LEGACY: return "sh(" + sortedmulti("sortedmulti", keys) + ")";
-    case OutputType::P2SH_SEGWIT: return "sh(wsh(" + sortedmulti("sortedmulti", keys) + "))";
-    case OutputType::BECH32: return "wsh(" + sortedmulti("sortedmulti", keys) + ")";
+    case OutputType::LEGACY: return "sh(" + sortedmulti("sortedmulti", nrequired, keys) + ")";
+    case OutputType::P2SH_SEGWIT: return "sh(wsh(" + sortedmulti("sortedmulti", nrequired, keys) + "))";
+    case OutputType::BECH32: return "wsh(" + sortedmulti("sortedmulti", nrequired, keys) + ")";
     case OutputType::BECH32M: {
         if (keys.empty()) return {};
         if (fallback_older && fallback_after) return {};
+        if (fallback_older && (*fallback_older == 0 || *fallback_older > CTxIn::SEQUENCE_LOCKTIME_MASK)) return {};
+        if (fallback_older_one_key && (*fallback_older_one_key == 0 || *fallback_older_one_key > CTxIn::SEQUENCE_LOCKTIME_MASK)) return {};
+        if (fallback_older_one_key && (!fallback_older || fallback_after || *fallback_older_one_key <= *fallback_older || nrequired < 2)) return {};
         if (fallback_older || fallback_after) {
             const std::vector<std::string>& rec = recovery_keys.empty() ? keys : recovery_keys;
             if (keys.size() < 2 || rec.empty()) return {};
@@ -93,7 +99,12 @@ std::string WrapSortedMulti(OutputType type, int nrequired, const std::vector<st
             const char* lock = fallback_older ? "older" : "after";
             const uint32_t lock_n = fallback_older ? *fallback_older : *fallback_after;
             // multi_a (not sortedmulti_a) is a miniscript fragment and can sit under older()/after().
-            return strprintf("tr(%s,and_v(v:%s(%u),%s))", musig, lock, lock_n, sortedmulti("multi_a", rec));
+            const std::string primary = strprintf("and_v(v:%s(%u),%s)", lock, lock_n, sortedmulti("multi_a", nrequired, rec));
+            if (fallback_older_one_key) {
+                const std::string one_key = strprintf("and_v(v:older(%u),%s)", *fallback_older_one_key, sortedmulti("multi_a", 1, rec));
+                return strprintf("tr(%s,{%s,%s})", musig, primary, one_key);
+            }
+            return strprintf("tr(%s,%s)", musig, primary);
         }
         if (keys.size() == 1 && nrequired == 1) {
             return "tr(" + keys[0] + ")";
@@ -109,7 +120,7 @@ std::string WrapSortedMulti(OutputType type, int nrequired, const std::vector<st
             return "tr(" + inner + "/<0;1>/*)";
         }
         // m-of-n: unspendable NUMS internal key, BIP 387 sortedmulti_a script path.
-        return strprintf("tr(%s,%s)", HexStr(XOnlyPubKey::NUMS_H), sortedmulti("sortedmulti_a", keys));
+        return strprintf("tr(%s,%s)", HexStr(XOnlyPubKey::NUMS_H), sortedmulti("sortedmulti_a", nrequired, keys));
     }
     case OutputType::UNKNOWN:
         break;
@@ -120,7 +131,8 @@ std::string WrapSortedMulti(OutputType type, int nrequired, const std::vector<st
 bilingual_str ValidateMultisigPolicy(int nrequired, size_t nkeys, OutputType type,
                                      std::optional<uint32_t> fallback_older,
                                      std::optional<uint32_t> fallback_after,
-                                     size_t n_recovery_keys)
+                                     size_t n_recovery_keys,
+                                     std::optional<uint32_t> fallback_older_one_key)
 {
     if (nkeys == 0) {
         return Untranslated("keys must be a non-empty array");
@@ -132,6 +144,26 @@ bilingual_str ValidateMultisigPolicy(int nrequired, size_t nkeys, OutputType typ
     if (fallback_older && fallback_after) {
         return Untranslated("fallback_older and fallback_after cannot both be set");
     }
+    if (fallback_older && (*fallback_older == 0 || *fallback_older > CTxIn::SEQUENCE_LOCKTIME_MASK)) {
+        return Untranslated(strprintf("fallback_older must be between 1 and %u blocks", CTxIn::SEQUENCE_LOCKTIME_MASK));
+    }
+    if (fallback_older_one_key) {
+        if (!fallback_older) {
+            return Untranslated("fallback_older_one_key requires fallback_older");
+        }
+        if (fallback_after) {
+            return Untranslated("fallback_older_one_key cannot be combined with fallback_after");
+        }
+        if (*fallback_older_one_key == 0 || *fallback_older_one_key > CTxIn::SEQUENCE_LOCKTIME_MASK) {
+            return Untranslated(strprintf("fallback_older_one_key must be between 1 and %u blocks", CTxIn::SEQUENCE_LOCKTIME_MASK));
+        }
+        if (*fallback_older_one_key <= *fallback_older) {
+            return Untranslated("fallback_older_one_key must be greater than fallback_older");
+        }
+        if (nrequired < 2) {
+            return Untranslated("fallback_older_one_key requires nrequired of at least 2");
+        }
+    }
     // P2SH redeemScript is capped at MAX_SCRIPT_ELEMENT_SIZE (520): 15 compressed keys.
     static constexpr size_t MAX_PUBKEYS_PER_P2SH_MULTISIG = 15;
     if (type == OutputType::LEGACY && nkeys > MAX_PUBKEYS_PER_P2SH_MULTISIG) {
@@ -142,27 +174,22 @@ bilingual_str ValidateMultisigPolicy(int nrequired, size_t nkeys, OutputType typ
     }
     if (type == OutputType::BECH32M) {
         // Script-path multi_a / Scrooge vault fallback is BIP 342 stack-limited (n+1 ≤ 1000).
-        const bool uses_multi_a = fallback_older.has_value() || fallback_after.has_value() || static_cast<size_t>(nrequired) < rec_n;
+        const bool uses_multi_a = fallback_older.has_value() || fallback_after.has_value() || fallback_older_one_key.has_value() || static_cast<size_t>(nrequired) < rec_n;
         if (uses_multi_a && rec_n > MAX_PUBKEYS_PER_MULTI_A) {
             return Untranslated(strprintf("Taproot script-path multisig supports at most %u keys (BIP 342 stack limit)", MAX_PUBKEYS_PER_MULTI_A));
         }
-        if ((fallback_older || fallback_after) && nkeys < 2) {
+        if ((fallback_older || fallback_after || fallback_older_one_key) && nkeys < 2) {
             return Untranslated("A Scrooge vault key-path needs at least two active keys");
         }
     }
     return {};
 }
 
-static std::optional<uint32_t> ParseMiniscriptUint(const std::string& desc, const char* fn)
+static std::optional<uint32_t> ParseUint(const std::string& value)
 {
-    const std::string needle = std::string(fn) + "(";
-    const auto pos = desc.find(needle);
-    if (pos == std::string::npos) return std::nullopt;
-    const auto start = pos + needle.size();
-    const auto end = desc.find(')', start);
-    if (end == std::string::npos || end == start) return std::nullopt;
+    if (value.empty() || !std::all_of(value.begin(), value.end(), [](unsigned char c) { return std::isdigit(c); })) return std::nullopt;
     try {
-        const unsigned long n = std::stoul(desc.substr(start, end - start));
+        const unsigned long n = std::stoul(value);
         if (n == 0 || n >= (1UL << 31)) return std::nullopt;
         return static_cast<uint32_t>(n);
     } catch (...) {
@@ -170,21 +197,113 @@ static std::optional<uint32_t> ParseMiniscriptUint(const std::string& desc, cons
     }
 }
 
+static std::vector<VaultRecoveryStage> ParseRecoveryStages(const std::string& desc)
+{
+    static constexpr std::string_view OLDER_PREFIX{"and_v(v:older("};
+    static constexpr std::string_view AFTER_PREFIX{"and_v(v:after("};
+    static constexpr std::string_view MULTI_PREFIX{"),multi_a("};
+    std::vector<VaultRecoveryStage> stages;
+    size_t search_pos{0};
+    while (search_pos < desc.size()) {
+        const size_t older_pos = desc.find(OLDER_PREFIX, search_pos);
+        const size_t after_pos = desc.find(AFTER_PREFIX, search_pos);
+        if (older_pos == std::string::npos && after_pos == std::string::npos) break;
+        const bool relative = after_pos == std::string::npos || (older_pos != std::string::npos && older_pos < after_pos);
+        const size_t stage_pos = relative ? older_pos : after_pos;
+        const std::string_view prefix = relative ? OLDER_PREFIX : AFTER_PREFIX;
+        const size_t lock_start = stage_pos + prefix.size();
+        const size_t lock_end = desc.find(')', lock_start);
+        if (lock_end == std::string::npos || desc.compare(lock_end, MULTI_PREFIX.size(), MULTI_PREFIX) != 0) {
+            search_pos = lock_start;
+            continue;
+        }
+        const size_t threshold_start = lock_end + MULTI_PREFIX.size();
+        const size_t threshold_end = desc.find(',', threshold_start);
+        if (threshold_end == std::string::npos) break;
+        const auto lock = ParseUint(desc.substr(lock_start, lock_end - lock_start));
+        const auto threshold = ParseUint(desc.substr(threshold_start, threshold_end - threshold_start));
+        if (lock && threshold && *threshold <= static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+            VaultRecoveryStage stage;
+            stage.nrequired = static_cast<int>(*threshold);
+            if (relative) stage.older = *lock;
+            else stage.after = *lock;
+            stages.push_back(stage);
+        }
+        search_pos = threshold_end + 1;
+    }
+    std::stable_sort(stages.begin(), stages.end(), [](const VaultRecoveryStage& a, const VaultRecoveryStage& b) {
+        if (a.older && b.older) return *a.older < *b.older;
+        if (a.after && b.after) return *a.after < *b.after;
+        return a.older.has_value() && !b.older.has_value();
+    });
+    return stages;
+}
+
+static bool RecoveryStagesEqual(const std::vector<VaultRecoveryStage>& a, const std::vector<VaultRecoveryStage>& b)
+{
+    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](const VaultRecoveryStage& x, const VaultRecoveryStage& y) {
+        return x.nrequired == y.nrequired && x.older == y.older && x.after == y.after;
+    });
+}
+
 InferredVaultPolicy InferVaultPolicy(const std::string& desc)
 {
     InferredVaultPolicy out;
-    out.older = ParseMiniscriptUint(desc, "older");
-    out.after = ParseMiniscriptUint(desc, "after");
-    if (const auto m = ParseMiniscriptUint(desc, "multi_a")) {
-        out.recovery_m = static_cast<int>(*m);
+    if (desc.find("tr(musig(") == std::string::npos) return out;
+    out.recovery_stages = ParseRecoveryStages(desc);
+    if (std::any_of(out.recovery_stages.begin(), out.recovery_stages.end(), [](const VaultRecoveryStage& stage) {
+            return stage.older && *stage.older > CTxIn::SEQUENCE_LOCKTIME_MASK;
+        })) {
+        out.recovery_stages.clear();
+        return out;
     }
-    out.is_vault = desc.find("tr(musig(") != std::string::npos && (out.older || out.after) && out.recovery_m > 0;
+    if (!out.recovery_stages.empty()) {
+        out.older = out.recovery_stages.front().older;
+        out.after = out.recovery_stages.front().after;
+        out.recovery_m = out.recovery_stages.front().nrequired;
+        out.is_vault = true;
+    }
     return out;
+}
+
+static std::optional<std::string> NormalizeDescriptorBranch(const std::string& desc, char expected_branch)
+{
+    std::string normalized = desc.substr(0, desc.find('#'));
+    size_t search_pos{0};
+    while (true) {
+        const size_t wildcard = normalized.find("/*", search_pos);
+        if (wildcard == std::string::npos) break;
+        if (wildcard < 2 || normalized[wildcard - 2] != '/' || normalized[wildcard - 1] != expected_branch) {
+            return std::nullopt;
+        }
+        normalized[wildcard - 1] = '?';
+        search_pos = wildcard + 2;
+    }
+    return normalized;
+}
+
+static bool IsCanonicalDescriptorPair(const std::string& receive, const std::string& change)
+{
+    const auto receive_policy = InferVaultPolicy(receive);
+    const auto change_policy = InferVaultPolicy(change);
+    if (receive_policy.is_vault != change_policy.is_vault ||
+        (receive_policy.is_vault && !RecoveryStagesEqual(receive_policy.recovery_stages, change_policy.recovery_stages))) {
+        return false;
+    }
+    const auto normalized_receive = NormalizeDescriptorBranch(receive, '0');
+    const auto normalized_change = NormalizeDescriptorBranch(change, '1');
+    return normalized_receive && normalized_change && *normalized_receive == *normalized_change;
 }
 
 std::optional<uint32_t> InferTaprootRecoveryDelay(const std::string& desc)
 {
-    return InferVaultPolicy(desc).older;
+    static constexpr std::string_view PREFIX{"older("};
+    const size_t pos = desc.find(PREFIX);
+    if (pos == std::string::npos) return std::nullopt;
+    const size_t start = pos + PREFIX.size();
+    const size_t end = desc.find(')', start);
+    if (end == std::string::npos) return std::nullopt;
+    return ParseUint(desc.substr(start, end - start));
 }
 
 std::string VaultPolicyId(std::string_view desc)
@@ -239,7 +358,8 @@ std::string FormatMultisigTranscript(const std::string& wallet_name,
                                      OutputType type,
                                      const std::vector<std::string>& public_descs,
                                      std::optional<uint32_t> fallback_older,
-                                     std::optional<uint32_t> fallback_after)
+                                     std::optional<uint32_t> fallback_after,
+                                     std::optional<uint32_t> fallback_older_one_key)
 {
     std::ostringstream out;
     out << "# Bitcoin Core multisig wallet\n";
@@ -257,6 +377,11 @@ std::string FormatMultisigTranscript(const std::string& wallet_name,
                 out << "Fallback: " << nrequired << " of " << n_rec
                     << " after " << *fallback_older << (*fallback_older == 1 ? " block" : " blocks")
                     << " (older(), BIP 68, per coin)\n";
+                if (fallback_older_one_key) {
+                    out << "Later fallback: any 1 of " << n_rec
+                        << " after " << *fallback_older_one_key << (*fallback_older_one_key == 1 ? " block" : " blocks")
+                        << " (older(), BIP 68, per coin)\n";
+                }
             } else {
                 out << "Fallback: " << nrequired << " of " << n_rec
                     << " at block height " << GroupedNumber(*fallback_after) << " (after(), CLTV)\n";
@@ -294,6 +419,9 @@ std::string FormatMultisigTranscript(const std::string& wallet_name,
     if (fallback_older || fallback_after) {
         out << "Immediate spends still need every active key. Recovery needs "
             << nrequired << " of the recovery keys after the delay.\n";
+        if (fallback_older_one_key) {
+            out << "After the later delay, any one recovery key can spend.\n";
+        }
     } else {
         out << "Ordinary m-of-n. Immediate spend needs " << nrequired << " of " << keys.size()
             << " keys. There is no delayed recovery path.\n";
@@ -413,10 +541,10 @@ util::Result<MultisigDescriptorResult> CreateMultisigDescriptor(CWallet& wallet,
     }
     const size_t n_recovery_only = static_cast<size_t>(std::count_if(keys.begin(), keys.end(), [](const MultisigKeySpec& k) { return k.recovery_only; }));
     const size_t n_active = keys.size() - n_recovery_only;
-    if (n_recovery_only > 0 && !options.fallback_older && !options.fallback_after) {
+    if (n_recovery_only > 0 && !options.fallback_older && !options.fallback_after && !options.fallback_older_one_key) {
         return util::Error{Untranslated("recovery-only keys require fallback_older or fallback_after")};
     }
-    if (const auto err = ValidateMultisigPolicy(nrequired, n_active, options.type, options.fallback_older, options.fallback_after, keys.size()); !err.empty()) {
+    if (const auto err = ValidateMultisigPolicy(nrequired, n_active, options.type, options.fallback_older, options.fallback_after, keys.size(), options.fallback_older_one_key); !err.empty()) {
         return util::Error{err};
     }
     if (options.type == OutputType::UNKNOWN) {
@@ -438,7 +566,10 @@ util::Result<MultisigDescriptorResult> CreateMultisigDescriptor(CWallet& wallet,
     if (auto r = check_lock(options.fallback_after, "fallback_after"); !r) {
         return util::Error{util::ErrorString(r)};
     }
-    if ((options.fallback_older || options.fallback_after) && n_active < 2) {
+    if (auto r = check_lock(options.fallback_older_one_key, "fallback_older_one_key"); !r) {
+        return util::Error{util::ErrorString(r)};
+    }
+    if ((options.fallback_older || options.fallback_after || options.fallback_older_one_key) && n_active < 2) {
         return util::Error{Untranslated("A Scrooge vault key-path needs at least two active keys")};
     }
 
@@ -454,8 +585,8 @@ util::Result<MultisigDescriptorResult> CreateMultisigDescriptor(CWallet& wallet,
         recovery_exprs.push_back(*expr);
     }
 
-    const std::vector<std::string>& wrap_keys = (options.fallback_older || options.fallback_after) ? active_exprs : recovery_exprs;
-    std::string desc_str = WrapSortedMulti(options.type, nrequired, wrap_keys, options.fallback_older, options.fallback_after, recovery_exprs);
+    const std::vector<std::string>& wrap_keys = (options.fallback_older || options.fallback_after || options.fallback_older_one_key) ? active_exprs : recovery_exprs;
+    std::string desc_str = WrapSortedMulti(options.type, nrequired, wrap_keys, options.fallback_older, options.fallback_after, recovery_exprs, options.fallback_older_one_key);
     if (desc_str.empty()) {
         return util::Error{Untranslated("Unsupported address type")};
     }
@@ -471,9 +602,10 @@ util::Result<MultisigDescriptorResult> CreateMultisigDescriptor(CWallet& wallet,
 
     MultisigDescriptorResult out;
     out.nrequired = nrequired;
-    out.key_exprs = (options.fallback_older || options.fallback_after) ? active_exprs : recovery_exprs;
+    out.key_exprs = (options.fallback_older || options.fallback_after || options.fallback_older_one_key) ? active_exprs : recovery_exprs;
     out.fallback_older = options.fallback_older;
     out.fallback_after = options.fallback_after;
+    out.fallback_older_one_key = options.fallback_older_one_key;
     for (size_t i = 0; i < parsed.size(); ++i) {
         const bool desc_internal = (parsed.size() == 2) ? (i == 1) : options.internal_only.value_or(false);
         if (options.internal_only && parsed.size() == 2 && desc_internal != *options.internal_only) {
@@ -515,12 +647,20 @@ InferredVaultPolicy InferWalletVaultPolicy(const CWallet& wallet)
     return {};
 }
 
+static bool IsVaultRecoveryStageMature(const VaultRecoveryStage& stage, int depth, int tip_height)
+{
+    if (stage.older) return depth >= static_cast<int>(*stage.older);
+    if (stage.after) return tip_height >= static_cast<int>(*stage.after);
+    return true;
+}
+
 bool IsVaultUtxoMature(const InferredVaultPolicy& policy, int depth, int tip_height)
 {
     if (!policy.is_vault) return true;
-    if (policy.older) return depth >= static_cast<int>(*policy.older);
-    if (policy.after) return tip_height >= static_cast<int>(*policy.after);
-    return true;
+    if (policy.recovery_stages.empty()) {
+        return IsVaultRecoveryStageMature({policy.recovery_m, policy.older, policy.after}, depth, tip_height);
+    }
+    return IsVaultRecoveryStageMature(policy.recovery_stages.front(), depth, tip_height);
 }
 
 VaultBalanceBreakdown GetVaultBalanceBreakdown(const CWallet& wallet)
@@ -529,6 +669,11 @@ VaultBalanceBreakdown GetVaultBalanceBreakdown(const CWallet& wallet)
     VaultBalanceBreakdown out;
     out.policy = InferWalletVaultPolicy(wallet);
     out.is_vault = out.policy.is_vault;
+    for (const auto& stage : out.policy.recovery_stages) {
+        VaultBalanceBreakdown::RecoveryStageBalance balance;
+        balance.stage = stage;
+        out.recovery_stages.push_back(std::move(balance));
+    }
     const int tip = wallet.HaveChain() ? wallet.GetLastBlockHeight() : 0;
     const auto coins = AvailableCoins(wallet);
     for (const auto& coin : coins.All()) {
@@ -536,42 +681,64 @@ VaultBalanceBreakdown GetVaultBalanceBreakdown(const CWallet& wallet)
         if (wallet.m_lost_signers.empty()) {
             out.immediate += coin.txout.nValue;
         }
-        if (!out.is_vault) continue;
-        if (IsVaultUtxoMature(out.policy, coin.depth, tip)) {
-            out.recoverable_now += coin.txout.nValue;
-        } else {
-            out.awaiting += coin.txout.nValue;
-            int remaining = 0;
-            if (out.policy.older) {
-                remaining = std::max(0, static_cast<int>(*out.policy.older) - coin.depth);
-            } else if (out.policy.after) {
-                remaining = std::max(0, static_cast<int>(*out.policy.after) - tip);
-            }
-            if (!out.earliest_blocks_remaining || remaining < *out.earliest_blocks_remaining) {
-                out.earliest_blocks_remaining = remaining;
+        for (auto& stage_balance : out.recovery_stages) {
+            if (IsVaultRecoveryStageMature(stage_balance.stage, coin.depth, tip)) {
+                stage_balance.recoverable_now += coin.txout.nValue;
+            } else {
+                stage_balance.awaiting += coin.txout.nValue;
+                int remaining = 0;
+                if (stage_balance.stage.older) {
+                    remaining = std::max(0, static_cast<int>(*stage_balance.stage.older) - coin.depth);
+                } else if (stage_balance.stage.after) {
+                    remaining = std::max(0, static_cast<int>(*stage_balance.stage.after) - tip);
+                }
+                if (!stage_balance.earliest_blocks_remaining || remaining < *stage_balance.earliest_blocks_remaining) {
+                    stage_balance.earliest_blocks_remaining = remaining;
+                }
             }
         }
+    }
+    if (!out.recovery_stages.empty()) {
+        out.recoverable_now = out.recovery_stages.front().recoverable_now;
+        out.awaiting = out.recovery_stages.front().awaiting;
+        out.earliest_blocks_remaining = out.recovery_stages.front().earliest_blocks_remaining;
     }
     return out;
 }
 
-void ApplyVaultRecoveryToCoinControl(const CWallet& wallet, CCoinControl& coin_control)
+util::Result<void> ApplyVaultRecoveryToCoinControl(const CWallet& wallet,
+                                                   CCoinControl& coin_control,
+                                                   std::optional<uint32_t> selected_older)
 {
     AssertLockHeld(wallet.cs_wallet);
     const auto policy = InferWalletVaultPolicy(wallet);
-    if (!policy.is_vault) return;
-    if (policy.older) {
-        coin_control.m_nSequence = *policy.older;
-        coin_control.m_min_depth = static_cast<int>(*policy.older);
+    if (!policy.is_vault || policy.recovery_stages.empty()) {
+        if (selected_older) return util::Error{Untranslated("The wallet does not have the requested relative recovery stage")};
+        return {};
+    }
+    const VaultRecoveryStage* selected = &policy.recovery_stages.front();
+    if (selected_older) {
+        const auto it = std::find_if(policy.recovery_stages.begin(), policy.recovery_stages.end(), [&](const VaultRecoveryStage& stage) {
+            return stage.older == selected_older;
+        });
+        if (it == policy.recovery_stages.end()) {
+            return util::Error{Untranslated(strprintf("The wallet does not have a recovery stage at older(%u)", *selected_older))};
+        }
+        selected = &*it;
+    }
+    if (selected->older) {
+        coin_control.m_nSequence = *selected->older;
+        coin_control.m_min_depth = static_cast<int>(*selected->older);
         coin_control.m_script_path = true;
-    } else if (policy.after) {
-        coin_control.m_locktime = *policy.after;
+    } else if (selected->after) {
+        coin_control.m_locktime = *selected->after;
         coin_control.m_script_path = true;
         const int tip = wallet.HaveChain() ? wallet.GetLastBlockHeight() : 0;
-        if (tip < static_cast<int>(*policy.after)) {
+        if (tip < static_cast<int>(*selected->after)) {
             coin_control.m_min_depth = std::numeric_limits<int>::max();
         }
     }
+    return {};
 }
 
 std::string FormatVaultPolicyPackage(const VaultPolicyPackage& pkg)
@@ -584,6 +751,18 @@ std::string FormatVaultPolicyPackage(const VaultPolicyPackage& pkg)
     obj.pushKV("nrequired", pkg.nrequired);
     if (pkg.fallback_older) obj.pushKV("fallback_older", static_cast<int>(*pkg.fallback_older));
     if (pkg.fallback_after) obj.pushKV("fallback_after", static_cast<int>(*pkg.fallback_after));
+    if (pkg.fallback_older_one_key) obj.pushKV("fallback_older_one_key", static_cast<int>(*pkg.fallback_older_one_key));
+    if (!pkg.recovery_stages.empty()) {
+        UniValue stages(UniValue::VARR);
+        for (const auto& stage : pkg.recovery_stages) {
+            UniValue value(UniValue::VOBJ);
+            value.pushKV("nrequired", stage.nrequired);
+            if (stage.older) value.pushKV("fallback_older", static_cast<int>(*stage.older));
+            if (stage.after) value.pushKV("fallback_after", static_cast<int>(*stage.after));
+            stages.push_back(std::move(value));
+        }
+        obj.pushKV("recovery_stages", std::move(stages));
+    }
     UniValue descs(UniValue::VARR);
     for (const auto& d : pkg.descs) descs.push_back(d);
     obj.pushKV("descs", std::move(descs));
@@ -602,18 +781,109 @@ util::Result<VaultPolicyPackage> ParseVaultPolicyPackage(const std::string& json
         return util::Error{Untranslated("Unknown vault policy package format")};
     }
     if (obj.exists("version")) pkg.version = obj["version"].getInt<int>();
+    if (pkg.version != 1) {
+        return util::Error{Untranslated("Unsupported vault policy package version")};
+    }
     if (obj.exists("policy_id")) pkg.policy_id = obj["policy_id"].get_str();
     if (obj.exists("network")) pkg.network = obj["network"].get_str();
     if (obj.exists("nrequired")) pkg.nrequired = obj["nrequired"].getInt<int>();
-    if (obj.exists("fallback_older")) pkg.fallback_older = static_cast<uint32_t>(obj["fallback_older"].getInt<int>());
-    if (obj.exists("fallback_after")) pkg.fallback_after = static_cast<uint32_t>(obj["fallback_after"].getInt<int>());
+    auto read_lock = [&](const char* name, uint32_t max) -> util::Result<std::optional<uint32_t>> {
+        if (!obj.exists(name)) return std::optional<uint32_t>{};
+        const int64_t value = obj[name].getInt<int64_t>();
+        if (value < 1 || value > max) {
+            return util::Error{Untranslated(strprintf("Vault policy package %s is out of range", name))};
+        }
+        return std::optional<uint32_t>{static_cast<uint32_t>(value)};
+    };
+    auto fallback_older = read_lock("fallback_older", CTxIn::SEQUENCE_LOCKTIME_MASK);
+    if (!fallback_older) return util::Error{util::ErrorString(fallback_older)};
+    pkg.fallback_older = *fallback_older;
+    auto fallback_after = read_lock("fallback_after", std::numeric_limits<int32_t>::max());
+    if (!fallback_after) return util::Error{util::ErrorString(fallback_after)};
+    pkg.fallback_after = *fallback_after;
+    auto fallback_older_one_key = read_lock("fallback_older_one_key", CTxIn::SEQUENCE_LOCKTIME_MASK);
+    if (!fallback_older_one_key) return util::Error{util::ErrorString(fallback_older_one_key)};
+    pkg.fallback_older_one_key = *fallback_older_one_key;
+    if (obj.exists("recovery_stages")) {
+        if (!obj["recovery_stages"].isArray()) {
+            return util::Error{Untranslated("Vault policy package recovery_stages must be an array")};
+        }
+        for (const UniValue& value : obj["recovery_stages"].getValues()) {
+            if (!value.isObject() || !value.exists("nrequired")) {
+                return util::Error{Untranslated("Vault policy package has an invalid recovery stage")};
+            }
+            VaultRecoveryStage stage;
+            stage.nrequired = value["nrequired"].getInt<int>();
+            if (value.exists("fallback_older")) {
+                const int64_t older = value["fallback_older"].getInt<int64_t>();
+                if (older < 1 || older > CTxIn::SEQUENCE_LOCKTIME_MASK) {
+                    return util::Error{Untranslated("Vault policy package has an invalid recovery stage")};
+                }
+                stage.older = static_cast<uint32_t>(older);
+            }
+            if (value.exists("fallback_after")) {
+                const int64_t after = value["fallback_after"].getInt<int64_t>();
+                if (after < 1 || after > std::numeric_limits<int32_t>::max()) {
+                    return util::Error{Untranslated("Vault policy package has an invalid recovery stage")};
+                }
+                stage.after = static_cast<uint32_t>(after);
+            }
+            if (stage.nrequired <= 0 || stage.older.has_value() == stage.after.has_value()) {
+                return util::Error{Untranslated("Vault policy package has an invalid recovery stage")};
+            }
+            pkg.recovery_stages.push_back(stage);
+        }
+    }
     if (!obj.exists("descs") || !obj["descs"].isArray() || obj["descs"].empty()) {
         return util::Error{Untranslated("Vault policy package is missing descriptors")};
     }
     for (const UniValue& d : obj["descs"].getValues()) {
         pkg.descs.push_back(d.get_str());
     }
-    if (pkg.policy_id.empty()) pkg.policy_id = VaultPolicyId(pkg.descs.front());
+    if (pkg.descs.size() > 2) {
+        return util::Error{Untranslated("Vault policy package may contain only a receive descriptor and its matching change descriptor")};
+    }
+    if (pkg.descs.size() == 2 && !IsCanonicalDescriptorPair(pkg.descs[0], pkg.descs[1])) {
+        return util::Error{Untranslated("Vault policy package receive and change descriptors do not form a matching vault pair")};
+    }
+    const std::string inferred_policy_id = VaultPolicyId(pkg.descs.front());
+    if (!pkg.policy_id.empty() && pkg.policy_id != inferred_policy_id) {
+        return util::Error{Untranslated("Vault policy package policy_id does not match its receive descriptor")};
+    }
+    pkg.policy_id = inferred_policy_id;
+
+    const auto descriptor_stages = ParseRecoveryStages(pkg.descs.front());
+    if (std::any_of(descriptor_stages.begin(), descriptor_stages.end(), [](const VaultRecoveryStage& stage) {
+            return stage.older && *stage.older > CTxIn::SEQUENCE_LOCKTIME_MASK;
+        })) {
+        return util::Error{Untranslated("Vault policy package descriptor has an out-of-range relative recovery delay")};
+    }
+    const InferredVaultPolicy inferred = InferVaultPolicy(pkg.descs.front());
+    std::optional<uint32_t> inferred_one_key;
+    for (size_t i = 1; i < inferred.recovery_stages.size(); ++i) {
+        if (inferred.recovery_stages[i].nrequired == 1 && inferred.recovery_stages[i].older) {
+            inferred_one_key = inferred.recovery_stages[i].older;
+            break;
+        }
+    }
+    if (inferred.is_vault) {
+        if ((obj.exists("nrequired") && pkg.nrequired != inferred.recovery_m) ||
+            (obj.exists("fallback_older") && pkg.fallback_older != inferred.older) ||
+            (obj.exists("fallback_after") && pkg.fallback_after != inferred.after) ||
+            (obj.exists("fallback_older_one_key") && pkg.fallback_older_one_key != inferred_one_key) ||
+            (obj.exists("recovery_stages") && !RecoveryStagesEqual(pkg.recovery_stages, inferred.recovery_stages))) {
+            return util::Error{Untranslated("Vault policy package recovery metadata does not match its receive descriptor")};
+        }
+        pkg.nrequired = inferred.recovery_m;
+        pkg.fallback_older = inferred.older;
+        pkg.fallback_after = inferred.after;
+        pkg.fallback_older_one_key = inferred_one_key;
+        pkg.recovery_stages = inferred.recovery_stages;
+    } else {
+        if (pkg.fallback_older || pkg.fallback_after || pkg.fallback_older_one_key || !pkg.recovery_stages.empty()) {
+            return util::Error{Untranslated("Vault policy package recovery metadata does not match its receive descriptor")};
+        }
+    }
     return pkg;
 }
 
@@ -622,29 +892,46 @@ VaultPolicyPackage ExportWalletVaultPolicy(const CWallet& wallet)
     AssertLockHeld(wallet.cs_wallet);
     VaultPolicyPackage pkg;
     pkg.network = Params().GetChainTypeString();
-    const auto policy = InferWalletVaultPolicy(wallet);
-    pkg.nrequired = policy.recovery_m;
-    pkg.fallback_older = policy.older;
-    pkg.fallback_after = policy.after;
-    auto append = [&](bool internal) {
-        for (OutputType type : {OutputType::BECH32M, OutputType::BECH32, OutputType::P2SH_SEGWIT, OutputType::LEGACY}) {
-            auto* man = wallet.GetScriptPubKeyMan(type, internal);
-            auto* desc_man = dynamic_cast<DescriptorScriptPubKeyMan*>(man);
-            if (!desc_man) continue;
-            std::string desc;
-            if (!desc_man->GetDescriptorString(desc, /*priv=*/false)) continue;
-            pkg.descs.push_back(desc);
-        }
+    auto vault_desc = [&](bool internal) -> std::optional<std::string> {
+        auto* man = wallet.GetScriptPubKeyMan(OutputType::BECH32M, internal);
+        auto* desc_man = dynamic_cast<DescriptorScriptPubKeyMan*>(man);
+        if (!desc_man) return std::nullopt;
+        std::string desc;
+        if (!desc_man->GetDescriptorString(desc, /*priv=*/false) || !InferVaultPolicy(desc).is_vault) return std::nullopt;
+        return desc;
     };
-    append(/*internal=*/false);
-    append(/*internal=*/true);
-    if (!pkg.descs.empty()) pkg.policy_id = VaultPolicyId(pkg.descs.front());
+    const auto receive = vault_desc(/*internal=*/false);
+    const auto change = vault_desc(/*internal=*/true);
+    if (receive) {
+        pkg.descs.push_back(*receive);
+        if (change && IsCanonicalDescriptorPair(*receive, *change)) pkg.descs.push_back(*change);
+    } else if (change) {
+        // Version 1 has no explicit descriptor role. Preserve the historical
+        // one-descriptor package for wallets that only have an internal vault.
+        pkg.descs.push_back(*change);
+    }
+    if (!pkg.descs.empty()) {
+        const auto policy = InferVaultPolicy(pkg.descs.front());
+        pkg.nrequired = policy.recovery_m;
+        pkg.fallback_older = policy.older;
+        pkg.fallback_after = policy.after;
+        pkg.recovery_stages = policy.recovery_stages;
+        for (size_t i = 1; i < policy.recovery_stages.size(); ++i) {
+            if (policy.recovery_stages[i].nrequired == 1 && policy.recovery_stages[i].older) {
+                pkg.fallback_older_one_key = policy.recovery_stages[i].older;
+                break;
+            }
+        }
+        pkg.policy_id = VaultPolicyId(pkg.descs.front());
+    }
     return pkg;
 }
 
 util::Result<void> ImportWalletVaultPolicy(CWallet& wallet, const VaultPolicyPackage& pkg)
 {
     AssertLockHeld(wallet.cs_wallet);
+    auto checked = ParseVaultPolicyPackage(FormatVaultPolicyPackage(pkg));
+    if (!checked) return util::Error{util::ErrorString(checked)};
     if (!pkg.network.empty() && pkg.network != Params().GetChainTypeString()) {
         return util::Error{Untranslated(strprintf("Policy package network %s does not match this node (%s)", pkg.network, Params().GetChainTypeString()))};
     }

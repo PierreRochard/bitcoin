@@ -145,7 +145,8 @@ public:
         const std::vector<MultisigKey>& keys,
         OutputType type,
         std::optional<uint32_t> fallback_older = {},
-        std::optional<uint32_t> fallback_after = {}) = 0;
+        std::optional<uint32_t> fallback_after = {},
+        std::optional<uint32_t> fallback_older_one_key = {}) = 0;
 
     //! Lock coin.
     virtual bool lockCoin(const COutPoint& output, bool write_to_db) = 0;
@@ -283,6 +284,14 @@ public:
     virtual std::optional<uint32_t> taprootRecoveryDelay() = 0;
 
     struct VaultStatus {
+        struct VaultRecoveryStage {
+            int nrequired{0};
+            std::optional<uint32_t> older;
+            std::optional<uint32_t> after;
+            CAmount recoverable_now{0};
+            CAmount awaiting_maturity{0};
+            std::optional<int> earliest_blocks_remaining;
+        };
         bool is_vault{false};
         std::optional<uint32_t> older;
         std::optional<uint32_t> after;
@@ -291,6 +300,7 @@ public:
         CAmount awaiting_maturity{0};
         std::optional<int> earliest_blocks_remaining;
         std::vector<std::string> lost_signers;
+        std::vector<VaultRecoveryStage> recovery_stages;
     };
     virtual VaultStatus getVaultStatus() = 0;
     virtual void setLostSigner(const std::string& fingerprint, bool lost) = 0;

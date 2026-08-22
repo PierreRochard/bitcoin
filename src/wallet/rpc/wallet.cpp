@@ -889,6 +889,7 @@ static RPCMethod createmultisigdescriptor()
                     {"internal", RPCArg::Type::BOOL, RPCArg::DefaultHint{"Both receive and change"}, "If set, import only the receive (false) or change (true) branch instead of both."},
                     {"fallback_older", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Bech32m only. Scrooge vault relative delay in blocks (miniscript older()) before an m-of-n script-path spend is valid. Immediate spends still use n-of-n MuSig2 on the key path. nrequired is the delayed threshold. Per-UTXO: a new deposit or change starts a new clock."},
                     {"fallback_after", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Bech32m only. Absolute recovery height (miniscript after()). Mutually exclusive with fallback_older. Funds received after this height may already be recoverable."},
+                    {"fallback_older_one_key", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Bech32m only. Optional later relative stage where any one recovery key can spend. Requires fallback_older, must be greater than it, and cannot be combined with fallback_after."},
                 },
             },
         },
@@ -898,6 +899,7 @@ static RPCMethod createmultisigdescriptor()
                 {RPCResult::Type::NUM, "nrequired", "The threshold (delayed m-of-n when a recovery lock is set; otherwise the immediate threshold)"},
                 {RPCResult::Type::NUM, "fallback_older", /*optional=*/true, "Relative recovery delay in blocks, if set"},
                 {RPCResult::Type::NUM, "fallback_after", /*optional=*/true, "Absolute recovery block height, if set"},
+                {RPCResult::Type::NUM, "fallback_older_one_key", /*optional=*/true, "Later 1-of-n relative recovery delay, if set"},
                 {RPCResult::Type::STR, "policy_id", /*optional=*/true, "Short identifier of the checksummed receive descriptor"},
                 {RPCResult::Type::ARR, "descs", "The public descriptors that were added",
                     {{RPCResult::Type::STR, "", ""}}
@@ -938,8 +940,8 @@ static RPCMethod createmultisigdescriptor()
             std::optional<uint32_t> fallback_older;
             if (options.exists("fallback_older")) {
                 const int v = options["fallback_older"].getInt<int>();
-                if (v < 0) {
-                    throw JSONRPCError(RPC_INVALID_PARAMETER, "fallback_older must be between 1 and 2^31-1 blocks");
+                if (v < 1 || v > static_cast<int>(CTxIn::SEQUENCE_LOCKTIME_MASK)) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("fallback_older must be between 1 and %u blocks", CTxIn::SEQUENCE_LOCKTIME_MASK));
                 }
                 fallback_older = static_cast<uint32_t>(v);
             }
@@ -953,6 +955,14 @@ static RPCMethod createmultisigdescriptor()
             }
             if (fallback_older && fallback_after) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, "fallback_older and fallback_after cannot both be set");
+            }
+            std::optional<uint32_t> fallback_older_one_key;
+            if (options.exists("fallback_older_one_key")) {
+                const int v = options["fallback_older_one_key"].getInt<int>();
+                if (v < 1 || v > static_cast<int>(CTxIn::SEQUENCE_LOCKTIME_MASK)) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("fallback_older_one_key must be between 1 and %u blocks", CTxIn::SEQUENCE_LOCKTIME_MASK));
+                }
+                fallback_older_one_key = static_cast<uint32_t>(v);
             }
 
             std::vector<MultisigKeySpec> specs;
@@ -983,7 +993,7 @@ static RPCMethod createmultisigdescriptor()
                 EnsureWalletIsUnlocked(wallet);
             }
 
-            const auto created = CreateMultisigDescriptor(wallet, nrequired, specs, MultisigOptions{output_type, account, internal_only, fallback_older, fallback_after});
+            const auto created = CreateMultisigDescriptor(wallet, nrequired, specs, MultisigOptions{output_type, account, internal_only, fallback_older, fallback_after, fallback_older_one_key});
             if (!created) {
                 const std::string msg = util::ErrorString(created).original;
                 int code = RPC_WALLET_ERROR;
@@ -995,6 +1005,7 @@ static RPCMethod createmultisigdescriptor()
                     msg.find("address type") != std::string::npos ||
                     msg.find("fallback_older") != std::string::npos ||
                     msg.find("fallback_after") != std::string::npos ||
+                    msg.find("fallback_older_one_key") != std::string::npos ||
                     msg.find("recovery-only") != std::string::npos) {
                     code = RPC_INVALID_PARAMETER;
                 } else if (msg.find("Private key") != std::string::npos ||
@@ -1011,6 +1022,7 @@ static RPCMethod createmultisigdescriptor()
             out.pushKV("nrequired", created->nrequired);
             if (created->fallback_older) out.pushKV("fallback_older", static_cast<int>(*created->fallback_older));
             if (created->fallback_after) out.pushKV("fallback_after", static_cast<int>(*created->fallback_after));
+            if (created->fallback_older_one_key) out.pushKV("fallback_older_one_key", static_cast<int>(*created->fallback_older_one_key));
             if (!created->policy_id.empty()) out.pushKV("policy_id", created->policy_id);
             out.pushKV("descs", std::move(descs));
             return out;
@@ -1032,6 +1044,18 @@ static RPCMethod getvaultinfo()
                 {RPCResult::Type::NUM, "nrequired", /*optional=*/true, "Recovery threshold"},
                 {RPCResult::Type::NUM, "fallback_older", /*optional=*/true, "Relative recovery delay in blocks"},
                 {RPCResult::Type::NUM, "fallback_after", /*optional=*/true, "Absolute recovery height"},
+                {RPCResult::Type::NUM, "fallback_older_one_key", /*optional=*/true, "Later 1-of-n relative recovery delay"},
+                {RPCResult::Type::ARR, "recovery_stages", /*optional=*/true, "Ordered recovery stages",
+                    {
+                        {RPCResult::Type::OBJ, "", "", {
+                            {RPCResult::Type::NUM, "nrequired", "Signatures required for this stage"},
+                            {RPCResult::Type::NUM, "fallback_older", /*optional=*/true, "Relative delay"},
+                            {RPCResult::Type::NUM, "fallback_after", /*optional=*/true, "Absolute height"},
+                            {RPCResult::Type::STR_AMOUNT, "recoverable_now", "Confirmed balance mature for this stage"},
+                            {RPCResult::Type::STR_AMOUNT, "awaiting_maturity", "Confirmed balance waiting for this stage"},
+                            {RPCResult::Type::NUM, "earliest_blocks_remaining", /*optional=*/true, "Blocks until the next UTXO matures for this stage"},
+                        }},
+                    }},
                 {RPCResult::Type::STR_AMOUNT, "spendable_now", "Confirmed balance spendable with every active key (0 if a signer is marked lost)"},
                 {RPCResult::Type::STR_AMOUNT, "recoverable_now", "Confirmed balance whose recovery path is mature"},
                 {RPCResult::Type::STR_AMOUNT, "awaiting_maturity", "Confirmed balance still waiting for the recovery delay"},
@@ -1052,11 +1076,30 @@ static RPCMethod getvaultinfo()
                 out.pushKV("nrequired", br.policy.recovery_m);
                 if (br.policy.older) out.pushKV("fallback_older", static_cast<int>(*br.policy.older));
                 if (br.policy.after) out.pushKV("fallback_after", static_cast<int>(*br.policy.after));
+                for (size_t i = 1; i < br.policy.recovery_stages.size(); ++i) {
+                    const auto& stage = br.policy.recovery_stages[i];
+                    if (stage.nrequired == 1 && stage.older) {
+                        out.pushKV("fallback_older_one_key", static_cast<int>(*stage.older));
+                        break;
+                    }
+                }
             }
             out.pushKV("spendable_now", ValueFromAmount(br.immediate));
             out.pushKV("recoverable_now", ValueFromAmount(br.recoverable_now));
             out.pushKV("awaiting_maturity", ValueFromAmount(br.awaiting));
             if (br.earliest_blocks_remaining) out.pushKV("earliest_blocks_remaining", *br.earliest_blocks_remaining);
+            UniValue stages(UniValue::VARR);
+            for (const auto& stage : br.recovery_stages) {
+                UniValue value(UniValue::VOBJ);
+                value.pushKV("nrequired", stage.stage.nrequired);
+                if (stage.stage.older) value.pushKV("fallback_older", static_cast<int>(*stage.stage.older));
+                if (stage.stage.after) value.pushKV("fallback_after", static_cast<int>(*stage.stage.after));
+                value.pushKV("recoverable_now", ValueFromAmount(stage.recoverable_now));
+                value.pushKV("awaiting_maturity", ValueFromAmount(stage.awaiting));
+                if (stage.earliest_blocks_remaining) value.pushKV("earliest_blocks_remaining", *stage.earliest_blocks_remaining);
+                stages.push_back(std::move(value));
+            }
+            out.pushKV("recovery_stages", std::move(stages));
             UniValue lost(UniValue::VARR);
             for (const auto& fpr : pwallet->m_lost_signers) lost.push_back(fpr);
             out.pushKV("lost_signers", std::move(lost));
