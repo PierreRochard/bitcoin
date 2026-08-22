@@ -28,6 +28,7 @@ namespace Ui {
 
 QT_BEGIN_NAMESPACE
 class QCheckBox;
+class QComboBox;
 class QLabel;
 class QUrl;
 QT_END_NAMESPACE
@@ -76,6 +77,7 @@ private:
     bool fFeeMinimized{true};
     const PlatformStyle *platformStyle;
     QCheckBox* m_vault_recovery{nullptr};
+    QComboBox* m_vault_recovery_stage{nullptr};
     QLabel* m_vault_lost{nullptr};
     bool updateVaultSendState();
 

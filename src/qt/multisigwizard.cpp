@@ -230,7 +230,11 @@ public:
         const int n_active = m_wizard->nActiveKeys();
         if (n >= 2) {
             if (m_wizard->outputType() == OutputType::BECH32M && (m_wizard->fallbackOlder() || m_wizard->fallbackAfter())) {
-                m_policy->setText(tr("Immediate all %1\nRecovery %2 of %3").arg(n_active).arg(m_wizard->nrequired()).arg(n));
+                QString summary = tr("Immediate all %1\nRecovery %2 of %3").arg(n_active).arg(m_wizard->nrequired()).arg(n);
+                if (m_wizard->fallbackOlderOneKey()) {
+                    summary += tr("\nFinal recovery 1 of %1").arg(n);
+                }
+                m_policy->setText(summary);
             } else {
                 m_policy->setText(tr("%1 of %2 keys").arg(m_wizard->nrequired()).arg(n));
             }
@@ -302,8 +306,8 @@ public:
         xpub->setFont(GUIUtil::fixedPitchFont());
         role = new QComboBox;
         role->setObjectName("airgapRoleCombo");
-        role->addItem(tr("Active (and recovery)"), 0);
-        role->addItem(tr("Recovery-only"), 1);
+        role->addItem(tr("Active (eligible for every recovery stage)"), 0);
+        role->addItem(tr("Recovery-only (eligible for every stage)"), 1);
         form->addRow(tr("Label"), label);
         form->addRow(tr("Fingerprint"), fingerprint);
         form->addRow(tr("Path"), path);
@@ -372,6 +376,10 @@ public:
             tr("Recover from one lost key (recommended)"),
             tr("All three active keys spend now. Any two recovery keys can spend after about 90 days (12960 blocks)."),
             MultisigWizard::VaultTemplate::RecoverOneLost, /*checked=*/true);
+        add(QStringLiteral("templateStagedRadio"),
+            tr("Staged recovery (30 / 60 days)"),
+            tr("All active keys spend now. Any two recovery keys can spend after about 30 days; any one recovery key can spend after about 60 days."),
+            MultisigWizard::VaultTemplate::StagedRecovery, false);
         add(QStringLiteral("templateMaximumRadio"),
             tr("Maximum protection"),
             tr("n-of-n MuSig2 only. No delayed recovery path. Losing any key freezes the funds."),
@@ -760,14 +768,18 @@ public:
     QSpinBox* required{nullptr};
     QSpinBox* delay{nullptr};
     QSpinBox* after{nullptr};
+    QSpinBox* final_delay{nullptr};
     QComboBox* delay_kind{nullptr};
+    QCheckBox* staged{nullptr};
     QLabel* delay_label{nullptr};
     QLabel* after_label{nullptr};
+    QLabel* final_delay_label{nullptr};
     QLabel* kind_label{nullptr};
     QLabel* required_label{nullptr};
     QLabel* delay_hint{nullptr};
     QLabel* sentence{nullptr};
     QLabel* headline{nullptr};
+    QLabel* stages_summary{nullptr};
 
     explicit MultisigThresholdPage(MultisigWizard* wizard) : QWizardPage(wizard), m_wizard(wizard)
     {
@@ -802,7 +814,7 @@ public:
         delay = new QSpinBox;
         delay->setObjectName("fallbackOlderSpin");
         delay->setMinimum(0);
-        delay->setMaximum((1 << 30) - 1);
+        delay->setMaximum(0xffff);
         delay->setSpecialValueText(tr("Off"));
         delay->setMinimumWidth(120);
         delay->setSuffix(QStringLiteral(" ") + tr("blocks"));
@@ -817,12 +829,28 @@ public:
         after->setValue(static_cast<int>(MultisigWizard::kDefaultVaultDelay));
         form->addRow(tr("Recovery height"), after);
         after_label = qobject_cast<QLabel*>(form->labelForField(after));
+        staged = new QCheckBox(tr("Add a later one-key recovery stage"));
+        staged->setObjectName("stagedRecoveryCheck");
+        form->addRow(QString(), staged);
+        final_delay = new QSpinBox;
+        final_delay->setObjectName("finalRecoveryOlderSpin");
+        final_delay->setMinimum(2);
+        final_delay->setMaximum(0xffff);
+        final_delay->setMinimumWidth(120);
+        final_delay->setSuffix(QStringLiteral(" ") + tr("blocks"));
+        form->addRow(tr("Any 1 recovery key after"), final_delay);
+        final_delay_label = qobject_cast<QLabel*>(form->labelForField(final_delay));
         layout->addLayout(form);
         layout->addSpacing(6);
         delay_hint = new QLabel;
         delay_hint->setWordWrap(true);
         delay_hint->setStyleSheet(QStringLiteral("QLabel { color: palette(window-text); }"));
         layout->addWidget(delay_hint);
+
+        stages_summary = new QLabel;
+        stages_summary->setObjectName("recoveryStagesSummaryLabel");
+        stages_summary->setWordWrap(true);
+        layout->addWidget(stages_summary);
 
         sentence = new QLabel;
         sentence->setObjectName("policySentence");
@@ -838,11 +866,35 @@ public:
         connect(delay, qOverload<int>(&QSpinBox::valueChanged), this, [this](int v) {
             delay->setSuffix(QStringLiteral(" ") + (v == 1 ? tr("block") : tr("blocks")));
             m_wizard->setFallbackOlder(v > 0 ? std::optional<uint32_t>{static_cast<uint32_t>(v)} : std::nullopt);
+            if (staged->isChecked() && v > 0 && final_delay->value() <= v) {
+                final_delay->setValue(std::min(0xffff, std::max(v + 1, v * 2)));
+            }
             if (delay_kind->currentData().toInt() == 0) {
                 after->blockSignals(true);
                 after->setValue(safeAfterHeight());
                 after->blockSignals(false);
             }
+            updateStageControls();
+            updateSentence();
+            Q_EMIT completeChanged();
+        });
+        connect(staged, &QCheckBox::toggled, this, [this](bool checked) {
+            if (checked) {
+                const int first = std::max(1, delay->value());
+                if (final_delay->value() <= first) {
+                    final_delay->setValue(std::min(0xffff, std::max(first + 1, first * 2)));
+                }
+                m_wizard->setFallbackOlderOneKey(static_cast<uint32_t>(final_delay->value()));
+            } else {
+                m_wizard->setFallbackOlderOneKey(std::nullopt);
+            }
+            updateStageControls();
+            updateSentence();
+            Q_EMIT completeChanged();
+        });
+        connect(final_delay, qOverload<int>(&QSpinBox::valueChanged), this, [this](int v) {
+            final_delay->setSuffix(QStringLiteral(" ") + (v == 1 ? tr("block") : tr("blocks")));
+            if (staged->isChecked()) m_wizard->setFallbackOlderOneKey(static_cast<uint32_t>(v));
             updateSentence();
             Q_EMIT completeChanged();
         });
@@ -887,9 +939,12 @@ public:
         delay_kind->blockSignals(true);
         delay->blockSignals(true);
         after->blockSignals(true);
+        staged->blockSignals(true);
+        final_delay->blockSignals(true);
         if (!taproot) {
             delay->setValue(0);
             m_wizard->setFallbackOlder(std::nullopt);
+            m_wizard->setFallbackOlderOneKey(std::nullopt);
             m_wizard->setFallbackAfter(std::nullopt);
             delay_kind->setCurrentIndex(0);
         } else if (configured_after && *configured_after > 1) {
@@ -903,10 +958,17 @@ public:
             after->setValue(safeAfterHeight());
             m_wizard->setFallbackOlder(cur > 0 ? std::optional<uint32_t>{static_cast<uint32_t>(cur)} : std::nullopt);
         }
+        const auto configured_final = m_wizard->fallbackOlderOneKey();
+        staged->setChecked(configured_final.has_value());
+        final_delay->setValue(static_cast<int>(configured_final.value_or(
+            std::min<uint32_t>(0xffff, std::max<uint32_t>(2, m_wizard->fallbackOlder().value_or(1) * 2)))));
         after->blockSignals(false);
         delay->blockSignals(false);
         delay_kind->blockSignals(false);
+        final_delay->blockSignals(false);
+        staged->blockSignals(false);
         applyDelayKind();
+        updateStageControls();
         updateSentence();
     }
     bool isComplete() const override
@@ -916,7 +978,8 @@ public:
             [](const wallet::MultisigKeySpec& k) { return !k.recovery_only; }));
         return wallet::ValidateMultisigPolicy(m_wizard->nrequired(), n_active,
                                               m_wizard->outputType(), m_wizard->fallbackOlder(),
-                                              m_wizard->fallbackAfter(), m_wizard->keys().size()).empty();
+                                              m_wizard->fallbackAfter(), m_wizard->keys().size(),
+                                              m_wizard->fallbackOlderOneKey()).empty();
     }
     bool validatePage() override
     {
@@ -956,10 +1019,32 @@ private:
         if (!taproot) return;
         if (abs) {
             m_wizard->setFallbackOlder(std::nullopt);
+            m_wizard->setFallbackOlderOneKey(std::nullopt);
             m_wizard->setFallbackAfter(static_cast<uint32_t>(after->value()));
         } else {
             m_wizard->setFallbackAfter(std::nullopt);
             m_wizard->setFallbackOlder(delay->value() > 0 ? std::optional<uint32_t>{static_cast<uint32_t>(delay->value())} : std::nullopt);
+            if (staged->isChecked() && delay->value() > 0) {
+                m_wizard->setFallbackOlderOneKey(static_cast<uint32_t>(final_delay->value()));
+            }
+        }
+        updateStageControls();
+    }
+    void updateStageControls()
+    {
+        const bool relative = m_wizard->outputType() == OutputType::BECH32M &&
+                              delay_kind->currentData().toInt() == 0 && delay->value() > 0;
+        staged->setVisible(relative);
+        staged->setEnabled(relative);
+        const bool show_final = relative && staged->isChecked();
+        final_delay->setVisible(show_final);
+        if (final_delay_label) final_delay_label->setVisible(show_final);
+        stages_summary->setVisible(show_final);
+        if (!relative && staged->isChecked()) {
+            staged->blockSignals(true);
+            staged->setChecked(false);
+            staged->blockSignals(false);
+            m_wizard->setFallbackOlderOneKey(std::nullopt);
         }
     }
     void updateSentence()
@@ -978,11 +1063,28 @@ private:
             headline->setText(tr("Ordinary multisig"));
             sentence->setText(tr("<p>Every spend uses the signature threshold above. There is no delayed recovery path.</p>"));
             delay_hint->clear();
+            stages_summary->clear();
             return;
         }
         headline->setText(tr("All %1 active keys now").arg(n_active));
         QString extra = tr("<p>Changing keys or timing later requires a new wallet and an on-chain transfer.</p>");
-        if (m_wizard->fallbackOlder()) {
+        if (m_wizard->fallbackOlder() && m_wizard->fallbackOlderOneKey()) {
+            extra = tr("<p><b>Immediate:</b> all %1 active keys are required.</p>"
+                       "<p><b>First recovery:</b> after approximately %2 (%3), any %4 of %5 recovery keys can spend.</p>"
+                       "<p><b>Final recovery:</b> after approximately %6 (%7), any 1 of %5 recovery keys can spend.</p>"
+                       "<p>After the final delay, both recovery paths remain available. Each received coin waits separately; spending and change restart both clocks. Recovery never happens automatically.</p>")
+                        .arg(n_active)
+                        .arg(ApproxDuration(*m_wizard->fallbackOlder()))
+                        .arg(BlockCount(*m_wizard->fallbackOlder()))
+                        .arg(m_wizard->nrequired())
+                        .arg(n)
+                        .arg(ApproxDuration(*m_wizard->fallbackOlderOneKey()))
+                        .arg(BlockCount(*m_wizard->fallbackOlderOneKey()));
+            delay_hint->setText(tr("Relative delays are measured from when each coin is received. Calendar dates are estimates."));
+            stages_summary->setText(tr("First: %1 of %2 after %3 blocks. Final: any 1 of %2 after %4 blocks.")
+                                        .arg(m_wizard->nrequired()).arg(n)
+                                        .arg(*m_wizard->fallbackOlder()).arg(*m_wizard->fallbackOlderOneKey()));
+        } else if (m_wizard->fallbackOlder()) {
             extra = tr("<p><b>Immediate:</b> all %1 active keys are required.</p>"
                        "<p><b>Recovery:</b> after approximately %2 (%3), any %4 of %5 recovery keys can spend. You can lose %6 and still recover.</p>"
                        "<p>Each received coin waits separately. Spending and change restart its clock. Recovery never happens automatically.</p>")
@@ -993,6 +1095,7 @@ private:
                         .arg(n)
                         .arg(lose);
             delay_hint->setText(tr("Measured from when each coin is received. 144 blocks ≈ 1 day, 1008 ≈ 1 week, 12960 ≈ 90 days. Calendar dates are estimates."));
+            stages_summary->clear();
         } else if (m_wizard->fallbackAfter()) {
             extra = tr("<p><b>Immediate:</b> all %1 active keys are required.</p>"
                        "<p><b>Recovery:</b> at block height %2, any %3 of %4 recovery keys can spend. Coins received later may already be recoverable.</p>"
@@ -1002,12 +1105,15 @@ private:
                         .arg(m_wizard->nrequired())
                         .arg(n);
             delay_hint->setText(tr("The recovery condition uses a block height, not a calendar date."));
+            stages_summary->clear();
         } else if (m_wizard->nrequired() == n && n >= 2) {
             extra = tr("<p>Every active key must participate. There is no delayed recovery path.</p>");
             delay_hint->setText(tr("Set a recovery delay to make a Scrooge vault: fewer keys can spend after that many blocks."));
+            stages_summary->clear();
         } else {
             extra = tr("<p>This is ordinary Taproot multisig. There is no delayed recovery path.</p>");
             delay_hint->setText(tr("A recovery delay turns this into a Scrooge vault: fewer keys can spend after a delay."));
+            stages_summary->clear();
         }
         sentence->setText(extra);
     }
@@ -1333,11 +1439,19 @@ public:
         QString extra;
         if (vault) {
             if (const auto older = m_wizard->fallbackOlder()) {
-                extra = tr("<p>This is a <b>Scrooge vault</b>. After <b>%1</b> (%2), %3 of %4 can recover without the missing keys.</p>")
-                            .arg(BlockCount(*older))
-                            .arg(ApproxDuration(*older))
-                            .arg(m_wizard->nrequired())
-                            .arg(n);
+                if (const auto final = m_wizard->fallbackOlderOneKey()) {
+                    extra = tr("<p>This is a <b>staged Scrooge vault</b>. After <b>%1</b> (%2), %3 of %4 recovery keys can spend. "
+                               "After <b>%5</b> (%6), any 1 recovery key can spend. Both paths remain available.</p>")
+                                .arg(BlockCount(*older)).arg(ApproxDuration(*older))
+                                .arg(m_wizard->nrequired()).arg(n)
+                                .arg(BlockCount(*final)).arg(ApproxDuration(*final));
+                } else {
+                    extra = tr("<p>This is a <b>Scrooge vault</b>. After <b>%1</b> (%2), %3 of %4 can recover without the missing keys.</p>")
+                                .arg(BlockCount(*older))
+                                .arg(ApproxDuration(*older))
+                                .arg(m_wizard->nrequired())
+                                .arg(n);
+                }
             } else if (const auto after = m_wizard->fallbackAfter()) {
                 extra = tr("<p>This is a <b>Scrooge vault</b>. At block height <b>%1</b>, %2 of %3 can recover. Coins received after that height may already be recoverable.</p>")
                             .arg(FormattedHeight(*after))
@@ -1350,7 +1464,7 @@ public:
         }
         const QString lead = vault
             ? tr("<p>The <b>%1</b> wallet requires <b>all %2 active keys</b> to spend immediately. "
-                 "Recovery is <b>%3 of %4</b> after the delay.</p>")
+                 "First recovery is <b>%3 of %4</b> after its delay.</p>")
                   .arg(m_wizard->walletName().toHtmlEscaped())
                   .arg(n_active)
                   .arg(m_wizard->nrequired())
@@ -1469,6 +1583,7 @@ void MultisigWizard::setOutputType(OutputType type)
     if (type != OutputType::BECH32M) {
         for (auto& key : m_airgapped) key.recovery_only = false;
         m_last_airgap_recovery_only = false;
+        m_fallback_older_one_key.reset();
     }
     refreshSidebar();
 }
@@ -1480,11 +1595,18 @@ void MultisigWizard::setNRequired(int n)
 void MultisigWizard::setFallbackOlder(std::optional<uint32_t> blocks)
 {
     m_fallback_older = blocks;
+    if (!blocks) m_fallback_older_one_key.reset();
+    refreshSidebar();
+}
+void MultisigWizard::setFallbackOlderOneKey(std::optional<uint32_t> blocks)
+{
+    m_fallback_older_one_key = blocks;
     refreshSidebar();
 }
 void MultisigWizard::setFallbackAfter(std::optional<uint32_t> height)
 {
     m_fallback_after = height;
+    if (height) m_fallback_older_one_key.reset();
     refreshSidebar();
 }
 void MultisigWizard::setVaultTemplate(VaultTemplate tmpl) { m_template = tmpl; }
@@ -1505,13 +1627,25 @@ void MultisigWizard::applyTemplate()
         m_type = OutputType::BECH32M;
         m_include_local = true;
         m_fallback_older = kDefaultVaultDelay;
+        m_fallback_older_one_key.reset();
         m_fallback_after.reset();
         m_prefer_n_minus_1 = true;
+        m_last_airgap_recovery_only = false;
+        break;
+    case VaultTemplate::StagedRecovery:
+        m_type = OutputType::BECH32M;
+        m_include_local = true;
+        m_fallback_older = kThirtyDayVaultDelay;
+        m_fallback_older_one_key = kSixtyDayVaultDelay;
+        m_fallback_after.reset();
+        m_prefer_n_minus_1 = false;
+        m_nrequired = 2;
         m_last_airgap_recovery_only = false;
         break;
     case VaultTemplate::Maximum:
         m_type = OutputType::BECH32M;
         m_fallback_older.reset();
+        m_fallback_older_one_key.reset();
         m_fallback_after.reset();
         m_prefer_n_minus_1 = false;
         m_nrequired = std::max(2, static_cast<int>(m_keys.size()));
@@ -1520,6 +1654,7 @@ void MultisigWizard::applyTemplate()
         m_type = OutputType::BECH32M;
         m_include_local = false;
         m_fallback_older = kDefaultVaultDelay;
+        m_fallback_older_one_key.reset();
         m_fallback_after.reset();
         m_prefer_n_minus_1 = true;
         break;
@@ -1528,6 +1663,7 @@ void MultisigWizard::applyTemplate()
         m_last_airgap_recovery_only = true;
         if (!m_airgapped.empty()) m_airgapped.back().recovery_only = true;
         m_fallback_older = kDefaultVaultDelay;
+        m_fallback_older_one_key.reset();
         m_fallback_after.reset();
         m_prefer_n_minus_1 = true;
         break;
@@ -1606,13 +1742,14 @@ QString MultisigWizard::transcript() const
         m_type,
         m_public_descs,
         m_fallback_older,
-        m_fallback_after));
+        m_fallback_after,
+        m_fallback_older_one_key));
 }
 
 bilingual_str MultisigWizard::policyError() const
 {
     const size_t n_active = static_cast<size_t>(std::count_if(m_keys.begin(), m_keys.end(), [](const MultisigKeySpec& k) { return !k.recovery_only; }));
-    return wallet::ValidateMultisigPolicy(m_nrequired, n_active, m_type, m_fallback_older, m_fallback_after, m_keys.size());
+    return wallet::ValidateMultisigPolicy(m_nrequired, n_active, m_type, m_fallback_older, m_fallback_after, m_keys.size(), m_fallback_older_one_key);
 }
 
 bool MultisigWizard::createWallet()
@@ -1699,7 +1836,7 @@ bool MultisigWizard::createWallet()
         }
         WalletModel* const wallet_model = m_wallet_controller->getOrCreateWallet(std::move(*created));
 
-        auto imported = wallet_model->wallet().createMultisigDescriptor(m_nrequired, iface_keys, m_type, m_fallback_older, m_fallback_after);
+        auto imported = wallet_model->wallet().createMultisigDescriptor(m_nrequired, iface_keys, m_type, m_fallback_older, m_fallback_after, m_fallback_older_one_key);
         if (!imported) {
             m_create_error = QString::fromStdString(util::ErrorString(imported).original);
             return false;
@@ -1713,6 +1850,13 @@ bool MultisigWizard::createWallet()
         package.nrequired = m_nrequired;
         package.fallback_older = m_fallback_older;
         package.fallback_after = m_fallback_after;
+        package.fallback_older_one_key = m_fallback_older_one_key;
+        if (m_fallback_older || m_fallback_after) {
+            package.recovery_stages.push_back({m_nrequired, m_fallback_older, m_fallback_after});
+            if (m_fallback_older_one_key) {
+                package.recovery_stages.push_back({1, m_fallback_older_one_key, {}});
+            }
+        }
         package.descs = *imported;
         package.policy_id = wallet::VaultPolicyId(package.descs.front());
         const QString policy_package = QString::fromStdString(wallet::FormatVaultPolicyPackage(package));

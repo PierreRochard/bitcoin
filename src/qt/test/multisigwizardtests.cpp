@@ -174,7 +174,8 @@ int OutputTypeIndex(const QComboBox& combo, OutputType type)
     return -1;
 }
 
-void AssertBackupPage(MultisigWizard& wizard, std::optional<uint32_t> older = {}, std::optional<uint32_t> after = {})
+void AssertBackupPage(MultisigWizard& wizard, std::optional<uint32_t> older = {}, std::optional<uint32_t> after = {},
+                      std::optional<uint32_t> one_key_older = {})
 {
     QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Backup));
     auto* policy = wizard.findChild<QPlainTextEdit*>("policyPackageEdit");
@@ -192,6 +193,7 @@ void AssertBackupPage(MultisigWizard& wizard, std::optional<uint32_t> older = {}
     QCOMPARE(parsed->version, 1);
     QCOMPARE(parsed->fallback_older, older);
     QCOMPARE(parsed->fallback_after, after);
+    QCOMPARE(parsed->fallback_older_one_key, one_key_older);
     QCOMPARE(parsed->descs.size(), size_t{2});
     QCOMPARE(QString::fromStdString(parsed->policy_id), QString::fromStdString(wallet::VaultPolicyId(parsed->descs.front())));
     QCOMPARE(QString::fromStdString(parsed->network), QString::fromStdString(Params().GetChainTypeString()));
@@ -424,6 +426,68 @@ void WalkScroogeToDone(MultisigWizard& wizard, int nrequired, int delay_blocks)
         QVERIFY(done_copy.contains(QStringLiteral("1 block")));
         QVERIFY(!done_copy.contains(QStringLiteral("1 blocks")));
     }
+}
+
+void WalkStagedRecoveryToDone(MultisigWizard& wizard, int first_delay = 4320, int final_delay = 8640)
+{
+    QSignalSpy created_spy(&wizard, &MultisigWizard::created);
+    QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Intro));
+    wizard.next();
+    QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Template));
+    wizard.setVaultTemplate(MultisigWizard::VaultTemplate::StagedRecovery);
+    wizard.applyTemplate();
+    wizard.next();
+    QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Setup));
+    auto* name = wizard.findChild<QLineEdit*>("walletNameEdit");
+    auto* type = wizard.findChild<QComboBox*>("scriptTypeCombo");
+    QVERIFY(name);
+    QVERIFY(type);
+    name->setText(wizard.walletName());
+    type->setCurrentIndex(OutputTypeIndex(*type, OutputType::BECH32M));
+    wizard.next();
+    QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Keys));
+    wizard.next();
+    QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Threshold));
+    auto* required = wizard.findChild<QSpinBox*>("nrequiredSpin");
+    auto* first = wizard.findChild<QSpinBox*>("fallbackOlderSpin");
+    auto* staged = wizard.findChild<QCheckBox*>("stagedRecoveryCheck");
+    auto* final = wizard.findChild<QSpinBox*>("finalRecoveryOlderSpin");
+    auto* summary = wizard.findChild<QLabel*>("recoveryStagesSummaryLabel");
+    QVERIFY(required);
+    QVERIFY(first);
+    QVERIFY(staged);
+    QVERIFY(final);
+    QVERIFY(summary);
+    required->setValue(2);
+    first->setValue(first_delay);
+    staged->setChecked(true);
+    final->setValue(final_delay);
+    QApplication::processEvents();
+    QCOMPARE(wizard.nrequired(), 2);
+    QCOMPARE(*wizard.fallbackOlder(), static_cast<uint32_t>(first_delay));
+    QCOMPARE(*wizard.fallbackOlderOneKey(), static_cast<uint32_t>(final_delay));
+    QVERIFY(summary->text().contains(QString::number(first_delay)));
+    QVERIFY(summary->text().contains(QString::number(final_delay)));
+    QVERIFY(wizard.button(QWizard::NextButton)->isEnabled());
+    wizard.next();
+    AssertBackupPage(wizard, static_cast<uint32_t>(first_delay), {}, static_cast<uint32_t>(final_delay));
+    const auto parsed = wallet::ParseVaultPolicyPackage(
+        wizard.findChild<QPlainTextEdit*>("policyPackageEdit")->toPlainText().toStdString());
+    QVERIFY(parsed);
+    QVERIFY(parsed->descs.front().find("older(" + std::to_string(first_delay) + ")") != std::string::npos);
+    QVERIFY(parsed->descs.front().find("older(" + std::to_string(final_delay) + ")") != std::string::npos);
+    const QString transcript = wizard.findChild<QPlainTextEdit*>("humanTranscriptEdit")->toPlainText();
+    QVERIFY(transcript.contains(QString::number(first_delay)));
+    QVERIFY(transcript.contains(QString::number(final_delay)));
+    wizard.findChild<QCheckBox*>("backupAckCheck")->setChecked(true);
+    wizard.next();
+    CompleteVerification(wizard);
+    wizard.next();
+    QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Done));
+    QCOMPARE(created_spy.count(), 1);
+    const QString done = VisibleText(*wizard.currentPage());
+    QVERIFY(done.contains(QString::number(first_delay)));
+    QVERIFY(done.contains(QString::number(final_delay)));
 }
 
 void WalkTemplateToDone(MultisigWizard& wizard,
@@ -1021,6 +1085,13 @@ void MultisigWizardTests::wizardTemplates()
     QVERIFY(wizard.includeLocalKey());
     QVERIFY(wizard.preferNMinus1());
     QCOMPARE(*wizard.fallbackOlder(), MultisigWizard::kDefaultVaultDelay);
+
+    wizard.setVaultTemplate(MultisigWizard::VaultTemplate::StagedRecovery);
+    wizard.applyTemplate();
+    QVERIFY(wizard.includeLocalKey());
+    QCOMPARE(wizard.nrequired(), 2);
+    QCOMPARE(*wizard.fallbackOlder(), MultisigWizard::kThirtyDayVaultDelay);
+    QCOMPARE(*wizard.fallbackOlderOneKey(), MultisigWizard::kSixtyDayVaultDelay);
 
     wizard.setNRequired(1);
     wizard.setVaultTemplate(MultisigWizard::VaultTemplate::Custom);
@@ -2122,6 +2193,143 @@ void MultisigWizardTests::vaultGuiSend()
         QVERIFY(!absolute_send.getCoinControl()->m_script_path);
         absolute.close();
     }
+}
+
+void MultisigWizardTests::vaultGuiStagedRecovery()
+{
+    TestChain100Setup test;
+    test.mineBlocks(5);
+    auto wallet_loader = interfaces::MakeWalletLoader(*test.m_node.chain, *Assert(test.m_node.args));
+    test.m_node.wallet_loader = wallet_loader.get();
+    m_node.setContext(&test.m_node);
+    gArgs.ForceSetArg("-signer", "internal");
+    gArgs.ForceSetArg("-fallbackfee", "0.0002");
+
+    hwi::MockRegistration mock{hwi::MakeMockMasterFromHex(), ChainType::REGTEST};
+    bilingual_str error;
+    OptionsModel options(m_node);
+    QVERIFY(options.Init(error));
+    ClientModel client(m_node, &options);
+    std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate(QStringLiteral("other")));
+    QVERIFY(style);
+    WalletController controller(client, style.get(), nullptr);
+    QApplication::processEvents();
+
+    MultisigWizard wizard(m_node, &controller);
+    wizard.setWalletName(QStringLiteral("GuiStagedVault"));
+    wizard.setIncludeLocalKey(true);
+    wizard.addHardwareKey(mock.Fingerprint(), "Mock Trezor");
+    wizard.rebuildKeyList();
+    wizard.show();
+    WalkStagedRecoveryToDone(wizard, /*first_delay=*/2, /*final_delay=*/4);
+    WalletModel* model = wizard.createdWallet();
+    QVERIFY(model);
+    auto status = model->wallet().getVaultStatus();
+    QCOMPARE(status.recovery_stages.size(), size_t{2});
+    QCOMPARE(status.recovery_stages[0].nrequired, 2);
+    QCOMPARE(status.recovery_stages[0].older, std::optional<uint32_t>{2});
+    QCOMPARE(status.recovery_stages[1].nrequired, 1);
+    QCOMPARE(status.recovery_stages[1].older, std::optional<uint32_t>{4});
+
+    const auto dest = wizard.firstReceiveAddress();
+    QVERIFY(dest);
+    CMutableTransaction funding = test.CreateValidMempoolTransaction(
+        test.m_coinbase_txns.at(0), /*input_vout=*/0, /*input_height=*/1, test.coinbaseKey,
+        GetScriptForDestination(*dest), 10 * COIN, /*submit=*/false);
+    test.CreateAndProcessBlock({funding}, GetScriptForRawPubKey(test.coinbaseKey.GetPubKey()));
+    test.m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    model->pollBalanceChanged();
+    QApplication::processEvents();
+
+    status = model->wallet().getVaultStatus();
+    QCOMPARE(status.recovery_stages[0].recoverable_now, 0);
+    QCOMPARE(status.recovery_stages[0].earliest_blocks_remaining, std::optional<int>{1});
+    QCOMPARE(status.recovery_stages[1].recoverable_now, 0);
+    QCOMPARE(status.recovery_stages[1].earliest_blocks_remaining, std::optional<int>{3});
+
+    OverviewPage overview(style.get());
+    overview.setClientModel(&client);
+    overview.setWalletModel(model);
+    overview.setBalance(model->wallet().getBalances());
+    QApplication::processEvents();
+    auto* final_rec = overview.findChild<QLabel*>("labelVaultFinalRecoverable");
+    auto* final_rec_text = overview.findChild<QLabel*>("labelVaultFinalRecoverableText");
+    auto* final_wait = overview.findChild<QLabel*>("labelVaultFinalAwaiting");
+    QVERIFY(final_rec);
+    QVERIFY(final_rec_text);
+    QVERIFY(final_wait);
+    QVERIFY(!final_rec->isHidden());
+    QVERIFY(!final_wait->isHidden());
+    QVERIFY(final_rec_text->text().contains(QStringLiteral("1 recovery key")));
+
+    SendCoinsDialog send(style.get());
+    send.setClientModel(&client);
+    send.setModel(model);
+    auto* recovery = send.findChild<QCheckBox*>("vaultRecoveryCheck");
+    auto* stages = send.findChild<QComboBox*>("vaultRecoveryStageCombo");
+    QVERIFY(recovery);
+    QVERIFY(stages);
+    QVERIFY(!recovery->isChecked());
+    QVERIFY(!stages->isHidden());
+    QCOMPARE(stages->count(), 2);
+    QCOMPARE(stages->currentData().toUInt(), 2u);
+    QVERIFY(!stages->isEnabled());
+    recovery->setChecked(true);
+    QApplication::processEvents();
+    QVERIFY(stages->isEnabled());
+    QCOMPARE(*send.getCoinControl()->m_nSequence, 2u);
+    stages->setCurrentIndex(1);
+    QApplication::processEvents();
+    QCOMPARE(*send.getCoinControl()->m_nSequence, 4u);
+    QCOMPARE(send.getCoinControl()->m_min_depth, 4);
+    QVERIFY(send.getCoinControl()->m_script_path);
+
+    stages->setCurrentIndex(0);
+    test.CreateAndProcessBlock({}, GetScriptForRawPubKey(test.coinbaseKey.GetPubKey()));
+    test.m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    model->pollBalanceChanged();
+    status = model->wallet().getVaultStatus();
+    QVERIFY(status.recovery_stages[0].recoverable_now > 0);
+    QCOMPARE(status.recovery_stages[1].recoverable_now, 0);
+    QCOMPARE(stages->currentData().toUInt(), 2u);
+
+    test.CreateAndProcessBlock({}, GetScriptForRawPubKey(test.coinbaseKey.GetPubKey()));
+    test.CreateAndProcessBlock({}, GetScriptForRawPubKey(test.coinbaseKey.GetPubKey()));
+    test.m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    model->pollBalanceChanged();
+    status = model->wallet().getVaultStatus();
+    QVERIFY(status.recovery_stages[0].recoverable_now > 0);
+    QVERIFY(status.recovery_stages[1].recoverable_now > 0);
+    QCOMPARE(stages->currentData().toUInt(), 2u); // Never auto-escalate to one key.
+
+    stages->setCurrentIndex(1);
+    recovery->setChecked(true);
+    QApplication::processEvents();
+    const QString pay = QString::fromStdString(EncodeDestination(PKHash(test.coinbaseKey.GetPubKey())));
+    QString confirmation;
+    const Txid final_id = SendFromDialog(send, pay, 1 * COIN, &confirmation);
+    QVERIFY(confirmation.contains(QStringLiteral("1 recovery key")));
+    QVERIFY(confirmation.contains(QStringLiteral("4 blocks")));
+    QVERIFY(confirmation.contains(QStringLiteral("all relative recovery clocks")));
+    const auto final_tx = model->wallet().getTx(final_id);
+    QVERIFY(final_tx);
+    QCOMPARE(final_tx->vin.size(), size_t{1});
+    QCOMPARE(final_tx->vin[0].nSequence, 4u);
+    const auto& witness = final_tx->vin[0].scriptWitness.stack;
+    QVERIFY(witness.size() >= 4);
+    QCOMPARE(static_cast<int>(std::count_if(witness.begin(), witness.end() - 2,
+                                           [](const auto& item) { return !item.empty(); })), 1);
+    QVERIFY(!recovery->isChecked());
+    QCOMPARE(stages->currentIndex(), 0);
+
+    test.CreateAndProcessBlock({CMutableTransaction{*final_tx}}, GetScriptForRawPubKey(test.coinbaseKey.GetPubKey()));
+    test.m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    model->pollBalanceChanged();
+    status = model->wallet().getVaultStatus();
+    QCOMPARE(status.recovery_stages[0].recoverable_now, 0);
+    QCOMPARE(status.recovery_stages[1].recoverable_now, 0);
+    QVERIFY(status.recovery_stages[0].awaiting_maturity > 0);
+    QVERIFY(status.recovery_stages[1].awaiting_maturity > 0);
 }
 
 void MultisigWizardTests::vaultGuiMissingKey()

@@ -178,6 +178,20 @@ OverviewPage::OverviewPage(const PlatformStyle *platformStyle, QWidget *parent) 
         wait->setObjectName("labelVaultAwaiting");
         wait->setAlignment(Qt::AlignRight | Qt::AlignTrailing | Qt::AlignVCenter);
         wait->setVisible(false);
+        auto* final_rec_text = new QLabel(tr("Final recovery path (same coins):"));
+        final_rec_text->setObjectName("labelVaultFinalRecoverableText");
+        final_rec_text->setVisible(false);
+        auto* final_rec = new QLabel(QStringLiteral("0"));
+        final_rec->setObjectName("labelVaultFinalRecoverable");
+        final_rec->setAlignment(Qt::AlignRight | Qt::AlignTrailing | Qt::AlignVCenter);
+        final_rec->setVisible(false);
+        auto* final_wait_text = new QLabel(tr("Final path not yet mature:"));
+        final_wait_text->setObjectName("labelVaultFinalAwaitingText");
+        final_wait_text->setVisible(false);
+        auto* final_wait = new QLabel(QStringLiteral("0"));
+        final_wait->setObjectName("labelVaultFinalAwaiting");
+        final_wait->setAlignment(Qt::AlignRight | Qt::AlignTrailing | Qt::AlignVCenter);
+        final_wait->setVisible(false);
         auto* note = new QLabel(tr("Recovery is another way to spend the same bitcoin, not extra funds."));
         note->setObjectName("labelVaultPathNote");
         note->setWordWrap(true);
@@ -188,7 +202,11 @@ OverviewPage::OverviewPage(const PlatformStyle *platformStyle, QWidget *parent) 
         grid->addWidget(rec, 6, 1);
         grid->addWidget(wait_text, 7, 0);
         grid->addWidget(wait, 7, 1);
-        grid->addWidget(note, 8, 0, 1, 2);
+        grid->addWidget(final_rec_text, 8, 0);
+        grid->addWidget(final_rec, 8, 1);
+        grid->addWidget(final_wait_text, 9, 0);
+        grid->addWidget(final_wait, 9, 1);
+        grid->addWidget(note, 10, 0, 1, 2);
     }
 }
 
@@ -249,6 +267,10 @@ void OverviewPage::setBalance(const interfaces::WalletBalances& balances)
         auto* wait_text = findChild<QLabel*>("labelVaultAwaitingText");
         auto* note = findChild<QLabel*>("labelVaultPathNote");
         auto* sep = findChild<QFrame*>("labelVaultPathSep");
+        auto* final_rec = findChild<QLabel*>("labelVaultFinalRecoverable");
+        auto* final_rec_text = findChild<QLabel*>("labelVaultFinalRecoverableText");
+        auto* final_wait = findChild<QLabel*>("labelVaultFinalAwaiting");
+        auto* final_wait_text = findChild<QLabel*>("labelVaultFinalAwaitingText");
         const bool show_vault = balances.is_vault;
         rec->setVisible(show_vault);
         if (rec_text) rec_text->setVisible(show_vault);
@@ -273,6 +295,37 @@ void OverviewPage::setBalance(const interfaces::WalletBalances& balances)
                 }
                 wait->setText(awaiting);
             }
+        }
+        const auto status = show_vault ? walletModel->wallet().getVaultStatus() : interfaces::Wallet::VaultStatus{};
+        const bool show_final = show_vault && status.recovery_stages.size() > 1;
+        if (final_rec) final_rec->setVisible(show_final);
+        if (final_rec_text) final_rec_text->setVisible(show_final);
+        if (show_final) {
+            const auto& stage = status.recovery_stages[1];
+            const uint32_t blocks = stage.older.value_or(0);
+            const uint32_t days = std::max<uint32_t>(1, (blocks + 72) / 144);
+            if (final_rec_text) {
+                final_rec_text->setText(stage.nrequired == 1
+                    ? tr("Any 1 recovery key after ~%1 days:").arg(days)
+                    : tr("Any %1 recovery keys after ~%2 days:").arg(stage.nrequired).arg(days));
+            }
+            final_rec->setText(BitcoinUnits::formatWithPrivacy(unit, stage.recoverable_now, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
+            final_rec->setToolTip(tr("The same vault coins under the later, weaker recovery branch. This amount is not additional bitcoin."));
+            const bool show_final_wait = stage.awaiting_maturity != 0;
+            if (final_wait) final_wait->setVisible(show_final_wait);
+            if (final_wait_text) final_wait_text->setVisible(show_final_wait);
+            if (show_final_wait && final_wait) {
+                QString awaiting = BitcoinUnits::formatWithPrivacy(unit, stage.awaiting_maturity, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy);
+                if (stage.earliest_blocks_remaining) {
+                    awaiting += *stage.earliest_blocks_remaining == 1
+                        ? tr(" (earliest: ~1 block)")
+                        : tr(" (earliest: ~%1 blocks)").arg(*stage.earliest_blocks_remaining);
+                }
+                final_wait->setText(awaiting);
+            }
+        } else {
+            if (final_wait) final_wait->setVisible(false);
+            if (final_wait_text) final_wait_text->setVisible(false);
         }
     }
 }
@@ -377,4 +430,6 @@ void OverviewPage::setMonospacedFont(const QFont& f)
     ui->labelTotal->setFont(f);
     if (auto* rec = findChild<QLabel*>("labelVaultRecoverable")) rec->setFont(f);
     if (auto* wait = findChild<QLabel*>("labelVaultAwaiting")) wait->setFont(f);
+    if (auto* rec = findChild<QLabel*>("labelVaultFinalRecoverable")) rec->setFont(f);
+    if (auto* wait = findChild<QLabel*>("labelVaultFinalAwaiting")) wait->setFont(f);
 }

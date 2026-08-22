@@ -51,6 +51,7 @@ public:
 
     enum class VaultTemplate {
         RecoverOneLost,
+        StagedRecovery,
         Maximum,
         HardwareCoordinator,
         Inheritance,
@@ -59,12 +60,16 @@ public:
 
     //! ~90 days at 10-minute blocks. Calendar dates derived from this are estimates.
     static constexpr uint32_t kDefaultVaultDelay{12960};
+    //! Approximate 30/60-day relative-delay stages at 144 blocks per day.
+    static constexpr uint32_t kThirtyDayVaultDelay{4320};
+    static constexpr uint32_t kSixtyDayVaultDelay{8640};
 
     explicit MultisigWizard(interfaces::Node& node, WalletController* wallet_controller, QWidget* parent = nullptr);
 
     QString walletName() const { return m_wallet_name; }
     int nrequired() const { return m_nrequired; }
     std::optional<uint32_t> fallbackOlder() const { return m_fallback_older; }
+    std::optional<uint32_t> fallbackOlderOneKey() const { return m_fallback_older_one_key; }
     std::optional<uint32_t> fallbackAfter() const { return m_fallback_after; }
     VaultTemplate vaultTemplate() const { return m_template; }
     bool preferNMinus1() const { return m_prefer_n_minus_1; }
@@ -79,6 +84,7 @@ public:
     void setOutputType(OutputType type);
     void setNRequired(int n);
     void setFallbackOlder(std::optional<uint32_t> blocks);
+    void setFallbackOlderOneKey(std::optional<uint32_t> blocks);
     void setFallbackAfter(std::optional<uint32_t> height);
     void setVaultTemplate(VaultTemplate tmpl);
     void applyTemplate();
@@ -134,6 +140,7 @@ private:
     std::vector<wallet::MultisigKeySpec> m_keys;
     int m_nrequired{2};
     std::optional<uint32_t> m_fallback_older{kDefaultVaultDelay};
+    std::optional<uint32_t> m_fallback_older_one_key;
     std::optional<uint32_t> m_fallback_after;
     std::vector<std::string> m_public_descs;
     WalletModel* m_wallet_model{nullptr};

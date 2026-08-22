@@ -27,6 +27,7 @@ private Q_SLOTS:
     void createWalletWithController();
     void wizardEdges();
     void vaultGuiSend();
+    void vaultGuiStagedRecovery();
     void vaultGuiMissingKey();
     void vaultGuiAirgapPsbt();
     void vaultGuiHardwareOnly();
