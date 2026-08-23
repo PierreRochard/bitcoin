@@ -9,6 +9,8 @@ via send(), and that NUMS m-of-n is not charged as a key-path.
 """
 
 from test_framework.descriptors import descsum_create
+from test_framework.key import TaggedHash
+from test_framework.messages import ser_string
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
@@ -607,7 +609,163 @@ class WalletTaprootVaultSendTest(BitcoinTestFramework):
         assert_equal(script_sigs(combined_input), expected_script_sigs)
         done = self.nodes[0].finalizepsbt(combined)
         assert done["complete"]
-        assert_equal(len(self._decode_send(watch, done["hex"])["vin"][0]["txinwitness"]), 1)
+        decoded = self._decode_send(watch, done["hex"])
+        assert_equal(decoded["vin"][0]["sequence"], 0xFFFFFFFC)
+        assert_equal(len(decoded["vin"][0]["txinwitness"]), 1)
+        assert_equal(len(decoded["vin"][0]["txinwitness"][0]), 128)
+        assert_equal(self.nodes[0].testmempoolaccept([done["hex"]])[0]["allowed"], True)
+
+        self.log.info("PSBTv2 staged older(2) recovery uses exactly two signers and a five-item script-path witness")
+        recovery_source = watch.getnewaddress("", "bech32m")
+        self._fund(recovery_source)
+        self.generate(self.nodes[0], 1)
+        recovery_utxos = watch.listunspent(1, 9999999, [recovery_source])
+        assert_equal(len(recovery_utxos), 1)
+        recovery_utxo = recovery_utxos[0]
+        assert_greater_than(recovery_utxo["confirmations"], 1)
+        recovery_dest = watch.getnewaddress("", "bech32m")
+        recovery_funded = watch.walletcreatefundedpsbt(
+            [{"txid": recovery_utxo["txid"], "vout": recovery_utxo["vout"]}],
+            [{recovery_dest: recovery_utxo["amount"]}],
+            0,
+            {
+                "add_inputs": False,
+                "change_type": "bech32m",
+                "fee_rate": 1,
+                "replaceable": False,
+                "subtractFeeFromOutputs": [0],
+                "vault_recovery": True,
+                "vault_recovery_older": 2,
+            },
+            True,
+            2,
+            2,
+        )
+        assert_equal(recovery_funded["changepos"], -1)
+        recovery_psbt = recovery_funded["psbt"]
+        recovery_base_input = decoded_input(recovery_psbt)
+        assert_equal(recovery_base_input["previous_txid"], recovery_utxo["txid"])
+        assert_equal(recovery_base_input["previous_vout"], recovery_utxo["vout"])
+        assert_equal(recovery_base_input["sequence"], 2)
+        assert "taproot_script_path_sigs" not in recovery_base_input
+        assert "taproot_key_path_sig" not in recovery_base_input
+        assert "musig2_pubnonces" not in recovery_base_input
+        assert "musig2_partial_sigs" not in recovery_base_input
+
+        recovery_participants = recovery_base_input["musig2_participant_pubkeys"]
+        assert_equal(len(recovery_participants), 1)
+        assert_equal(set(recovery_participants[0]), {"aggregate_pubkey", "participant_pubkeys"})
+        recovery_participant_keys = set(recovery_participants[0]["participant_pubkeys"])
+        assert_equal(len(recovery_participant_keys), 3)
+        recovery_derivations = [item for item in recovery_base_input["taproot_bip32_derivs"] if item["path"] != "m"]
+        recovery_key_by_fingerprint = {item["master_fingerprint"]: item["pubkey"] for item in recovery_derivations}
+        assert_equal(set(recovery_key_by_fingerprint), set(fingerprints))
+        assert_equal(set(recovery_key_by_fingerprint.values()), {key[2:] for key in recovery_participant_keys})
+
+        recovery_scripts = recovery_base_input["taproot_scripts"]
+        assert_equal(len(recovery_scripts), 2)
+        assert all(set(item) == {"script", "leaf_ver", "control_blocks"} for item in recovery_scripts)
+        assert all(item["leaf_ver"] == 0xC0 for item in recovery_scripts)
+        assert all(len(item["control_blocks"]) == 1 for item in recovery_scripts)
+        assert all(len(bytes.fromhex(item["control_blocks"][0])) == 65 for item in recovery_scripts)
+        older2 = [item for item in recovery_scripts if item["script"].startswith("52b2")]
+        older4 = [item for item in recovery_scripts if item["script"].startswith("54b2")]
+        assert_equal(len(older2), 1)
+        assert_equal(len(older4), 1)
+        older2 = older2[0]
+        older4 = older4[0]
+
+        def leaf_hash(item):
+            return TaggedHash(
+                "TapLeaf",
+                bytes([item["leaf_ver"]]) + ser_string(bytes.fromhex(item["script"])),
+            ).hex()
+
+        older2_hash = leaf_hash(older2)
+        older4_hash = leaf_hash(older4)
+        recovery_leaf_hashes = {older2_hash, older4_hash}
+        assert_equal(len(recovery_leaf_hashes), 2)
+        assert all(set(item["leaf_hashes"]) == recovery_leaf_hashes for item in recovery_derivations)
+
+        third_signer_name = signers[2].getwalletinfo()["walletname"]
+        self.nodes[0].unloadwallet(third_signer_name)
+        assert third_signer_name not in self.nodes[0].listwallets()
+
+        recovery_signed_psbts = []
+        recovery_signer_sig_maps = []
+        for signer, fingerprint in zip(signers[:2], fingerprints[:2]):
+            result = signer.walletprocesspsbt(psbt=recovery_psbt, finalize=False)
+            assert_equal(result["complete"], False)
+            assert "hex" not in result
+            result_input = decoded_input(result["psbt"])
+            assert_equal(result_input["sequence"], 2)
+            assert_equal(result_input["musig2_participant_pubkeys"], recovery_participants)
+            assert "taproot_key_path_sig" not in result_input
+            assert "musig2_pubnonces" not in result_input
+            assert "musig2_partial_sigs" not in result_input
+            signer_sig_map = script_sigs(result_input)
+            assert_equal(
+                set(signer_sig_map),
+                {(recovery_key_by_fingerprint[fingerprint], leaf) for leaf in recovery_leaf_hashes},
+            )
+            recovery_signed_psbts.append(result["psbt"])
+            recovery_signer_sig_maps.append(signer_sig_map)
+
+        expected_recovery_sigs = {}
+        for signer_sig_map in recovery_signer_sig_maps:
+            for pair, signature in signer_sig_map.items():
+                assert pair not in expected_recovery_sigs
+                expected_recovery_sigs[pair] = signature
+        expected_recovery_pairs = {
+            (recovery_key_by_fingerprint[fingerprint], leaf)
+            for fingerprint in fingerprints[:2]
+            for leaf in recovery_leaf_hashes
+        }
+        assert_equal(set(expected_recovery_sigs), expected_recovery_pairs)
+        assert_equal(
+            expected_recovery_pairs & {
+                (recovery_key_by_fingerprint[fingerprints[2]], leaf)
+                for leaf in recovery_leaf_hashes
+            },
+            set(),
+        )
+
+        recovery_combined = self.nodes[0].combinepsbt(recovery_signed_psbts)
+        recovery_combined_input = decoded_input(recovery_combined)
+        assert_equal(recovery_combined_input["sequence"], 2)
+        assert_equal(recovery_combined_input["musig2_participant_pubkeys"], recovery_participants)
+        assert "taproot_key_path_sig" not in recovery_combined_input
+        assert "musig2_pubnonces" not in recovery_combined_input
+        assert "musig2_partial_sigs" not in recovery_combined_input
+        assert_equal(script_sigs(recovery_combined_input), expected_recovery_sigs)
+
+        expected_recovery_witness = [
+            "",
+            expected_recovery_sigs[(recovery_key_by_fingerprint[fingerprints[1]], older2_hash)],
+            expected_recovery_sigs[(recovery_key_by_fingerprint[fingerprints[0]], older2_hash)],
+            older2["script"],
+            older2["control_blocks"][0],
+        ]
+        assert_equal(len(expected_recovery_witness), 5)
+        assert_equal(expected_recovery_witness[0], "")
+        assert all(len(bytes.fromhex(item)) == 64 for item in expected_recovery_witness[1:3])
+
+        recovery_final = self.nodes[0].finalizepsbt(recovery_combined, False)
+        assert recovery_final["complete"]
+        recovery_final_input = decoded_input(recovery_final["psbt"])
+        assert_equal(recovery_final_input["final_scriptwitness"], expected_recovery_witness)
+        assert "final_scriptSig" not in recovery_final_input
+        assert "taproot_key_path_sig" not in recovery_final_input
+        assert "musig2_pubnonces" not in recovery_final_input
+        assert "musig2_partial_sigs" not in recovery_final_input
+        recovery_extracted = self.nodes[0].finalizepsbt(recovery_final["psbt"], True)
+        assert recovery_extracted["complete"]
+        recovery_decoded = self.nodes[0].decoderawtransaction(recovery_extracted["hex"])
+        assert_equal(recovery_decoded["vin"][0]["sequence"], 2)
+        assert_equal(recovery_decoded["vin"][0]["txinwitness"], expected_recovery_witness)
+        assert_equal(recovery_decoded["vout"][0]["scriptPubKey"]["address"], recovery_dest)
+        assert_equal(self.nodes[0].testmempoolaccept([recovery_extracted["hex"]])[0]["allowed"], True)
+
 
     def test_older_2_reorg_evicts_recovery(self):
         self.log.info("older(2) recovery is BIP68-invalid after reorg drops the second confirmation")
