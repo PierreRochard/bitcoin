@@ -766,6 +766,141 @@ class WalletTaprootVaultSendTest(BitcoinTestFramework):
         assert_equal(recovery_decoded["vout"][0]["scriptPubKey"]["address"], recovery_dest)
         assert_equal(self.nodes[0].testmempoolaccept([recovery_extracted["hex"]])[0]["allowed"], True)
 
+        self.log.info("Final older(4) stage requires explicit selection and lets only signer three recover")
+        self.generate(self.nodes[0], 2)
+        recovery_utxos = watch.listunspent(1, 9999999, [recovery_source])
+        assert_equal(len(recovery_utxos), 1)
+        final_utxo = recovery_utxos[0]
+        assert_greater_than(final_utxo["confirmations"], 3)
+        first_two_names = [signer.getwalletinfo()["walletname"] for signer in signers[:2]]
+        for signer_name in first_two_names:
+            self.nodes[0].unloadwallet(signer_name)
+        assert not set(first_two_names) & set(self.nodes[0].listwallets())
+        self.nodes[0].loadwallet(third_signer_name)
+        signer_three = self.nodes[0].get_wallet_rpc(third_signer_name)
+        assert_equal(set(first_two_names) & set(self.nodes[0].listwallets()), set())
+        assert third_signer_name in self.nodes[0].listwallets()
+        final_dest = self.def_wallet.getnewaddress("", "bech32")
+
+        def recovery_stage_psbt(older=None):
+            options = {
+                "add_inputs": False,
+                "change_type": "bech32m",
+                "fee_rate": 1,
+                "replaceable": False,
+                "subtractFeeFromOutputs": [0],
+                "vault_recovery": True,
+            }
+            if older is not None:
+                options["vault_recovery_older"] = older
+            funded = watch.walletcreatefundedpsbt(
+                [{"txid": final_utxo["txid"], "vout": final_utxo["vout"]}],
+                [{final_dest: final_utxo["amount"]}],
+                0,
+                options,
+                True,
+                2,
+                2,
+            )
+            assert_equal(funded["changepos"], -1)
+            return funded["psbt"]
+
+        default_stage = recovery_stage_psbt()
+        default_stage_decoded = self.nodes[0].decodepsbt(default_stage)
+        assert_equal(default_stage_decoded["psbt_version"], 2)
+        assert_equal(default_stage_decoded["tx_version"], 2)
+        assert_equal(default_stage_decoded["fallback_locktime"], 0)
+        assert_equal(default_stage_decoded["input_count"], 1)
+        assert_equal(default_stage_decoded["output_count"], 1)
+        default_input = decoded_input(default_stage)
+        assert_equal(default_input["sequence"], 2)
+        assert_equal(default_input["musig2_participant_pubkeys"], recovery_participants)
+        assert "taproot_script_path_sigs" not in default_input
+        assert "taproot_key_path_sig" not in default_input
+        assert "musig2_pubnonces" not in default_input
+        assert "musig2_partial_sigs" not in default_input
+        default_signed = signer_three.walletprocesspsbt(psbt=default_stage, finalize=False)
+        assert_equal(default_signed["complete"], False)
+        assert "hex" not in default_signed
+        default_signed_input = decoded_input(default_signed["psbt"])
+        assert_equal(default_signed_input["sequence"], 2)
+        assert_equal(default_signed_input["musig2_participant_pubkeys"], recovery_participants)
+        assert "taproot_key_path_sig" not in default_signed_input
+        assert "musig2_pubnonces" not in default_signed_input
+        assert "musig2_partial_sigs" not in default_signed_input
+        signer_three_default_sigs = script_sigs(default_signed_input)
+        assert_equal(
+            set(signer_three_default_sigs),
+            {(recovery_key_by_fingerprint[fingerprints[2]], leaf) for leaf in recovery_leaf_hashes},
+        )
+        default_finalized = self.nodes[0].finalizepsbt(default_signed["psbt"], False)
+        assert_equal(default_finalized["complete"], False)
+        assert "hex" not in default_finalized
+        default_after_input = decoded_input(default_finalized["psbt"])
+        assert_equal(default_after_input["sequence"], 2)
+        assert_equal(default_after_input["musig2_participant_pubkeys"], recovery_participants)
+        assert "final_scriptwitness" not in default_after_input
+        assert "final_scriptSig" not in default_after_input
+        assert "taproot_key_path_sig" not in default_after_input
+        assert "musig2_pubnonces" not in default_after_input
+        assert "musig2_partial_sigs" not in default_after_input
+        assert_equal(script_sigs(default_after_input), signer_three_default_sigs)
+
+        final_stage = recovery_stage_psbt(4)
+        final_stage_decoded = self.nodes[0].decodepsbt(final_stage)
+        assert_equal(final_stage_decoded["psbt_version"], 2)
+        assert_equal(final_stage_decoded["tx_version"], 2)
+        assert_equal(final_stage_decoded["fallback_locktime"], 0)
+        assert_equal(final_stage_decoded["input_count"], 1)
+        assert_equal(final_stage_decoded["output_count"], 1)
+        final_stage_input = decoded_input(final_stage)
+        assert_equal(final_stage_input["sequence"], 4)
+        assert_equal(final_stage_input["musig2_participant_pubkeys"], recovery_participants)
+        assert "taproot_script_path_sigs" not in final_stage_input
+        assert "taproot_key_path_sig" not in final_stage_input
+        assert "musig2_pubnonces" not in final_stage_input
+        assert "musig2_partial_sigs" not in final_stage_input
+        final_signed = signer_three.walletprocesspsbt(psbt=final_stage, finalize=False)
+        assert_equal(final_signed["complete"], False)
+        assert "hex" not in final_signed
+        final_signed_input = decoded_input(final_signed["psbt"])
+        assert_equal(final_signed_input["sequence"], 4)
+        assert_equal(final_signed_input["musig2_participant_pubkeys"], recovery_participants)
+        assert "taproot_key_path_sig" not in final_signed_input
+        assert "musig2_pubnonces" not in final_signed_input
+        assert "musig2_partial_sigs" not in final_signed_input
+        signer_three_final_sigs = script_sigs(final_signed_input)
+        assert_equal(
+            set(signer_three_final_sigs),
+            {(recovery_key_by_fingerprint[fingerprints[2]], leaf) for leaf in recovery_leaf_hashes},
+        )
+        assert set(signer_three_final_sigs.values()).isdisjoint(signer_three_default_sigs.values())
+
+        expected_final_witness = [
+            signer_three_final_sigs[(recovery_key_by_fingerprint[fingerprints[2]], older4_hash)],
+            "",
+            "",
+            older4["script"],
+            older4["control_blocks"][0],
+        ]
+        assert_equal(len(expected_final_witness), 5)
+        assert_equal(len(bytes.fromhex(expected_final_witness[0])), 64)
+        assert_equal(expected_final_witness[1:3], ["", ""])
+        final_finalized = self.nodes[0].finalizepsbt(final_signed["psbt"], False)
+        assert final_finalized["complete"]
+        final_finalized_input = decoded_input(final_finalized["psbt"])
+        assert_equal(final_finalized_input["final_scriptwitness"], expected_final_witness)
+        assert "final_scriptSig" not in final_finalized_input
+        assert "taproot_key_path_sig" not in final_finalized_input
+        assert "musig2_pubnonces" not in final_finalized_input
+        assert "musig2_partial_sigs" not in final_finalized_input
+        final_extracted = self.nodes[0].finalizepsbt(final_finalized["psbt"], True)
+        assert final_extracted["complete"]
+        final_decoded = self.nodes[0].decoderawtransaction(final_extracted["hex"])
+        assert_equal(final_decoded["vin"][0]["sequence"], 4)
+        assert_equal(final_decoded["vin"][0]["txinwitness"], expected_final_witness)
+        assert_equal(final_decoded["vout"][0]["scriptPubKey"]["address"], final_dest)
+        assert_equal(self.nodes[0].testmempoolaccept([final_extracted["hex"]])[0]["allowed"], True)
 
     def test_older_2_reorg_evicts_recovery(self):
         self.log.info("older(2) recovery is BIP68-invalid after reorg drops the second confirmation")
