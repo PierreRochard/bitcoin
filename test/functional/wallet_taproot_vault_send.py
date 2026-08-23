@@ -425,17 +425,19 @@ class WalletTaprootVaultSendTest(BitcoinTestFramework):
         assert_equal(len(self._decode_send(rest, sent)["vin"][0]["txinwitness"]), 1)
 
     def test_airgapped_psbt_roundtrip(self):
-        self.log.info("xpub-only watch wallet: two offline signers complete a vault key-path PSBT")
+        self.log.info("xpub-only watch wallet: three offline signers retain two-leaf signatures while completing the key path")
         keys = []
+        fingerprints = []
         signers = []
-        for i in range(2):
+        for i in range(3):
             s = self._blank(f"air_sign_{self.n}_{i}")
             xpub = s.addhdkey()["xpub"]
             info = s.derivehdkey(PATH, {"private": True, "hdkey": xpub})
             keys.append((info["origin"] + info["xprv"], info["origin"] + info["xpub"]))
+            fingerprints.append(info["origin"][1:9])
             signers.append(s)
         self.n += 1
-        pat = self._vault_pat(2, 2, 1)
+        pat = self._vault_pat(2, 3, 2, 4)
         watch = self._blank(f"air_watch_{self.n}", disable_private_keys=True)
         self.n += 1
         pub = self._subst(pat, keys, priv_mask=set())
@@ -446,13 +448,163 @@ class WalletTaprootVaultSendTest(BitcoinTestFramework):
         addr = watch.getnewaddress("", "bech32m")
         assert_equal(addr, signers[0].getnewaddress("", "bech32m"))
         self._fund(addr)
+        utxo = watch.listunspent()[0]
         dest = self.def_wallet.getnewaddress()
-        psbt = watch.walletcreatefundedpsbt([], [{dest: 1}], 0, {"change_type": "bech32m", "replaceable": True, "fee_rate": 1})["psbt"]
+        psbt = watch.walletcreatefundedpsbt(
+            [{"txid": utxo["txid"], "vout": utxo["vout"], "sequence": 0xFFFFFFFC}],
+            [{dest: 1}],
+            0,
+            {"add_inputs": False, "change_type": "bech32m", "replaceable": True, "fee_rate": 1},
+            True,
+            2,
+            2,
+        )["psbt"]
         unsigned = watch.walletprocesspsbt(psbt=psbt, finalize=False)
         assert_equal(unsigned["complete"], False)
-        nonces = self.nodes[0].combinepsbt([s.walletprocesspsbt(psbt=psbt, finalize=False)["psbt"] for s in signers])
-        partials = [s.walletprocesspsbt(psbt=nonces, finalize=False)["psbt"] for s in signers]
+
+        def decoded_input(candidate):
+            return self.nodes[0].decodepsbt(candidate)["inputs"][0]
+
+        def assert_hex_size(value, size):
+            assert_equal(len(bytes.fromhex(value)), size)
+
+        def script_sigs(candidate_input):
+            entries = candidate_input.get("taproot_script_path_sigs", [])
+            assert all(set(entry) == {"pubkey", "leaf_hash", "sig"} for entry in entries)
+            for entry in entries:
+                assert_hex_size(entry["pubkey"], 32)
+                assert_hex_size(entry["leaf_hash"], 32)
+                assert_hex_size(entry["sig"], 64)
+            pairs = [(entry["pubkey"], entry["leaf_hash"]) for entry in entries]
+            assert_equal(len(pairs), len(set(pairs)))
+            return {(entry["pubkey"], entry["leaf_hash"]): entry["sig"] for entry in entries}
+
+        def musig_material(candidate_input, signing_key):
+            nonce_entries = candidate_input.get("musig2_pubnonces", [])
+            partial_entries = candidate_input.get("musig2_partial_sigs", [])
+            assert all(set(entry) == {"participant_pubkey", "aggregate_pubkey", "pubnonce"} for entry in nonce_entries)
+            assert all(set(entry) == {"participant_pubkey", "aggregate_pubkey", "partial_sig"} for entry in partial_entries)
+            for entry in nonce_entries:
+                assert_equal(entry["aggregate_pubkey"], signing_key)
+                assert_hex_size(entry["participant_pubkey"], 33)
+                assert_hex_size(entry["pubnonce"], 66)
+            for entry in partial_entries:
+                assert_equal(entry["aggregate_pubkey"], signing_key)
+                assert_hex_size(entry["participant_pubkey"], 33)
+                assert_hex_size(entry["partial_sig"], 32)
+            nonce_map = {entry["participant_pubkey"]: entry["pubnonce"] for entry in nonce_entries}
+            partial_map = {entry["participant_pubkey"]: entry["partial_sig"] for entry in partial_entries}
+            assert_equal(len(nonce_map), len(nonce_entries))
+            assert_equal(len(set(nonce_map.values())), len(nonce_map))
+            assert_equal(len(partial_map), len(partial_entries))
+            return nonce_map, partial_map
+
+        base_input = decoded_input(psbt)
+        assert_equal(base_input["sequence"], 0xFFFFFFFC)
+        assert "taproot_script_path_sigs" not in base_input
+        assert "taproot_key_path_sig" not in base_input
+        participants = base_input["musig2_participant_pubkeys"]
+        assert_equal(len(participants), 1)
+        participant_keys = set(participants[0]["participant_pubkeys"])
+        assert_equal(len(participant_keys), 3)
+        participant_xonly = {key[2:] for key in participant_keys}
+        derivations = [item for item in base_input["taproot_bip32_derivs"] if item["path"] != "m"]
+        key_by_fingerprint = {item["master_fingerprint"]: item["pubkey"] for item in derivations}
+        assert_equal(set(key_by_fingerprint), set(fingerprints))
+        assert_equal(set(key_by_fingerprint.values()), participant_xonly)
+        leaf_hash_sets = {frozenset(item["leaf_hashes"]) for item in derivations}
+        assert_equal(len(leaf_hash_sets), 1)
+        leaf_hashes = set(next(iter(leaf_hash_sets)))
+        assert_equal(len(leaf_hashes), 2)
+        expected_script_pairs = {
+            (pubkey, leaf_hash)
+            for pubkey in participant_xonly
+            for leaf_hash in leaf_hashes
+        }
+        control_block_parities = {
+            int(item["control_blocks"][0][:2], 16) & 1
+            for item in base_input["taproot_scripts"]
+        }
+        assert_equal(len(control_block_parities), 1)
+        output_key_prefix = "03" if next(iter(control_block_parities)) else "02"
+        signing_key = output_key_prefix + base_input["witness_utxo"]["scriptPubKey"]["hex"][4:]
+        assert_equal(musig_material(base_input, signing_key), ({}, {}))
+
+        nonce_psbts = []
+        nonce_maps = []
+        nonce_script_sig_maps = []
+        for signer, fingerprint in zip(signers, fingerprints):
+            result = signer.walletprocesspsbt(psbt=psbt, finalize=False)
+            assert_equal(result["complete"], False)
+            result_input = decoded_input(result["psbt"])
+            assert "taproot_key_path_sig" not in result_input
+            signer_nonces, signer_partials = musig_material(result_input, signing_key)
+            assert_equal(signer_partials, {})
+            assert_equal(len(signer_nonces), 1)
+            nonce_signer = next(iter(signer_nonces))
+            assert_equal(nonce_signer[2:], key_by_fingerprint[fingerprint])
+            signer_script_sigs = script_sigs(result_input)
+            assert_equal(
+                set(signer_script_sigs),
+                {(key_by_fingerprint[fingerprint], leaf_hash) for leaf_hash in leaf_hashes},
+            )
+            nonce_maps.append(signer_nonces)
+            nonce_script_sig_maps.append(signer_script_sigs)
+            nonce_psbts.append(result["psbt"])
+
+        expected_nonces = {}
+        for signer_nonces in nonce_maps:
+            for participant, public_nonce in signer_nonces.items():
+                assert participant not in expected_nonces
+                assert public_nonce not in expected_nonces.values()
+                expected_nonces[participant] = public_nonce
+        assert_equal(set(expected_nonces), participant_keys)
+
+        expected_script_sigs = {}
+        for signer_script_sigs in nonce_script_sig_maps:
+            for pair, signature in signer_script_sigs.items():
+                assert pair not in expected_script_sigs
+                expected_script_sigs[pair] = signature
+        assert_equal(set(expected_script_sigs), expected_script_pairs)
+
+        nonces = self.nodes[0].combinepsbt(nonce_psbts)
+        nonces_input = decoded_input(nonces)
+        assert "taproot_key_path_sig" not in nonces_input
+        combined_nonces, combined_nonce_partials = musig_material(nonces_input, signing_key)
+        assert_equal(combined_nonces, expected_nonces)
+        assert_equal(combined_nonce_partials, {})
+        assert_equal(script_sigs(nonces_input), expected_script_sigs)
+
+        partials = []
+        partial_maps = []
+        for signer, fingerprint in zip(signers, fingerprints):
+            result = signer.walletprocesspsbt(psbt=nonces, finalize=False)
+            assert_equal(result["complete"], False)
+            result_input = decoded_input(result["psbt"])
+            assert "taproot_key_path_sig" not in result_input
+            signer_nonces, signer_partials = musig_material(result_input, signing_key)
+            assert_equal(signer_nonces, expected_nonces)
+            assert_equal(len(signer_partials), 1)
+            partial_signer = next(iter(signer_partials))
+            assert_equal(partial_signer[2:], key_by_fingerprint[fingerprint])
+            assert_equal(script_sigs(result_input), expected_script_sigs)
+            partial_maps.append(signer_partials)
+            partials.append(result["psbt"])
+
+        expected_partials = {}
+        for signer_partials in partial_maps:
+            for participant, partial_signature in signer_partials.items():
+                assert participant not in expected_partials
+                expected_partials[participant] = partial_signature
+        assert_equal(set(expected_partials), participant_keys)
+
         combined = self.nodes[0].combinepsbt(partials)
+        combined_input = decoded_input(combined)
+        assert "taproot_key_path_sig" not in combined_input
+        final_nonces, final_partials = musig_material(combined_input, signing_key)
+        assert_equal(final_nonces, expected_nonces)
+        assert_equal(final_partials, expected_partials)
+        assert_equal(script_sigs(combined_input), expected_script_sigs)
         done = self.nodes[0].finalizepsbt(combined)
         assert done["complete"]
         assert_equal(len(self._decode_send(watch, done["hex"])["vin"][0]["txinwitness"]), 1)
