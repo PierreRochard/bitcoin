@@ -4,12 +4,18 @@
 
 #include <wallet/wallet.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <future>
 #include <memory>
+#include <stdexcept>
+#include <string>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 #include <addresstype.h>
+#include <chainparams.h>
 #include <interfaces/chain.h>
 #include <interfaces/wallet.h>
 #include <key_io.h>
@@ -27,10 +33,13 @@
 #include <validationinterface.h>
 #include <wallet/coincontrol.h>
 #include <wallet/context.h>
+#include <wallet/multisig.h>
 #include <wallet/receive.h>
+#include <wallet/scriptpubkeyman.h>
 #include <wallet/spend.h>
 #include <wallet/test/util.h>
 #include <wallet/test/wallet_test_fixture.h>
+#include <wallet/walletutil.h>
 
 #include <boost/test/unit_test.hpp>
 #include <univalue.h>
@@ -45,6 +54,79 @@ static_assert(DEFAULT_TRANSACTION_MINFEE >= DEFAULT_MIN_RELAY_TX_FEE, "wallet mi
 static_assert(WALLET_INCREMENTAL_RELAY_FEE >= DEFAULT_INCREMENTAL_RELAY_FEE, "wallet incremental fee is smaller than default incremental relay fee");
 
 BOOST_FIXTURE_TEST_SUITE(wallet_tests, WalletTestingSetup)
+
+struct FixedVaultCandidate {
+    std::string package;
+    std::vector<SecureString> mnemonics;
+};
+
+static CMutableTransaction TestSimpleSpend(const CTransaction& from, uint32_t index, const CKey& key, const CScript& pubkey);
+
+static FixedVaultCandidate PrepareFixedVaultCandidate()
+{
+    std::vector<MultisigKeySpec> specs(3);
+    for (auto& spec : specs) spec.generate_local = true;
+    MultisigOptions options;
+    options.type = OutputType::BECH32M;
+    options.fallback_older = 4320;
+    options.fallback_older_one_key = 8640;
+    auto prepared{PrepareMultisigDescriptor(/*nrequired=*/2, specs, options)};
+    BOOST_REQUIRE_MESSAGE(prepared, util::ErrorString(prepared).original);
+
+    VaultPolicyPackage policy;
+    policy.network = Params().GetChainTypeString();
+    policy.nrequired = 2;
+    policy.fallback_older = 4320;
+    policy.fallback_older_one_key = 8640;
+    policy.recovery_stages = {{2, 4320, {}}, {1, 8640, {}}};
+    policy.descs = prepared->descs;
+    policy.policy_id = prepared->policy_id;
+
+    FixedVaultCandidate candidate{FormatVaultPolicyPackage(policy), {}};
+    for (auto& recovery : prepared->recovery) {
+        candidate.mnemonics.push_back(std::move(recovery.mnemonic));
+    }
+    return candidate;
+}
+
+static void CheckNoFixedVaultStages(const fs::path& wallet_dir)
+{
+    std::error_code error;
+    for (fs::directory_iterator it{wallet_dir, error}; !error && it != fs::directory_iterator{}; it.increment(error)) {
+        BOOST_CHECK(!fs::PathToString(it->path().filename()).starts_with(".bitcoin-fixed-vault-stage-"));
+    }
+    BOOST_CHECK(!error);
+}
+
+static void CheckVaultDescriptorTimestamps(interfaces::Wallet& wallet, uint64_t expected)
+{
+    CWallet& internal{*Assert(wallet.wallet())};
+    LOCK(internal.cs_wallet);
+    const auto managers{internal.GetActiveScriptPubKeyMans()};
+    BOOST_REQUIRE_EQUAL(managers.size(), 2U);
+    for (ScriptPubKeyMan* manager : managers) {
+        auto* descriptor{dynamic_cast<DescriptorScriptPubKeyMan*>(manager)};
+        BOOST_REQUIRE(descriptor);
+        LOCK(descriptor->cs_desc_man);
+        BOOST_CHECK_EQUAL(descriptor->GetWalletDescriptor().creation_time, expected);
+    }
+}
+
+static CScript FirstFixedVaultScript(const FixedVaultCandidate& candidate)
+{
+    const auto package{ParseVaultPolicyPackage(candidate.package)};
+    BOOST_REQUIRE_MESSAGE(package, util::ErrorString(package).original);
+    BOOST_REQUIRE(!package->descs.empty());
+    FlatSigningProvider public_keys;
+    std::string error;
+    auto descriptors{Parse(package->descs.front(), public_keys, error, /*require_checksum=*/true)};
+    BOOST_REQUIRE_MESSAGE(descriptors.size() == 1, error);
+    std::vector<CScript> scripts;
+    FlatSigningProvider expanded_keys;
+    BOOST_REQUIRE(descriptors.front()->Expand(/*pos=*/0, public_keys, scripts, expanded_keys));
+    BOOST_REQUIRE_EQUAL(scripts.size(), 1U);
+    return scripts.front();
+}
 
 BOOST_FIXTURE_TEST_CASE(check_rescan_from_genesis_rejects_missing_blocks_without_wallet_creation, TestChain100Setup)
 {
@@ -65,6 +147,337 @@ BOOST_FIXTURE_TEST_CASE(check_rescan_from_genesis_rejects_missing_blocks_without
     BOOST_CHECK(util::ErrorString(blocked).original.find("unpruned block data back to genesis") != std::string::npos);
     BOOST_CHECK(loader->getWallets().empty());
 }
+
+BOOST_FIXTURE_TEST_CASE(fixed_vault_public_only_restore_is_atomic_and_timestamp_zero, TestChain100Setup)
+{
+    auto loader{interfaces::MakeWalletLoader(*m_node.chain, *Assert(m_node.args))};
+    FixedVaultCandidate candidate{PrepareFixedVaultCandidate()};
+    const std::string name{"fixed_vault_public_only"};
+    const fs::path final_path{GetWalletDir() / fs::PathFromString(name)};
+    BOOST_CHECK(!fs::exists(final_path));
+
+    std::vector<bilingual_str> warnings;
+    auto installed{loader->installFixedVault(
+        name, candidate.package, /*mnemonics=*/{},
+        interfaces::FixedVaultInstallMode::RESTORE, warnings)};
+    BOOST_REQUIRE_MESSAGE(installed, util::ErrorString(installed).original);
+    BOOST_REQUIRE(installed->wallet);
+    BOOST_CHECK(installed->matches.empty());
+    BOOST_CHECK(installed->wallet->privateKeysDisabled());
+    BOOST_CHECK(installed->wallet->hasExternalSigner());
+    BOOST_CHECK_EQUAL(installed->wallet->exportVaultPolicy(), candidate.package);
+    const auto public_status{installed->wallet->getVaultStatus()};
+    BOOST_CHECK_EQUAL(public_status.participants.size(), 3U);
+    BOOST_CHECK_EQUAL(public_status.lost_signers.size(), 3U);
+    BOOST_CHECK(public_status.genesis_rescan_required);
+    BOOST_CHECK(fs::is_regular_file(final_path));
+    CheckVaultDescriptorTimestamps(*installed->wallet, /*expected=*/0);
+    CheckNoFixedVaultStages(GetWalletDir());
+
+    const auto listed{loader->listWalletDir()};
+    BOOST_CHECK(std::ranges::find(listed, std::pair{name, std::string{"sqlite"}}) != listed.end());
+
+    const auto rescanned{installed->wallet->rescanFromGenesis()};
+    BOOST_REQUIRE_MESSAGE(rescanned, util::ErrorString(rescanned).original);
+    BOOST_CHECK(!installed->wallet->getVaultStatus().genesis_rescan_required);
+
+    // The same public package can be committed with all matching phrases. The
+    // create flow stores the current timestamp and needs no external signer.
+    static constexpr uint64_t CREATE_TIME{1700000000};
+    loader->setMockTime(CREATE_TIME);
+    auto private_install{loader->installFixedVault(
+        "fixed_vault_private_create", candidate.package, candidate.mnemonics,
+        interfaces::FixedVaultInstallMode::CREATE, warnings)};
+    BOOST_REQUIRE_MESSAGE(private_install, util::ErrorString(private_install).original);
+    BOOST_REQUIRE(private_install->wallet);
+    BOOST_CHECK_EQUAL(private_install->matches.size(), 3U);
+    BOOST_CHECK(!private_install->wallet->privateKeysDisabled());
+    BOOST_CHECK(!private_install->wallet->hasExternalSigner());
+    BOOST_CHECK_EQUAL(private_install->wallet->exportVaultPolicy(), candidate.package);
+    BOOST_CHECK(private_install->wallet->getVaultStatus().lost_signers.empty());
+    BOOST_CHECK(!private_install->wallet->getVaultStatus().genesis_rescan_required);
+    CheckVaultDescriptorTimestamps(*private_install->wallet, CREATE_TIME);
+    CheckNoFixedVaultStages(GetWalletDir());
+}
+
+BOOST_FIXTURE_TEST_CASE(fixed_vault_incomplete_rescan_blocks_backend_spending, TestChain100Setup)
+{
+    auto loader{interfaces::MakeWalletLoader(*m_node.chain, *Assert(m_node.args))};
+    FixedVaultCandidate candidate{PrepareFixedVaultCandidate()};
+    std::vector<bilingual_str> warnings;
+    auto installed{loader->installFixedVault(
+        "fixed_vault_rescan_spend_guard", candidate.package, candidate.mnemonics,
+        interfaces::FixedVaultInstallMode::RESTORE, warnings)};
+    BOOST_REQUIRE_MESSAGE(installed, util::ErrorString(installed).original);
+    BOOST_REQUIRE(installed->wallet);
+    BOOST_CHECK(installed->wallet->getVaultStatus().genesis_rescan_required);
+
+    CWallet& wallet{*Assert(installed->wallet->wallet())};
+    const CScript vault_script{FirstFixedVaultScript(candidate)};
+    CMutableTransaction previous;
+    previous.version = 2;
+    previous.vin.emplace_back();
+    previous.vout.emplace_back(10 * COIN, vault_script);
+    const CTransactionRef previous_ref{MakeTransactionRef(previous)};
+
+    uint256 tip_hash;
+    int tip_height;
+    {
+        LOCK(Assert(m_node.chainman)->GetMutex());
+        const CBlockIndex* tip{Assert(m_node.chainman)->ActiveChain().Tip()};
+        tip_hash = tip->GetBlockHash();
+        tip_height = tip->nHeight;
+    }
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_REQUIRE(wallet.AddToWallet(previous_ref, TxStateConfirmed{tip_hash, tip_height, /*index=*/0}));
+    }
+
+    CKey destination_key;
+    destination_key.MakeNewKey(/*fCompressed=*/true);
+    const CRecipient recipient{PKHash{destination_key.GetPubKey()}, COIN, /*fSubtractFeeFromAmount=*/false};
+    CCoinControl coin_control;
+    coin_control.m_feerate = CFeeRate{1000};
+    coin_control.fOverrideFeeRate = true;
+    auto blocked_create{CreateTransaction(wallet, {recipient}, /*change_pos=*/std::nullopt, coin_control)};
+    BOOST_REQUIRE(!blocked_create);
+    BOOST_CHECK(util::ErrorString(blocked_create).original.find("rescanning from genesis") != std::string::npos);
+
+    CMutableTransaction spending;
+    spending.version = 2;
+    spending.vin.emplace_back(COutPoint{previous.GetHash(), 0});
+    spending.vout.emplace_back(9 * COIN, GetScriptForDestination(recipient.dest));
+
+    PartiallySignedTransaction blocked_psbt{spending, /*version=*/0};
+    blocked_psbt.inputs[0].non_witness_utxo = previous_ref;
+    blocked_psbt.inputs[0].witness_utxo = previous.vout[0];
+    bool complete{false};
+    BOOST_CHECK(!wallet.FillPSBT(blocked_psbt, {.sign = false, .bip32_derivs = true}, complete));
+    const auto blocked_psbt_error{wallet.FillPSBT(
+        blocked_psbt, {.sign = true, .finalize = true, .bip32_derivs = false}, complete)};
+    BOOST_REQUIRE(blocked_psbt_error);
+    BOOST_CHECK(*blocked_psbt_error == PSBTError::WALLET_RESCAN_REQUIRED);
+    BOOST_CHECK(!complete);
+    BOOST_CHECK(!PSBTInputSigned(blocked_psbt.inputs[0]));
+
+    CMutableTransaction direct_spend{spending};
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(!wallet.SignTransaction(direct_spend));
+    }
+    std::map<COutPoint, Coin> coins{{spending.vin[0].prevout, Coin{previous.vout[0], tip_height, /*coinbase=*/false}}};
+    std::map<int, bilingual_str> input_errors;
+    BOOST_CHECK(!wallet.SignTransaction(direct_spend, coins, SIGHASH_DEFAULT, input_errors));
+    BOOST_REQUIRE_EQUAL(input_errors.size(), 1U);
+    BOOST_CHECK(input_errors.begin()->second.original.find("rescanning from genesis") != std::string::npos);
+
+    const auto rescanned{installed->wallet->rescanFromGenesis()};
+    BOOST_REQUIRE_MESSAGE(rescanned, util::ErrorString(rescanned).original);
+    BOOST_CHECK(!installed->wallet->getVaultStatus().genesis_rescan_required);
+
+    auto created{CreateTransaction(wallet, {recipient}, /*change_pos=*/std::nullopt, coin_control)};
+    if (!created) {
+        BOOST_CHECK(util::ErrorString(created).original.find("rescanning from genesis") == std::string::npos);
+    }
+    PartiallySignedTransaction signed_psbt{spending, /*version=*/0};
+    signed_psbt.inputs[0].non_witness_utxo = previous_ref;
+    signed_psbt.inputs[0].witness_utxo = previous.vout[0];
+    complete = false;
+    BOOST_CHECK(!wallet.FillPSBT(signed_psbt, {.sign = false, .bip32_derivs = true}, complete));
+    BOOST_CHECK(!wallet.FillPSBT(signed_psbt, {.sign = true, .finalize = true, .bip32_derivs = false}, complete));
+    BOOST_CHECK(complete);
+}
+
+BOOST_FIXTURE_TEST_CASE(fixed_vault_incomplete_rescan_marker_survives_reload, TestChain100Setup)
+{
+    auto loader{interfaces::MakeWalletLoader(*m_node.chain, *Assert(m_node.args))};
+    FixedVaultCandidate candidate{PrepareFixedVaultCandidate()};
+    const std::string name{"fixed_vault_rescan_retry"};
+    std::vector<bilingual_str> warnings;
+    auto installed{loader->installFixedVault(
+        name, candidate.package, /*mnemonics=*/{},
+        interfaces::FixedVaultInstallMode::RESTORE, warnings)};
+    BOOST_REQUIRE_MESSAGE(installed, util::ErrorString(installed).original);
+    BOOST_REQUIRE(installed->wallet);
+    BOOST_CHECK(installed->wallet->getVaultStatus().genesis_rescan_required);
+    installed->wallet->remove();
+    installed->wallet.reset();
+
+    CBlockIndex* unavailable_block{nullptr};
+    uint32_t original_status{0};
+    {
+        LOCK(Assert(m_node.chainman)->GetMutex());
+        const CChain& active{Assert(m_node.chainman)->ActiveChain()};
+        BOOST_REQUIRE_GT(active.Height(), 5);
+        unavailable_block = active[5];
+        original_status = unavailable_block->nStatus;
+        unavailable_block->nStatus &= ~BLOCK_HAVE_DATA;
+    }
+
+    warnings.clear();
+    auto incomplete{loader->loadWallet(name, warnings)};
+    BOOST_REQUIRE_MESSAGE(incomplete, util::ErrorString(incomplete).original);
+    BOOST_CHECK((*incomplete)->getVaultStatus().genesis_rescan_required);
+    BOOST_CHECK(std::ranges::any_of(warnings, [](const bilingual_str& warning) {
+        return warning.original.find("remains marked as requiring a genesis rescan") != std::string::npos;
+    }));
+    (*incomplete)->remove();
+    incomplete->reset();
+
+    {
+        LOCK(Assert(m_node.chainman)->GetMutex());
+        unavailable_block->nStatus = original_status;
+    }
+    warnings.clear();
+    auto completed{loader->loadWallet(name, warnings)};
+    BOOST_REQUIRE_MESSAGE(completed, util::ErrorString(completed).original);
+    BOOST_CHECK(!(*completed)->getVaultStatus().genesis_rescan_required);
+    (*completed)->remove();
+}
+
+BOOST_FIXTURE_TEST_CASE(fixed_vault_install_failures_never_publish_final_name, TestChain100Setup)
+{
+    auto loader{interfaces::MakeWalletLoader(*m_node.chain, *Assert(m_node.args))};
+    FixedVaultCandidate candidate{PrepareFixedVaultCandidate()};
+    std::vector<bilingual_str> warnings;
+
+    const std::string noncanonical_name{"fixed_vault_noncanonical"};
+    auto noncanonical{loader->installFixedVault(
+        noncanonical_name, candidate.package + "\n", candidate.mnemonics,
+        interfaces::FixedVaultInstallMode::RESTORE, warnings)};
+    BOOST_REQUIRE(!noncanonical);
+    BOOST_CHECK(!fs::exists(GetWalletDir() / fs::PathFromString(noncanonical_name)));
+
+    const std::string invalid_phrase_name{"fixed_vault_invalid_phrase"};
+    const std::string invalid_text{"not a valid recovery phrase"};
+    std::vector<SecureString> invalid_phrases{
+        SecureString{invalid_text.begin(), invalid_text.end()},
+    };
+    auto invalid_phrase{loader->installFixedVault(
+        invalid_phrase_name, candidate.package, invalid_phrases,
+        interfaces::FixedVaultInstallMode::RESTORE, warnings)};
+    BOOST_REQUIRE(!invalid_phrase);
+    BOOST_CHECK(!fs::exists(GetWalletDir() / fs::PathFromString(invalid_phrase_name)));
+
+    // Force loading the atomically published database to fail. Publication
+    // rollback must remove the final hard link before returning the error.
+    const std::string load_failure_name{"fixed_vault_load_failure"};
+    auto throwing_load_handler{loader->handleLoadWallet([](std::unique_ptr<interfaces::Wallet>) {
+        throw std::runtime_error{"injected fixed vault load failure"};
+    })};
+    auto load_failure{loader->installFixedVault(
+        load_failure_name, candidate.package, candidate.mnemonics,
+        interfaces::FixedVaultInstallMode::RESTORE, warnings)};
+    BOOST_REQUIRE(!load_failure);
+    BOOST_CHECK(!fs::exists(GetWalletDir() / fs::PathFromString(load_failure_name)));
+    throwing_load_handler.reset();
+
+    // AddWallet() registers the wallet before it emits this signal. A signal
+    // exception must still unregister the wallet before publication rollback.
+    const std::string add_failure_name{"fixed_vault_add_failure"};
+    std::unique_ptr<interfaces::Handler> add_thrower;
+    auto add_load_handler{loader->handleLoadWallet([&](std::unique_ptr<interfaces::Wallet> wallet) {
+        add_thrower = wallet->handleCanGetAddressesChanged([] {
+            throw std::runtime_error{"injected fixed vault AddWallet failure"};
+        });
+    })};
+    auto add_failure{loader->installFixedVault(
+        add_failure_name, candidate.package, candidate.mnemonics,
+        interfaces::FixedVaultInstallMode::RESTORE, warnings)};
+    BOOST_REQUIRE(!add_failure);
+    BOOST_CHECK(util::ErrorString(add_failure).original.find("injected fixed vault AddWallet failure") != std::string::npos);
+    add_thrower.reset();
+    add_load_handler.reset();
+    BOOST_CHECK(!fs::exists(GetWalletDir() / fs::PathFromString(add_failure_name)));
+    BOOST_CHECK(loader->getWallets().empty());
+
+    // Force the atomic no-overwrite publication step to lose a race after the
+    // staging wallet has been completed. The existing final path must survive.
+    const std::string collision_name{"fixed_vault_collision"};
+    const fs::path collision_path{GetWalletDir() / fs::PathFromString(collision_name)};
+    BOOST_REQUIRE(fs::create_directory(collision_path));
+    auto collision{loader->installFixedVault(
+        collision_name, candidate.package, candidate.mnemonics,
+        interfaces::FixedVaultInstallMode::RESTORE, warnings)};
+    BOOST_REQUIRE(!collision);
+    BOOST_CHECK(fs::is_directory(collision_path));
+    BOOST_CHECK(fs::is_empty(collision_path));
+    CheckNoFixedVaultStages(GetWalletDir());
+}
+
+BOOST_FIXTURE_TEST_CASE(fixed_vault_post_init_failure_unregisters_and_rolls_back, TestChain100Setup)
+{
+    auto loader{interfaces::MakeWalletLoader(*m_node.chain, *Assert(m_node.args))};
+    FixedVaultCandidate candidate{PrepareFixedVaultCandidate()};
+    const std::string name{"fixed_vault_post_init_failure"};
+    const fs::path final_path{GetWalletDir() / fs::PathFromString(name)};
+
+    // postInitProcess() asks the chain for current mempool transactions after
+    // AddWallet() has registered the wallet. A relevant transaction lets this
+    // callback inject a failure at that exact boundary.
+    const CMutableTransaction mempool_tx{TestSimpleSpend(
+        *m_coinbase_txns.front(), 0, coinbaseKey, FirstFixedVaultScript(candidate))};
+    std::string broadcast_error;
+    BOOST_REQUIRE(m_node.chain->broadcastTransaction(
+        MakeTransactionRef(mempool_tx), DEFAULT_TRANSACTION_MAXFEE,
+        node::TxBroadcast::MEMPOOL_NO_BROADCAST, broadcast_error));
+
+    std::unique_ptr<interfaces::Handler> post_init_thrower;
+    auto load_handler{loader->handleLoadWallet([&](std::unique_ptr<interfaces::Wallet> wallet) {
+        post_init_thrower = wallet->handleTransactionChanged([](const Txid&, ChangeType) {
+            throw std::runtime_error{"injected fixed vault post-init failure"};
+        });
+    })};
+    std::vector<bilingual_str> warnings;
+    auto installed{loader->installFixedVault(
+        name, candidate.package, candidate.mnemonics,
+        interfaces::FixedVaultInstallMode::RESTORE, warnings)};
+    BOOST_REQUIRE(!installed);
+    BOOST_CHECK(util::ErrorString(installed).original.find("injected fixed vault post-init failure") != std::string::npos);
+    post_init_thrower.reset();
+    load_handler.reset();
+
+    BOOST_CHECK(!fs::exists(final_path));
+    BOOST_CHECK(loader->getWallets().empty());
+    CheckNoFixedVaultStages(GetWalletDir());
+}
+
+#ifndef WIN32
+BOOST_FIXTURE_TEST_CASE(fixed_vault_rollback_refuses_replaced_final_path, TestChain100Setup)
+{
+    auto loader{interfaces::MakeWalletLoader(*m_node.chain, *Assert(m_node.args))};
+    FixedVaultCandidate candidate{PrepareFixedVaultCandidate()};
+    const std::string name{"fixed_vault_replaced_during_rollback"};
+    const fs::path final_path{GetWalletDir() / fs::PathFromString(name)};
+
+    auto load_handler{loader->handleLoadWallet([&](std::unique_ptr<interfaces::Wallet>) {
+        std::error_code error;
+        if (!fs::remove(final_path, error) || error) {
+            throw std::runtime_error{strprintf("unable to inject final-path replacement: %s", error.message())};
+        }
+        if (!fs::create_directory(final_path, error) || error) {
+            throw std::runtime_error{strprintf("unable to inject replacement directory: %s", error.message())};
+        }
+        throw std::runtime_error{"injected fixed vault load failure after path replacement"};
+    })};
+    std::vector<bilingual_str> warnings;
+    auto installed{loader->installFixedVault(
+        name, candidate.package, candidate.mnemonics,
+        interfaces::FixedVaultInstallMode::RESTORE, warnings)};
+    BOOST_REQUIRE(!installed);
+    const std::string install_error{util::ErrorString(installed).original};
+    BOOST_CHECK(install_error.find("final-name publication rollback failed") != std::string::npos);
+    BOOST_CHECK(install_error.find("refusing to remove it") != std::string::npos);
+    BOOST_CHECK(fs::is_directory(final_path));
+    BOOST_CHECK(loader->getWallets().empty());
+    CheckNoFixedVaultStages(GetWalletDir());
+
+    load_handler.reset();
+    std::error_code cleanup_error;
+    BOOST_CHECK(fs::remove(final_path, cleanup_error));
+    BOOST_CHECK(!cleanup_error);
+}
+#endif // WIN32
 
 static CMutableTransaction TestSimpleSpend(const CTransaction& from, uint32_t index, const CKey& key, const CScript& pubkey)
 {

@@ -7,6 +7,7 @@
 
 #include <common/settings.h>
 #include <consensus/amount.h>
+#include <interfaces/external_signer.h>
 #include <net.h>
 #include <net_types.h>
 #include <netaddress.h>
@@ -158,6 +159,9 @@ public:
 
     //! Return list of external signers (attached devices which can sign transactions).
     virtual std::vector<std::unique_ptr<ExternalSigner>> listExternalSigners() = 0;
+
+    //! Return lossless discovery evidence for fixed-vault signer selection.
+    virtual ExternalSignerDiscovery discoverExternalSigners(const std::string& account_path) = 0;
 
     //! Get total bytes recv.
     virtual int64_t getTotalBytesRecv() = 0;

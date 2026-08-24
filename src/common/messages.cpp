@@ -113,6 +113,8 @@ bilingual_str PSBTErrorString(PSBTError err)
             return Untranslated("External signer not found");
         case PSBTError::EXTERNAL_SIGNER_FAILED:
             return Untranslated("External signer failed to sign");
+        case PSBTError::WALLET_RESCAN_REQUIRED:
+            return Untranslated("Vault restore must finish rescanning from genesis before signing");
         case PSBTError::UNSUPPORTED:
             return Untranslated("Signer does not support PSBT");
         case PSBTError::INCOMPLETE:

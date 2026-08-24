@@ -458,6 +458,7 @@ struct ResolvedMultisigKey {
 static util::Result<ResolvedMultisigKey> ResolvePrivateMaster(const CExtKey& master,
                                                               const std::vector<uint32_t>& parsed_path,
                                                               size_t key_index,
+                                                              bool private_expression,
                                                               std::optional<SecureString> generated_mnemonic = {})
 {
     auto child = DeriveExtKey(master, parsed_path);
@@ -468,11 +469,15 @@ static util::Result<ResolvedMultisigKey> ResolvePrivateMaster(const CExtKey& mas
     const std::string fingerprint{HexStr(child->second.fingerprint)};
     const std::string path{WriteHDKeypath(child->second.path)};
     const std::string xpub{EncodeExtPubKey(child->first.Neuter())};
+    // Candidate preparation must never serialize an xprv into ordinary heap
+    // memory. Wallet-backed advanced/RPC creation retains its established
+    // private-expression path so Parse() can populate the signing provider.
+    const std::string descriptor_key{private_expression ? EncodeExtKey(child->first) : xpub};
     ResolvedMultisigKey out{
         strprintf("[%s%s]%s/<0;1>/*",
                   fingerprint,
                   FormatHDKeypath(child->second.path),
-                  EncodeExtKey(child->first)),
+                  descriptor_key),
         xpub,
         std::nullopt,
     };
@@ -488,12 +493,15 @@ static util::Result<ResolvedMultisigKey> ResolvePrivateMaster(const CExtKey& mas
     return out;
 }
 
-static util::Result<ResolvedMultisigKey> KeyExprFromSpec(CWallet& wallet,
+static util::Result<ResolvedMultisigKey> KeyExprFromSpec(CWallet* wallet,
                                                          const MultisigKeySpec& spec,
                                                          const std::string& default_path,
-                                                         size_t key_index)
+                                                         size_t key_index) NO_THREAD_SAFETY_ANALYSIS
 {
-    AssertLockHeld(wallet.cs_wallet);
+    // The nullable wallet separates pure candidate preparation from the
+    // wallet-backed advanced API. Clang cannot express the conditional lock
+    // requirement; every wallet-backed caller holds cs_wallet.
+    if (wallet) AssertLockHeld(wallet->cs_wallet);
 
     std::string path = spec.path.value_or(default_path);
     std::vector<uint32_t> parsed_path;
@@ -508,7 +516,7 @@ static util::Result<ResolvedMultisigKey> KeyExprFromSpec(CWallet& wallet,
         if ((spec.generate_local && spec.recovery_mnemonic) || spec.fingerprint || spec.hdkey || spec.xpub) {
             return util::Error{Untranslated("A mnemonic local key cannot also specify another key source")};
         }
-        if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+        if (wallet && wallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
             return util::Error{Untranslated("Watch-only wallets cannot generate local keys")};
         }
 
@@ -527,7 +535,7 @@ static util::Result<ResolvedMultisigKey> KeyExprFromSpec(CWallet& wallet,
         }
         CExtKey master;
         master.SetSeed(std::as_bytes(std::span{*seed}));
-        return ResolvePrivateMaster(master, parsed_path, key_index,
+        return ResolvePrivateMaster(master, parsed_path, key_index, /*private_expression=*/wallet != nullptr,
                                     spec.generate_local ? std::optional<SecureString>{std::move(mnemonic)} : std::nullopt);
     }
 
@@ -576,17 +584,17 @@ static util::Result<ResolvedMultisigKey> KeyExprFromSpec(CWallet& wallet,
         };
     }
 
-    if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+    if (wallet && wallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
         return util::Error{Untranslated("Watch-only wallets cannot use local keys; specify a signer fingerprint or xpub")};
     }
 
     if (spec.hdkey) {
         const CExtKey extkey = DecodeExtKey(*spec.hdkey);
         if (extkey.key.IsValid()) {
-            if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+            if (wallet && wallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
                 return util::Error{Untranslated("Watch-only wallets cannot use local keys; specify a signer fingerprint or xpub")};
             }
-            return ResolvePrivateMaster(extkey, parsed_path, key_index);
+            return ResolvePrivateMaster(extkey, parsed_path, key_index, /*private_expression=*/wallet != nullptr);
         }
     }
 
@@ -597,8 +605,11 @@ static util::Result<ResolvedMultisigKey> KeyExprFromSpec(CWallet& wallet,
             return util::Error{Untranslated("Unable to parse HD key. Please provide a valid xpub or xprv")};
         }
     } else {
-        CWallet::HDPubKeyMap unused = wallet.GetHDPubKeys(CWallet::HDKeyFilter::UnusedKey);
-        CWallet::HDPubKeyMap active = wallet.GetHDPubKeys(CWallet::HDKeyFilter::Active);
+        if (!wallet) {
+            return util::Error{Untranslated("Preparing a multisig candidate requires every key source to be explicit")};
+        }
+        CWallet::HDPubKeyMap unused = wallet->GetHDPubKeys(CWallet::HDKeyFilter::UnusedKey);
+        CWallet::HDPubKeyMap active = wallet->GetHDPubKeys(CWallet::HDKeyFilter::Active);
         if (unused.size() == 1) {
             xpub = unused.begin()->first;
         } else if (unused.empty() && active.size() == 1) {
@@ -607,21 +618,26 @@ static util::Result<ResolvedMultisigKey> KeyExprFromSpec(CWallet& wallet,
             return util::Error{Untranslated("Unable to determine which HD key to use. Please specify with 'hdkey'")};
         }
     }
-    std::optional<CExtKey> xprv = wallet.GetExtKey(xpub);
+    if (!wallet) {
+        return util::Error{Untranslated("Preparing a multisig candidate cannot select private keys from a wallet")};
+    }
+    std::optional<CExtKey> xprv = wallet->GetExtKey(xpub);
     if (!xprv) {
         return util::Error{Untranslated(strprintf("Private key for %s is not known", EncodeExtPubKey(xpub)))};
     }
-    return ResolvePrivateMaster(*xprv, parsed_path, key_index);
+    return ResolvePrivateMaster(*xprv, parsed_path, key_index, /*private_expression=*/true);
 }
 
-util::Result<MultisigDescriptorResult> CreateMultisigDescriptor(CWallet& wallet,
-                                                                int nrequired,
-                                                                const std::vector<MultisigKeySpec>& keys,
-                                                                const MultisigOptions& options)
+static util::Result<MultisigDescriptorResult> BuildMultisigDescriptor(CWallet* wallet,
+                                                                      int nrequired,
+                                                                      const std::vector<MultisigKeySpec>& keys,
+                                                                      const MultisigOptions& options) NO_THREAD_SAFETY_ANALYSIS
 {
-    AssertLockHeld(wallet.cs_wallet);
+    // See KeyExprFromSpec: wallet-backed callers hold cs_wallet, while a null
+    // wallet is a side-effect-free public candidate build.
+    if (wallet) AssertLockHeld(wallet->cs_wallet);
 
-    if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) && !wallet.IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
+    if (wallet && wallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) && !wallet->IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
         const bool all_xpub = std::all_of(keys.begin(), keys.end(), [](const MultisigKeySpec& k) { return k.xpub.has_value(); });
         if (!all_xpub) {
             return util::Error{Untranslated("createmultisigdescriptor requires a wallet with private keys or an external signer")};
@@ -714,14 +730,18 @@ util::Result<MultisigDescriptorResult> CreateMultisigDescriptor(CWallet& wallet,
         if (!parsed[i]->Expand(0, parse_keys, scripts, expand_keys)) {
             return util::Error{Untranslated("Cannot expand descriptor")};
         }
-        WalletDescriptor w_desc(std::move(parsed[i]), GetTime(), 0, wallet.m_keypool_size, 0);
-        auto spkm_res = wallet.AddWalletDescriptor(w_desc, parse_keys, /*label=*/"", desc_internal);
+        if (!wallet) {
+            out.descs.push_back(parsed[i]->ToString());
+            continue;
+        }
+        WalletDescriptor w_desc(std::move(parsed[i]), GetTime(), 0, wallet->m_keypool_size, 0);
+        auto spkm_res = wallet->AddWalletDescriptor(w_desc, parse_keys, /*label=*/"", desc_internal);
         if (!spkm_res) {
             return util::Error{util::ErrorString(spkm_res)};
         }
         auto& spkm = spkm_res.value().get();
         if (auto type = w_desc.descriptor->GetOutputType()) {
-            wallet.AddActiveScriptPubKeyMan(spkm.GetID(), *type, desc_internal);
+            wallet->AddActiveScriptPubKeyMan(spkm.GetID(), *type, desc_internal);
         }
         std::string out_desc;
         CHECK_NONFATAL(spkm.GetDescriptorString(out_desc, false));
@@ -729,6 +749,23 @@ util::Result<MultisigDescriptorResult> CreateMultisigDescriptor(CWallet& wallet,
     }
     if (!out.descs.empty()) out.policy_id = VaultPolicyId(out.descs.front());
     return out;
+}
+
+util::Result<MultisigDescriptorResult> PrepareMultisigDescriptor(
+    int nrequired,
+    const std::vector<MultisigKeySpec>& keys,
+    const MultisigOptions& options)
+{
+    return BuildMultisigDescriptor(/*wallet=*/nullptr, nrequired, keys, options);
+}
+
+util::Result<MultisigDescriptorResult> CreateMultisigDescriptor(CWallet& wallet,
+                                                                int nrequired,
+                                                                const std::vector<MultisigKeySpec>& keys,
+                                                                const MultisigOptions& options)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    return BuildMultisigDescriptor(&wallet, nrequired, keys, options);
 }
 
 InferredVaultPolicy InferWalletVaultPolicy(const CWallet& wallet)
@@ -1102,7 +1139,7 @@ struct PreparedVaultDescriptor {
 struct PreparedVaultMnemonicRestore {
     std::vector<VaultMnemonicMatch> matches;
     std::vector<PreparedVaultDescriptor> descriptors;
-    std::vector<std::string> participant_fingerprints;
+    std::vector<FixedVaultParticipant> participants;
     std::vector<std::string> unavailable_fingerprints;
 };
 
@@ -1158,10 +1195,13 @@ util::Result<std::pair<KeyFingerprint, size_t>> DescriptorAccountOrigin(
 
 util::Result<PreparedVaultMnemonicRestore> PrepareVaultMnemonicRestore(
     const VaultPolicyPackage& package,
-    const std::span<const SecureString> mnemonics)
+    const std::span<const SecureString> mnemonics,
+    bool allow_empty)
 {
-    if (mnemonics.empty() || mnemonics.size() > 3) {
-        return util::Error{Untranslated("Vault recovery requires between one and three BIP39 phrases")};
+    if ((!allow_empty && mnemonics.empty()) || mnemonics.size() > 3) {
+        return util::Error{Untranslated(allow_empty
+            ? "Fixed vault installation accepts at most three BIP39 phrases"
+            : "Vault recovery requires between one and three BIP39 phrases")};
     }
 
     auto checked = ParseVaultPolicyPackage(FormatVaultPolicyPackage(package));
@@ -1252,7 +1292,8 @@ util::Result<PreparedVaultMnemonicRestore> PrepareVaultMnemonicRestore(
                 if (!unique_fingerprints.insert(fingerprint).second) {
                     return util::Error{Untranslated("Vault participant master fingerprints are ambiguous")};
                 }
-                prepared.participant_fingerprints.push_back(HexStr(fingerprint));
+                prepared.participants.push_back(FixedVaultParticipant{
+                    HexStr(fingerprint), standard_path_string, xpub});
             }
         } else if (branch_participants != participants) {
             return util::Error{Untranslated("Receive and change descriptors do not contain the same vault participants")};
@@ -1462,9 +1503,31 @@ util::Result<std::vector<VaultMnemonicMatch>> ValidateVaultPolicyMnemonics(
     const VaultPolicyPackage& package,
     const std::span<const SecureString> mnemonics)
 {
-    auto prepared = PrepareVaultMnemonicRestore(package, mnemonics);
+    auto prepared = PrepareVaultMnemonicRestore(package, mnemonics, /*allow_empty=*/false);
     if (!prepared) return util::Error{util::ErrorString(prepared)};
     return std::move(prepared->matches);
+}
+
+util::Result<std::vector<VaultMnemonicMatch>> ValidateFixedVaultMnemonics(
+    const VaultPolicyPackage& package,
+    const std::span<const SecureString> mnemonics)
+{
+    if (auto fixed = ValidateFixedStagedVaultPolicy(package); !fixed) {
+        return util::Error{util::ErrorString(fixed)};
+    }
+    auto prepared = PrepareVaultMnemonicRestore(package, mnemonics, /*allow_empty=*/true);
+    if (!prepared) return util::Error{util::ErrorString(prepared)};
+    return std::move(prepared->matches);
+}
+
+util::Result<std::vector<FixedVaultParticipant>> FixedVaultParticipants(const VaultPolicyPackage& package)
+{
+    if (auto fixed = ValidateFixedStagedVaultPolicy(package); !fixed) {
+        return util::Error{util::ErrorString(fixed)};
+    }
+    auto prepared = PrepareVaultMnemonicRestore(package, /*mnemonics=*/{}, /*allow_empty=*/true);
+    if (!prepared) return util::Error{util::ErrorString(prepared)};
+    return std::move(prepared->participants);
 }
 
 VaultPolicyPackage ExportWalletVaultPolicy(const CWallet& wallet)
@@ -1507,6 +1570,12 @@ VaultPolicyPackage ExportWalletVaultPolicy(const CWallet& wallet)
     return pkg;
 }
 
+bool IsFixedStagedVault(const CWallet& wallet)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    return bool(ValidateFixedStagedVaultPolicy(ExportWalletVaultPolicy(wallet)));
+}
+
 util::Result<void> ImportWalletVaultPolicy(CWallet& wallet, const VaultPolicyPackage& pkg)
 {
     AssertLockHeld(wallet.cs_wallet);
@@ -1533,16 +1602,18 @@ util::Result<void> ImportWalletVaultPolicy(CWallet& wallet, const VaultPolicyPac
     return {};
 }
 
-util::Result<std::vector<VaultMnemonicMatch>> RestoreWalletVaultPolicy(
+namespace {
+util::Result<std::vector<VaultMnemonicMatch>> InstallPreparedVaultPolicy(
     CWallet& wallet,
-    const VaultPolicyPackage& package,
-    const std::span<const SecureString> mnemonics)
+    PreparedVaultMnemonicRestore prepared,
+    uint64_t creation_time,
+    bool persist_unavailable_as_lost)
 {
     AssertLockHeld(wallet.cs_wallet);
     if (!wallet.IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
         return util::Error{Untranslated("Vault mnemonic recovery requires a descriptor wallet")};
     }
-    if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+    if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) && !prepared.matches.empty()) {
         return util::Error{Untranslated("Vault mnemonic recovery requires a wallet that can store private keys")};
     }
     if (wallet.IsLocked()) {
@@ -1552,19 +1623,16 @@ util::Result<std::vector<VaultMnemonicMatch>> RestoreWalletVaultPolicy(
         return util::Error{Untranslated("Wallet keypool size is outside the supported descriptor range")};
     }
 
-    auto prepared = PrepareVaultMnemonicRestore(package, mnemonics);
-    if (!prepared) return util::Error{util::ErrorString(prepared)};
-
     struct ImportItem {
         WalletDescriptor descriptor;
         FlatSigningProvider provider;
         bool internal{false};
     };
     std::vector<ImportItem> imports;
-    imports.reserve(prepared->descriptors.size());
-    for (auto& item : prepared->descriptors) {
+    imports.reserve(prepared.descriptors.size());
+    for (auto& item : prepared.descriptors) {
         imports.push_back(ImportItem{
-            WalletDescriptor{std::move(item.descriptor), /*creation_time=*/0,
+            WalletDescriptor{std::move(item.descriptor), creation_time,
                              /*range_start=*/0, static_cast<int32_t>(wallet.m_keypool_size), /*next_index=*/0},
             std::move(item.provider),
             item.internal,
@@ -1597,11 +1665,46 @@ util::Result<std::vector<VaultMnemonicMatch>> RestoreWalletVaultPolicy(
     for (const auto& [manager, internal] : imported) {
         wallet.AddActiveScriptPubKeyMan(manager->GetID(), OutputType::BECH32M, internal);
     }
-    const std::set<std::string> lost_signers{prepared->unavailable_fingerprints.begin(),
-                                             prepared->unavailable_fingerprints.end()};
-    if (!wallet.SetLostSigners(lost_signers)) {
-        return util::Error{Untranslated("Vault keys were restored, but unavailable-signer metadata could not be saved")};
+    if (persist_unavailable_as_lost) {
+        const std::set<std::string> lost_signers{prepared.unavailable_fingerprints.begin(),
+                                                 prepared.unavailable_fingerprints.end()};
+        if (!wallet.SetLostSigners(lost_signers)) {
+            return util::Error{Untranslated("Vault keys were restored, but unavailable-signer metadata could not be saved")};
+        }
     }
-    return std::move(prepared->matches);
+    return std::move(prepared.matches);
+}
+} // namespace
+
+util::Result<std::vector<VaultMnemonicMatch>> InstallFixedVaultPolicy(
+    CWallet& wallet,
+    const VaultPolicyPackage& package,
+    const std::span<const SecureString> mnemonics,
+    uint64_t creation_time,
+    bool persist_unavailable_as_lost)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    if (auto fixed = ValidateFixedStagedVaultPolicy(package); !fixed) {
+        return util::Error{util::ErrorString(fixed)};
+    }
+    auto prepared = PrepareVaultMnemonicRestore(package, mnemonics, /*allow_empty=*/true);
+    if (!prepared) return util::Error{util::ErrorString(prepared)};
+    return InstallPreparedVaultPolicy(wallet, std::move(*prepared), creation_time,
+                                      persist_unavailable_as_lost);
+}
+
+util::Result<std::vector<VaultMnemonicMatch>> RestoreWalletVaultPolicy(
+    CWallet& wallet,
+    const VaultPolicyPackage& package,
+    const std::span<const SecureString> mnemonics)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+        return util::Error{Untranslated("Vault mnemonic recovery requires a wallet that can store private keys")};
+    }
+    auto prepared = PrepareVaultMnemonicRestore(package, mnemonics, /*allow_empty=*/false);
+    if (!prepared) return util::Error{util::ErrorString(prepared)};
+    return InstallPreparedVaultPolicy(wallet, std::move(*prepared), /*creation_time=*/0,
+                                      /*persist_unavailable_as_lost=*/true);
 }
 } // namespace wallet

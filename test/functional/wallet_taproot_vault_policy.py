@@ -5,6 +5,7 @@
 """Vault policy package, lost signer, and mixed-maturity recovery."""
 
 import json
+import re
 
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
@@ -192,7 +193,7 @@ class WalletTaprootVaultPolicyTest(BitcoinTestFramework):
         assert_raises_rpc_error(-8, "fingerprint must be 8 hex", w.setlostsigner, "aabbccddee", True)
 
     def test_getvaultinfo_nonvault_and_unload_lost(self):
-        self.log.info("getvaultinfo on a non-vault; lost-signer metadata does not survive unload")
+        self.log.info("getvaultinfo on a non-vault; lost-signer metadata survives unload")
         node = self.nodes[0]
         info = self.funding.getvaultinfo()
         assert_equal(info["is_vault"], False)
@@ -219,7 +220,7 @@ class WalletTaprootVaultPolicyTest(BitcoinTestFramework):
         node.unloadwallet("lost_tmp")
         node.loadwallet("lost_tmp")
         w = node.get_wallet_rpc("lost_tmp")
-        assert "aabbccdd" not in w.getvaultinfo()["lost_signers"]
+        assert "aabbccdd" in w.getvaultinfo()["lost_signers"]
 
     def test_lost_signer_and_mixed_maturity(self):
         self.log.info("Journeys 3/4: lost signer freezes immediate; recover only mature UTXOs")
@@ -227,7 +228,8 @@ class WalletTaprootVaultPolicyTest(BitcoinTestFramework):
         node.createwallet(wallet_name="mat_vault", blank=True)
         w = node.get_wallet_rpc("mat_vault")
         specs = [{"path": PATH, "hdkey": w.addhdkey()["xpub"]} for _ in range(3)]
-        w.createmultisigdescriptor(2, specs, {"type": "bech32m", "fallback_older": 2})
+        created = w.createmultisigdescriptor(2, specs, {"type": "bech32m", "fallback_older": 2})
+        signer_fingerprint = re.search(r"\[([0-9a-fA-F]{8})/", created["descs"][0]).group(1)
         addr = w.getnewaddress("", "bech32m")
         self.funding.sendtoaddress(addr, 5)
         self.generate(node, 1)
@@ -240,16 +242,16 @@ class WalletTaprootVaultPolicyTest(BitcoinTestFramework):
         assert_greater_than(float(info["spendable_now"]), 0)
         assert_equal(info["earliest_blocks_remaining"], 1)
         descs_before = w.listdescriptors()
-        lost = w.setlostsigner("aabbccdd", True)
-        assert "aabbccdd" in lost["lost_signers"]
+        lost = w.setlostsigner(signer_fingerprint, True)
+        assert signer_fingerprint in lost["lost_signers"]
         frozen = w.getvaultinfo()
         assert_equal(float(frozen["spendable_now"]), 0)
         assert_greater_than(float(frozen["recoverable_now"]), 0)
         assert_equal(w.listdescriptors(), descs_before)
-        cleared = w.setlostsigner("aabbccdd", False)
-        assert "aabbccdd" not in cleared["lost_signers"]
+        cleared = w.setlostsigner(signer_fingerprint, False)
+        assert signer_fingerprint not in cleared["lost_signers"]
         assert_greater_than(float(w.getvaultinfo()["spendable_now"]), 0)
-        w.setlostsigner("aabbccdd", True)
+        w.setlostsigner(signer_fingerprint, True)
         dest = self.funding.getnewaddress()
         utxos = sorted(w.listunspent(), key=lambda u: u["confirmations"])
         young, old = utxos[0], utxos[-1]

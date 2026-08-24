@@ -22,7 +22,6 @@
 #include <stdexcept>
 
 namespace hwi {
-namespace {
 
 std::string AddressFromDescriptor(const std::string& desc_str)
 {
@@ -43,6 +42,8 @@ std::string AddressFromDescriptor(const std::string& desc_str)
     }
     return EncodeDestination(dest);
 }
+
+namespace {
 
 std::string WrapKeyExpr(OutputType type, const std::string& key_expr)
 {
@@ -126,7 +127,8 @@ std::string HardwareWalletClient::DisplaySinglesigAddress(const std::string& bip
 
 std::string HardwareWalletClient::DisplayMultisigAddress(const std::string& descriptor) const
 {
-    return AddressFromDescriptor(descriptor);
+    throw HWIError("This hardware wallet cannot display multisig addresses",
+                   ErrorCode::UNAVAILABLE_ACTION);
 }
 
 std::vector<DeviceInfo> Enumerate()
@@ -142,15 +144,22 @@ std::vector<DeviceInfo> Enumerate()
     return devices;
 }
 
+std::unique_ptr<HardwareWalletClient> ConnectDevice(const DeviceInfo& info)
+{
+    if (info.type == "mock") return ConnectMock(info);
+    if (info.type == "coldcard") return ConnectColdcard(info);
+    if (info.type == "ledger") return ConnectLedger(info);
+    if (info.type == "trezor") return ConnectTrezor(info);
+    throw HWIError("Unknown hardware wallet type: " + info.type, ErrorCode::UNKNOWN_DEVICE_TYPE);
+}
+
 std::unique_ptr<HardwareWalletClient> FindDevice(const std::string& fingerprint, std::optional<std::string> type)
 {
     for (const DeviceInfo& info : Enumerate()) {
         if (!fingerprint.empty() && info.fingerprint != fingerprint) continue;
         if (type && info.type != *type) continue;
-        if (info.type == "mock") return ConnectMock(info);
-        if (info.type == "coldcard") return ConnectColdcard(info);
-        if (info.type == "ledger") return ConnectLedger(info);
-        if (info.type == "trezor") return ConnectTrezor(info);
+        if (info.type != "mock" && info.type != "coldcard" && info.type != "ledger" && info.type != "trezor") continue;
+        return ConnectDevice(info);
     }
     return nullptr;
 }
@@ -231,7 +240,17 @@ std::string DisplayAddress(const HardwareWalletClient& client, const std::string
     if (!ExtractDestination(scripts.at(0), dest)) {
         throw HWIError("Descriptor does not have an address", ErrorCode::BAD_ARGUMENT);
     }
-    return EncodeDestination(dest);
+    if (!client.CanDisplayMultisigAddress()) {
+        throw HWIError("This hardware wallet cannot display multisig addresses",
+                       ErrorCode::UNAVAILABLE_ACTION);
+    }
+    const std::string expected{EncodeDestination(dest)};
+    const std::string displayed{client.DisplayMultisigAddress(descriptor)};
+    if (displayed != expected) {
+        throw HWIError("Hardware wallet displayed a different address",
+                       ErrorCode::UNKNOWN_ERROR);
+    }
+    return displayed;
 }
 
 uint32_t BIP44Purpose(OutputType type)

@@ -5,8 +5,10 @@
 #include <addresstype.h>
 #include <consensus/amount.h>
 #include <external_signer.h>
+#include <external_signer_discovery.h>
 #include <hwi/hwi.h>
 #include <hwi/mock.h>
+#include <interfaces/node.h>
 #include <key.h>
 #include <key_io.h>
 #include <primitives/transaction.h>
@@ -22,7 +24,9 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -31,6 +35,11 @@ BOOST_FIXTURE_TEST_SUITE(hwi_tests, BasicTestingSetup)
 static CExtKey MockMaster()
 {
     return hwi::MakeMockMasterFromHex();
+}
+
+static CExtKey OtherMockMaster(std::string_view suffix)
+{
+    return hwi::MakeMockMasterFromHex("101112131415161718191a1b1c1d1e" + std::string{suffix});
 }
 
 BOOST_AUTO_TEST_CASE(mock_enumerate_and_xpub)
@@ -128,6 +137,40 @@ BOOST_AUTO_TEST_CASE(mock_displayaddress)
     BOOST_CHECK_EQUAL(hwi::DisplayAddress(*client, bech32_receive), address);
 }
 
+BOOST_AUTO_TEST_CASE(multisig_display_requires_physical_capability_and_exact_echo)
+{
+    const auto receive_descriptor = [](const hwi::MockRegistration& registration) {
+        auto client{registration.Connect()};
+        const hwi::DescriptorSets descs{hwi::GetDescriptors(*client, /*account=*/0)};
+        const auto it{std::ranges::find_if(descs.receive, [](const std::string& desc) {
+            return desc.starts_with("wpkh(");
+        })};
+        BOOST_REQUIRE(it != descs.receive.end());
+        return *it;
+    };
+
+    hwi::MockDeviceOptions unsupported_options;
+    unsupported_options.can_display_multisig_address = false;
+    hwi::MockRegistration unsupported{OtherMockMaster("10"), ChainType::MAIN, unsupported_options};
+    auto unsupported_client{unsupported.Connect()};
+    const std::string unsupported_desc{receive_descriptor(unsupported)};
+    BOOST_CHECK_THROW(hwi::DisplayAddress(*unsupported_client, unsupported_desc), hwi::HWIError);
+
+    hwi::MockDeviceOptions refusal_options;
+    refusal_options.display_address_error = "User refused physical display";
+    hwi::MockRegistration refusal{OtherMockMaster("11"), ChainType::MAIN, refusal_options};
+    auto refusal_client{refusal.Connect()};
+    const std::string refusal_desc{receive_descriptor(refusal)};
+    BOOST_CHECK_THROW(hwi::DisplayAddress(*refusal_client, refusal_desc), hwi::HWIError);
+
+    hwi::MockDeviceOptions mismatch_options;
+    mismatch_options.displayed_address_override = "bc1qwrongdisplayedaddress";
+    hwi::MockRegistration mismatch{OtherMockMaster("12"), ChainType::MAIN, mismatch_options};
+    auto mismatch_client{mismatch.Connect()};
+    const std::string mismatch_desc{receive_descriptor(mismatch)};
+    BOOST_CHECK_THROW(hwi::DisplayAddress(*mismatch_client, mismatch_desc), hwi::HWIError);
+}
+
 BOOST_AUTO_TEST_CASE(mock_signmessage)
 {
     hwi::MockRegistration mock{MockMaster()};
@@ -198,6 +241,164 @@ BOOST_AUTO_TEST_CASE(native_external_signer)
     const UniValue displayed{mock_signer->DisplayAddress(desc)};
     BOOST_CHECK(displayed.find_value("address").isStr());
     BOOST_CHECK(!displayed.find_value("address").get_str().empty());
+}
+
+BOOST_AUTO_TEST_CASE(diagnostic_discovery_distinguishes_configuration_and_empty_success)
+{
+    static const std::string ACCOUNT_PATH{"m/48h/0h/0h/2h"};
+    hwi::UsbEnumerateSuppress no_usb;
+
+    const auto not_configured{DiscoverExternalSigners("", "main", ACCOUNT_PATH)};
+    BOOST_CHECK(not_configured.status == interfaces::ExternalSignerDiscoveryStatus::NOT_CONFIGURED);
+    BOOST_CHECK_EQUAL(not_configured.account_path, ACCOUNT_PATH);
+    BOOST_CHECK(not_configured.devices.empty());
+    BOOST_CHECK(!not_configured.error);
+
+    const auto empty{DiscoverExternalSigners("internal", "main", ACCOUNT_PATH)};
+    BOOST_CHECK(empty.status == interfaces::ExternalSignerDiscoveryStatus::SUCCESS);
+    BOOST_CHECK(empty.devices.empty());
+    BOOST_CHECK(!empty.error);
+
+    std::unique_ptr<interfaces::Node> node{interfaces::MakeNode(m_node)};
+    m_node.args->ForceSetArg("-signer", "");
+    BOOST_CHECK(node->discoverExternalSigners(ACCOUNT_PATH).status == interfaces::ExternalSignerDiscoveryStatus::NOT_CONFIGURED);
+    m_node.args->ForceSetArg("-signer", "internal");
+    const auto node_empty{node->discoverExternalSigners(ACCOUNT_PATH)};
+    BOOST_CHECK(node_empty.status == interfaces::ExternalSignerDiscoveryStatus::SUCCESS);
+    BOOST_CHECK(node_empty.devices.empty());
+}
+
+BOOST_AUTO_TEST_CASE(diagnostic_discovery_retains_device_evidence_and_duplicates)
+{
+    static const std::string ACCOUNT_PATH{"m/48h/0h/0h/2h"};
+    hwi::UsbEnumerateSuppress no_usb;
+    const CExtKey master{MockMaster()};
+    hwi::MockRegistration first{master};
+    hwi::MockRegistration second{master};
+
+    const auto result{DiscoverExternalSigners("internal", "main", ACCOUNT_PATH)};
+    BOOST_REQUIRE(result.status == interfaces::ExternalSignerDiscoveryStatus::SUCCESS);
+    BOOST_REQUIRE_EQUAL(result.devices.size(), 2U);
+    BOOST_CHECK(!result.error);
+    for (const auto& device : result.devices) {
+        BOOST_CHECK_EQUAL(device.type, "mock");
+        BOOST_CHECK_EQUAL(device.model, "Mock Trezor");
+        BOOST_CHECK(!device.path.empty());
+        BOOST_CHECK_EQUAL(device.fingerprint, first.Fingerprint());
+        BOOST_CHECK(!device.locked);
+        BOOST_CHECK(device.duplicate);
+        BOOST_CHECK(!device.error);
+        BOOST_REQUIRE(device.supports_staged_vault);
+        BOOST_CHECK(*device.supports_staged_vault);
+        BOOST_REQUIRE(device.supports_multisig_address_display);
+        BOOST_CHECK(*device.supports_multisig_address_display);
+        BOOST_REQUIRE(device.account_xpub);
+        BOOST_CHECK(!device.account_xpub->empty());
+        BOOST_CHECK(!device.account_xpub_error);
+        BOOST_CHECK(!device.IsUsableForStagedVault());
+    }
+    BOOST_CHECK_NE(result.devices[0].path, result.devices[1].path);
+    BOOST_CHECK_EQUAL(*result.devices[0].account_xpub, *result.devices[1].account_xpub);
+
+    std::vector<ExternalSigner> legacy;
+    BOOST_CHECK(ExternalSigner::Enumerate("internal", legacy, "main"));
+    BOOST_CHECK_EQUAL(legacy.size(), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(diagnostic_discovery_retains_faults_and_capability_evidence)
+{
+    static const std::string ACCOUNT_PATH{"m/48h/0h/0h/2h"};
+    hwi::UsbEnumerateSuppress no_usb;
+
+    hwi::MockDeviceOptions locked_options;
+    locked_options.locked = true;
+    locked_options.needs_pin = true;
+    hwi::MockRegistration locked{OtherMockMaster("00"), ChainType::MAIN, locked_options};
+
+    hwi::MockDeviceOptions enumeration_options;
+    enumeration_options.enumerate_error = "Injected device enumeration error";
+    hwi::MockRegistration enumeration_error{OtherMockMaster("01"), ChainType::MAIN, enumeration_options};
+
+    hwi::MockDeviceOptions unsupported_options;
+    unsupported_options.can_sign_musig2 = false;
+    hwi::MockRegistration unsupported{OtherMockMaster("02"), ChainType::MAIN, unsupported_options};
+
+    hwi::MockDeviceOptions xpub_options;
+    xpub_options.account_xpub_error = "Injected account xpub failure";
+    hwi::MockRegistration xpub_error{OtherMockMaster("03"), ChainType::MAIN, xpub_options};
+
+    hwi::MockDeviceOptions connection_options;
+    connection_options.connect_error = "Injected connection failure";
+    hwi::MockRegistration connection_error{OtherMockMaster("04"), ChainType::MAIN, connection_options};
+
+    hwi::MockRegistration supported{OtherMockMaster("05")};
+
+    const auto result{DiscoverExternalSigners("internal", "main", ACCOUNT_PATH)};
+    BOOST_REQUIRE(result.status == interfaces::ExternalSignerDiscoveryStatus::SUCCESS);
+    BOOST_REQUIRE_EQUAL(result.devices.size(), 6U);
+
+    auto find_device = [&](const hwi::MockRegistration& registration) -> const interfaces::ExternalSignerDeviceDiagnostics& {
+        const auto it{std::find_if(result.devices.begin(), result.devices.end(), [&](const auto& device) {
+            return device.path == registration.Path();
+        })};
+        BOOST_REQUIRE(it != result.devices.end());
+        return *it;
+    };
+
+    const auto& locked_device{find_device(locked)};
+    BOOST_CHECK(locked_device.locked);
+    BOOST_CHECK(locked_device.fingerprint.empty());
+    BOOST_CHECK(!locked_device.supports_staged_vault);
+    BOOST_CHECK(!locked_device.account_xpub);
+    BOOST_CHECK(!locked_device.IsUsableForStagedVault());
+
+    const auto& enumeration_device{find_device(enumeration_error)};
+    BOOST_REQUIRE(enumeration_device.error);
+    BOOST_CHECK_EQUAL(*enumeration_device.error, "Injected device enumeration error");
+    BOOST_CHECK(!enumeration_device.supports_staged_vault);
+    BOOST_CHECK(!enumeration_device.account_xpub);
+    BOOST_CHECK(!enumeration_device.IsUsableForStagedVault());
+
+    const auto& unsupported_device{find_device(unsupported)};
+    BOOST_REQUIRE(unsupported_device.supports_staged_vault);
+    BOOST_CHECK(!*unsupported_device.supports_staged_vault);
+    BOOST_REQUIRE(unsupported_device.account_xpub);
+    BOOST_CHECK(!unsupported_device.account_xpub->empty());
+    BOOST_CHECK(!unsupported_device.IsUsableForStagedVault());
+
+    const auto& xpub_device{find_device(xpub_error)};
+    BOOST_REQUIRE(xpub_device.supports_staged_vault);
+    BOOST_CHECK(*xpub_device.supports_staged_vault);
+    BOOST_CHECK(!xpub_device.account_xpub);
+    BOOST_REQUIRE(xpub_device.account_xpub_error);
+    BOOST_CHECK_EQUAL(*xpub_device.account_xpub_error, "Injected account xpub failure");
+    BOOST_CHECK(!xpub_device.IsUsableForStagedVault());
+
+    const auto& connection_device{find_device(connection_error)};
+    BOOST_REQUIRE(connection_device.error);
+    BOOST_CHECK_EQUAL(*connection_device.error, "Injected connection failure");
+    BOOST_CHECK(!connection_device.supports_staged_vault);
+    BOOST_CHECK(!connection_device.account_xpub);
+    BOOST_CHECK(!connection_device.IsUsableForStagedVault());
+
+    const auto& supported_device{find_device(supported)};
+    BOOST_CHECK(supported_device.IsUsableForStagedVault());
+    BOOST_REQUIRE(supported_device.supports_multisig_address_display);
+    BOOST_CHECK(*supported_device.supports_multisig_address_display);
+}
+
+BOOST_AUTO_TEST_CASE(diagnostic_discovery_reports_backend_failure)
+{
+    hwi::UsbEnumerateSuppress no_usb;
+    hwi::MockDeviceOptions options;
+    options.enumerate_throws = true;
+    hwi::MockRegistration failure{MockMaster(), ChainType::MAIN, options};
+
+    const auto result{DiscoverExternalSigners("internal", "main", "m/48h/0h/0h/2h")};
+    BOOST_CHECK(result.status == interfaces::ExternalSignerDiscoveryStatus::FAILED);
+    BOOST_CHECK(result.devices.empty());
+    BOOST_REQUIRE(result.error);
+    BOOST_CHECK_EQUAL(*result.error, "Injected mock enumeration failure");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

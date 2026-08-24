@@ -48,11 +48,15 @@ std::vector<std::pair<fs::path, std::string>> ListDatabases(const fs::path& wall
                         paths.emplace_back(fs::path(), "sqlite");
                     }
                 } else if (IsBDBFile(it->path())) {
-                    // Found top-level btree file not called wallet.dat. Current bitcoin
+                    // Found a top-level btree file not called wallet.dat. Current bitcoin
                     // software will never create these files but will allow them to be
                     // opened in a shared database environment for backwards compatibility.
-                    // Add it to the list of available wallets.
                     paths.emplace_back(path, "bdb");
+                } else if (IsSQLiteFile(it->path())) {
+                    // A fixed vault is atomically published as a complete, closed SQLite
+                    // file. Keep it top-level so publication can use a no-overwrite hard
+                    // link instead of exposing a partially populated final directory.
+                    paths.emplace_back(path, "sqlite");
                 }
             }
         } catch (const std::exception& e) {
@@ -88,7 +92,10 @@ fs::path BDBDataFile(const fs::path& wallet_path)
 
 fs::path SQLiteDataFile(const fs::path& path)
 {
-    return path / "wallet.dat";
+    // Regular top-level SQLite wallets are used by the fixed-vault publisher
+    // because a complete file can be atomically linked without overwriting an
+    // existing name. Directory wallets retain the normal wallet.dat layout.
+    return fs::is_regular_file(path) ? path : path / "wallet.dat";
 }
 
 bool IsBDBFile(const fs::path& path)

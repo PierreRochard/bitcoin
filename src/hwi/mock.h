@@ -24,13 +24,30 @@ inline constexpr std::string_view MOCK_SEED_HEX{"000102030405060708090a0b0c0d0e0
 CExtKey MakeMockMaster(std::span<const std::byte> seed);
 CExtKey MakeMockMasterFromHex(std::string_view hex_seed = MOCK_SEED_HEX);
 
+//! Per-registration fault and capability controls for discovery tests.
+struct MockDeviceOptions {
+    std::string model{"Mock Trezor"};
+    bool locked{false};
+    bool needs_pin{false};
+    bool needs_passphrase{false};
+    bool can_sign_taproot{true};
+    bool can_sign_musig2{true};
+    bool can_display_multisig_address{true};
+    bool enumerate_throws{false};
+    std::optional<std::string> enumerate_error;
+    std::optional<std::string> connect_error;
+    std::optional<std::string> account_xpub_error;
+    std::optional<std::string> display_address_error;
+    std::optional<std::string> displayed_address_override;
+};
+
 //! RAII registration of a software "hardware wallet" that Enumerate() and
 //! FindDevice() can see. Used by unit tests and (later) functional tests so
 //! wallet/GUI work does not require USB hardware.
 class MockRegistration
 {
 public:
-    explicit MockRegistration(CExtKey master, ChainType chain = ChainType::MAIN);
+    explicit MockRegistration(CExtKey master, ChainType chain = ChainType::MAIN, MockDeviceOptions options = {});
     ~MockRegistration();
 
     MockRegistration(const MockRegistration&) = delete;
@@ -47,6 +64,9 @@ private:
 
 std::vector<DeviceInfo> EnumerateMockDevices();
 std::unique_ptr<HardwareWalletClient> ConnectMock(const DeviceInfo& info);
+//! Test-only: reverse mock enumeration without changing paths or identities.
+//! Callers must reverse again during teardown.
+void ReverseMockEnumerationOrder();
 //! True while a UsbEnumerateSuppress is alive (mock-only unit tests).
 bool UsbEnumerateSuppressed();
 

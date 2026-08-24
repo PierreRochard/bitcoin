@@ -34,6 +34,7 @@ struct MockRecord {
     CExtKey master;
     ChainType chain;
     std::string fingerprint;
+    MockDeviceOptions options;
     // Secret nonces must survive the nonce round so the next SignTx can
     // produce a MuSig2 partial signature (BIP 327).
     std::map<uint256, MuSig2SecNonce> musig2_secnonces;
@@ -58,8 +59,8 @@ CExtPubKey DeriveXpub(const CExtKey& master, const std::string& bip32_path)
 class MockHardwareWallet final : public HardwareWalletClient
 {
 public:
-    MockHardwareWallet(std::string path, CExtKey master, ChainType chain)
-        : HardwareWalletClient(std::move(path), chain), m_master{std::move(master)}
+    MockHardwareWallet(std::string path, CExtKey master, ChainType chain, MockDeviceOptions options)
+        : HardwareWalletClient(std::move(path), chain), m_master{std::move(master)}, m_options{std::move(options)}
     {
     }
 
@@ -67,6 +68,9 @@ public:
 
     CExtPubKey GetPubkeyAtPath(const std::string& bip32_path) const override
     {
+        if (m_options.account_xpub_error) {
+            throw HWIError(*m_options.account_xpub_error, ErrorCode::DEVICE_CONN_ERROR);
+        }
         return DeriveXpub(m_master, bip32_path);
     }
 
@@ -160,8 +164,17 @@ public:
         return signature;
     }
 
-    bool CanSignTaproot() const override { return true; }
-    bool CanSignMuSig2() const override { return true; }
+    bool CanSignTaproot() const override { return m_options.can_sign_taproot; }
+    bool CanSignMuSig2() const override { return m_options.can_sign_musig2; }
+    bool CanDisplayMultisigAddress() const override { return m_options.can_display_multisig_address; }
+    std::string DisplayMultisigAddress(const std::string& descriptor) const override
+    {
+        if (m_options.display_address_error) {
+            throw HWIError(*m_options.display_address_error, ErrorCode::UNKNOWN_ERROR);
+        }
+        if (m_options.displayed_address_override) return *m_options.displayed_address_override;
+        return AddressFromDescriptor(descriptor);
+    }
     void Close() override {}
 
     KeyFingerprint GetMasterFingerprint() const override
@@ -171,6 +184,7 @@ public:
 
 private:
     CExtKey m_master;
+    MockDeviceOptions m_options;
 };
 
 } // namespace
@@ -191,7 +205,7 @@ CExtKey MakeMockMasterFromHex(std::string_view hex_seed)
     return MakeMockMaster(seed);
 }
 
-MockRegistration::MockRegistration(CExtKey master, ChainType chain)
+MockRegistration::MockRegistration(CExtKey master, ChainType chain, MockDeviceOptions options)
 {
     LOCK(g_mocks_mutex);
     m_path = strprintf("mock:%d", g_next_mock_id++);
@@ -201,6 +215,7 @@ MockRegistration::MockRegistration(CExtKey master, ChainType chain)
     rec->master = std::move(master);
     rec->chain = chain;
     rec->fingerprint = m_fingerprint;
+    rec->options = std::move(options);
     g_mocks.push_back(std::move(rec));
 }
 
@@ -240,22 +255,45 @@ std::vector<DeviceInfo> EnumerateMockDevices()
     std::vector<DeviceInfo> result;
     result.reserve(g_mocks.size());
     for (const auto& record : g_mocks) {
+        if (record->options.enumerate_throws) {
+            throw HWIError("Injected mock enumeration failure", ErrorCode::DEVICE_CONN_ERROR);
+        }
         DeviceInfo info;
         info.type = "mock";
-        info.model = "Mock Trezor";
+        info.model = record->options.model;
         info.path = record->path;
-        info.fingerprint = record->fingerprint;
+        if (!record->options.locked) info.fingerprint = record->fingerprint;
+        info.needs_pin = record->options.needs_pin;
+        info.needs_passphrase = record->options.needs_passphrase;
+        info.error = record->options.enumerate_error;
         result.push_back(std::move(info));
     }
     return result;
 }
 
+void ReverseMockEnumerationOrder()
+{
+    LOCK(g_mocks_mutex);
+    std::reverse(g_mocks.begin(), g_mocks.end());
+}
+
 std::unique_ptr<HardwareWalletClient> ConnectMock(const DeviceInfo& info)
 {
     LOCK(g_mocks_mutex);
-    for (const auto& record : g_mocks) {
-        if (record->path == info.path || (!info.fingerprint.empty() && record->fingerprint == info.fingerprint)) {
-            return std::make_unique<MockHardwareWallet>(record->path, record->master, record->chain);
+    auto connect = [](const MockRecord& record) -> std::unique_ptr<HardwareWalletClient> {
+        if (record.options.connect_error) {
+            throw HWIError(*record.options.connect_error, ErrorCode::DEVICE_CONN_ERROR);
+        }
+        return std::make_unique<MockHardwareWallet>(record.path, record.master, record.chain, record.options);
+    };
+    if (!info.path.empty()) {
+        for (const auto& record : g_mocks) {
+            if (record->path == info.path) return connect(*record);
+        }
+    }
+    if (!info.fingerprint.empty()) {
+        for (const auto& record : g_mocks) {
+            if (record->fingerprint == info.fingerprint) return connect(*record);
         }
     }
     throw HWIError("Mock device not found", ErrorCode::DEVICE_CONN_ERROR);

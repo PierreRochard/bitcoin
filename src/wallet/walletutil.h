@@ -54,6 +54,12 @@ enum WalletFlags : uint64_t {
 
     //! Indicates that the wallet needs an external signer
     WALLET_FLAG_EXTERNAL_SIGNER = (1ULL << 35),
+
+    //! A fixed-vault restore has installed timestamp-zero descriptors but has
+    //! not yet completed its required scan from genesis. This mandatory flag
+    //! prevents older software from presenting an incomplete restored wallet
+    //! as synchronized.
+    WALLET_FLAG_GENESIS_RESCAN_REQUIRED = (1ULL << 36),
 };
 
 //! Get the path of the wallet directory.

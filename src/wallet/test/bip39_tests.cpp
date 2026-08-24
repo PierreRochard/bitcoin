@@ -334,6 +334,64 @@ BOOST_FIXTURE_TEST_CASE(fixed_staged_policy_validation, BasicTestingSetup)
     BOOST_CHECK(util::ErrorString(invalid_pair).original.find("receive and change") != std::string::npos);
 }
 
+BOOST_FIXTURE_TEST_CASE(multisig_candidate_prepared_before_wallet_commit, BasicTestingSetup)
+{
+    std::vector<MultisigKeySpec> candidate_specs(3);
+    for (auto& spec : candidate_specs) spec.generate_local = true;
+    MultisigOptions options;
+    options.type = OutputType::BECH32M;
+    options.fallback_older = 4320;
+    options.fallback_older_one_key = 8640;
+
+    auto prepared{PrepareMultisigDescriptor(/*nrequired=*/2, candidate_specs, options)};
+    BOOST_REQUIRE_MESSAGE(prepared, util::ErrorString(prepared).original);
+    BOOST_REQUIRE_EQUAL(prepared->descs.size(), 2U);
+    BOOST_REQUIRE_EQUAL(prepared->recovery.size(), 3U);
+    BOOST_CHECK_EQUAL(prepared->policy_id, VaultPolicyId(prepared->descs.front()));
+    for (const std::string& descriptor : prepared->descs) {
+        BOOST_CHECK(descriptor.find("xprv") == std::string::npos);
+        BOOST_CHECK(descriptor.find("tprv") == std::string::npos);
+        for (const auto& recovery : prepared->recovery) {
+            BOOST_CHECK(descriptor.find(std::string{recovery.mnemonic}) == std::string::npos);
+        }
+    }
+
+    VaultPolicyPackage package;
+    package.network = Params().GetChainTypeString();
+    package.nrequired = 2;
+    package.fallback_older = 4320;
+    package.fallback_older_one_key = 8640;
+    package.recovery_stages = {{2, 4320, {}}, {1, 8640, {}}};
+    package.descs = prepared->descs;
+    package.policy_id = prepared->policy_id;
+    const auto fixed{ValidateFixedStagedVaultPolicy(package)};
+    BOOST_REQUIRE_MESSAGE(fixed, util::ErrorString(fixed).original);
+
+    // Commit the already printed phrases into a wallet only after the public
+    // candidate has been fixed. The resulting descriptors must be byte-for-
+    // byte identical, and committing must not mint replacement mnemonics.
+    std::vector<MultisigKeySpec> commit_specs(3);
+    for (const auto& recovery : prepared->recovery) {
+        BOOST_REQUIRE_LT(recovery.key_index, commit_specs.size());
+        commit_specs[recovery.key_index].recovery_mnemonic.emplace(
+            recovery.mnemonic.begin(), recovery.mnemonic.end());
+    }
+    auto wallet{MakeMnemonicWallet("prepared_candidate_commit")};
+    auto committed{[&] {
+        LOCK(wallet->cs_wallet);
+        return CreateMultisigDescriptor(*wallet, /*nrequired=*/2, commit_specs, options);
+    }()};
+    BOOST_REQUIRE_MESSAGE(committed, util::ErrorString(committed).original);
+    BOOST_CHECK(committed->recovery.empty());
+    BOOST_CHECK(committed->descs == prepared->descs);
+    BOOST_CHECK_EQUAL(committed->policy_id, prepared->policy_id);
+
+    std::vector<MultisigKeySpec> implicit_specs(3);
+    auto implicit{PrepareMultisigDescriptor(/*nrequired=*/2, implicit_specs, options)};
+    BOOST_REQUIRE(!implicit);
+    BOOST_CHECK(util::ErrorString(implicit).original.find("explicit") != std::string::npos);
+}
+
 BOOST_FIXTURE_TEST_CASE(generated_mnemonics_restore_public_policy, BasicTestingSetup)
 {
     auto source{MakeMnemonicWallet("mnemonic_source")};

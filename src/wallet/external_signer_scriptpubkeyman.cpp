@@ -6,6 +6,7 @@
 #include <common/args.h>
 #include <common/system.h>
 #include <external_signer.h>
+#include <hwi/hwi.h>
 #include <node/types.h>
 #include <wallet/external_signer_scriptpubkeyman.h>
 
@@ -54,18 +55,20 @@ std::unique_ptr<ExternalSignerScriptPubKeyMan> ExternalSignerScriptPubKeyMan::Cr
     return spkm;
 }
 
-util::Result<std::vector<ExternalSigner>> ExternalSignerScriptPubKeyMan::GetExternalSigners()
+util::Result<std::vector<ExternalSigner>> ExternalSignerScriptPubKeyMan::GetExternalSigners(bool allow_native_default)
 {
-    const std::string command = gArgs.GetArg("-signer", "");
+    const std::string command{gArgs.IsArgSet("-signer")
+            ? gArgs.GetArg("-signer", "")
+            : (allow_native_default ? std::string{hwi::NATIVE_SIGNER_COMMAND} : std::string{})};
     if (command.empty()) return util::Error{Untranslated("restart bitcoind with -signer=<cmd>")};
     std::vector<ExternalSigner> signers;
     ExternalSigner::Enumerate(command, signers, Params().GetChainTypeString());
     return signers;
 }
 
-util::Result<ExternalSigner> ExternalSignerScriptPubKeyMan::GetExternalSigner(const std::optional<std::string>& fingerprint)
+util::Result<ExternalSigner> ExternalSignerScriptPubKeyMan::GetExternalSigner(const std::optional<std::string>& fingerprint, bool allow_native_default)
 {
-    auto signers = GetExternalSigners();
+    auto signers = GetExternalSigners(allow_native_default);
     if (!signers) return util::Error{util::ErrorString(signers)};
     if (fingerprint) {
         for (const ExternalSigner& signer : *signers) {
@@ -80,7 +83,7 @@ util::Result<ExternalSigner> ExternalSignerScriptPubKeyMan::GetExternalSigner(co
     return (*signers)[0];
 }
 
-std::optional<PSBTError> ExternalSignerScriptPubKeyMan::SignPSBT(PartiallySignedTransaction& psbt, bool finalize)
+std::optional<PSBTError> ExternalSignerScriptPubKeyMan::SignPSBT(PartiallySignedTransaction& psbt, bool finalize, bool allow_native_default)
 {
     bool complete = true;
     for (const auto& input : psbt.inputs) {
@@ -91,7 +94,7 @@ std::optional<PSBTError> ExternalSignerScriptPubKeyMan::SignPSBT(PartiallySigned
         return {};
     }
 
-    auto signers = GetExternalSigners();
+    auto signers = GetExternalSigners(allow_native_default);
     if (!signers) {
         LogWarning("%s", util::ErrorString(signers).original);
         return PSBTError::EXTERNAL_SIGNER_NOT_FOUND;

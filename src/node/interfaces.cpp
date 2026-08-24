@@ -15,6 +15,8 @@
 #include <consensus/merkle.h>
 #include <consensus/validation.h>
 #include <external_signer.h>
+#include <external_signer_discovery.h>
+#include <hwi/hwi.h>
 #include <httprpc.h>
 #include <index/blockfilterindex.h>
 #include <init.h>
@@ -293,6 +295,25 @@ public:
         // (or something that also includes error messages) if this distinction
         // becomes important.
         return {};
+#endif // ENABLE_EXTERNAL_SIGNER
+    }
+    interfaces::ExternalSignerDiscovery discoverExternalSigners(const std::string& account_path) override
+    {
+#ifdef ENABLE_EXTERNAL_SIGNER
+        // Fixed-vault diagnostics use native discovery out of the box. An
+        // explicit -signer value (including an empty/negated value) retains
+        // its configured meaning, while listExternalSigners() and RPC keep
+        // their legacy requirement for -signer.
+        const std::string command{
+            args().IsArgSet("-signer")
+                ? args().GetArg("-signer", "")
+                : std::string{hwi::NATIVE_SIGNER_COMMAND}};
+        return DiscoverExternalSigners(command, Params().GetChainTypeString(), account_path);
+#else
+        interfaces::ExternalSignerDiscovery result;
+        result.status = interfaces::ExternalSignerDiscoveryStatus::FAILED;
+        result.error = "External signer support is not available in this build";
+        return result;
 #endif // ENABLE_EXTERNAL_SIGNER
     }
     int64_t getTotalBytesRecv() override { return m_context->connman ? m_context->connman->GetTotalBytesRecv() : 0; }

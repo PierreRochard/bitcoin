@@ -274,12 +274,26 @@ BOOST_AUTO_TEST_CASE(select_signer_by_fingerprint)
 BOOST_AUTO_TEST_CASE(signer_command_required)
 {
     gArgs.ForceSetArg("-signer", "");
-    auto signers = ExternalSignerScriptPubKeyMan::GetExternalSigners();
+    auto signers = ExternalSignerScriptPubKeyMan::GetExternalSigners(/*allow_native_default=*/true);
     BOOST_CHECK(!signers);
     BOOST_CHECK(util::ErrorString(signers).original.find("-signer") != std::string::npos);
 
-    auto one = ExternalSignerScriptPubKeyMan::GetExternalSigner();
+    auto one = ExternalSignerScriptPubKeyMan::GetExternalSigner(std::nullopt, /*allow_native_default=*/true);
     BOOST_CHECK(!one);
+}
+
+BOOST_AUTO_TEST_CASE(native_default_must_be_explicitly_allowed)
+{
+    BOOST_REQUIRE(!gArgs.IsArgSet("-signer"));
+    hwi::MockRegistration mock{hwi::MakeMockMasterFromHex()};
+
+    auto legacy = ExternalSignerScriptPubKeyMan::GetExternalSigners();
+    BOOST_CHECK(!legacy);
+
+    auto operational = ExternalSignerScriptPubKeyMan::GetExternalSigners(/*allow_native_default=*/true);
+    BOOST_REQUIRE(operational);
+    BOOST_REQUIRE_EQUAL(operational->size(), 1U);
+    BOOST_CHECK_EQUAL(operational->front().m_fingerprint, mock.Fingerprint());
 }
 
 BOOST_AUTO_TEST_CASE(mixed_flag_allows_private_keys)

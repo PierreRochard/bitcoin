@@ -90,6 +90,16 @@ struct MultisigDescriptorResult {
     std::string policy_id;
 };
 
+//! Resolve keys and build canonical public descriptors without touching a
+//! wallet database. Every participant must be explicit (generated mnemonic,
+//! recovery mnemonic, xpub, xprv, or external-signer fingerprint); selecting
+//! an existing wallet HD root is intentionally unavailable. This is used by
+//! setup flows that must secure recovery material before creating a wallet.
+util::Result<MultisigDescriptorResult> PrepareMultisigDescriptor(
+    int nrequired,
+    const std::vector<MultisigKeySpec>& keys,
+    const MultisigOptions& options);
+
 struct VaultRecoveryStage {
     int nrequired{0};
     std::optional<uint32_t> older;
@@ -208,9 +218,19 @@ struct VaultMnemonicMatch {
     std::string xpub;
 };
 
+//! Public account identity for one fixed-vault participant.
+struct FixedVaultParticipant {
+    std::string fingerprint;
+    std::string path;
+    std::string xpub;
+};
+
 std::string FormatVaultPolicyPackage(const VaultPolicyPackage& pkg);
 util::Result<VaultPolicyPackage> ParseVaultPolicyPackage(const std::string& json);
 VaultPolicyPackage ExportWalletVaultPolicy(const CWallet& wallet);
+//! True only for the exact fixed 3/2/1 staged policy used by the consumer
+//! journey. The caller must hold wallet.cs_wallet.
+bool IsFixedStagedVault(const CWallet& wallet);
 util::Result<void> ImportWalletVaultPolicy(CWallet& wallet, const VaultPolicyPackage& pkg);
 //! Require the GUI's fixed policy: three active/recovery participants, 2-of-3
 //! after 4,320 blocks, then 1-of-3 after 8,640 blocks, on the standard account.
@@ -220,6 +240,24 @@ util::Result<void> ValidateFixedStagedVaultPolicy(const VaultPolicyPackage& pkg)
 //! No wallet state is read or changed.
 util::Result<std::vector<VaultMnemonicMatch>> ValidateVaultPolicyMnemonics(
     const VaultPolicyPackage& pkg, std::span<const SecureString> mnemonics);
+//! Validate zero to three phrases for the fixed staged-vault installer. An
+//! empty set deliberately produces a public-only policy suitable for exact
+//! external-signer reconnection; it is not accepted by the legacy mnemonic
+//! restore entry point below.
+util::Result<std::vector<VaultMnemonicMatch>> ValidateFixedVaultMnemonics(
+    const VaultPolicyPackage& pkg, std::span<const SecureString> mnemonics);
+//! Extract the exact public account identities from a canonical fixed policy.
+util::Result<std::vector<FixedVaultParticipant>> FixedVaultParticipants(const VaultPolicyPackage& pkg);
+//! Install the canonical fixed public policy and only the private providers
+//! derived from matching mnemonics. Descriptors are parsed from public package
+//! strings, so this path never constructs a private descriptor/xprv string.
+//! A creation_time of zero is required for disaster restoration.
+util::Result<std::vector<VaultMnemonicMatch>> InstallFixedVaultPolicy(
+    CWallet& wallet,
+    const VaultPolicyPackage& pkg,
+    std::span<const SecureString> mnemonics,
+    uint64_t creation_time,
+    bool persist_unavailable_as_lost = false);
 //! Import both public vault branches with only the private account keys matched
 //! by mnemonics. Caller must hold cs_wallet and unlock an encrypted wallet.
 //! Validation completes before descriptor state is changed.

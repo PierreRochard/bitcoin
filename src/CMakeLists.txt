@@ -118,6 +118,7 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   core_io.cpp
   deploymentinfo.cpp
   external_signer.cpp
+  external_signer_discovery.cpp
   hwi/coldcard.cpp
   hwi/hid.cpp
   hwi/hwi.cpp

@@ -312,6 +312,11 @@ public:
     virtual std::optional<uint32_t> taprootRecoveryDelay() = 0;
 
     struct VaultStatus {
+        struct VaultParticipant {
+            std::string fingerprint;
+            std::string path;
+            std::string xpub;
+        };
         struct VaultRecoveryStage {
             int nrequired{0};
             std::optional<uint32_t> older;
@@ -321,6 +326,8 @@ public:
             std::optional<int> earliest_blocks_remaining;
         };
         bool is_vault{false};
+        bool is_fixed_staged_vault{false};
+        bool genesis_rescan_required{false};
         std::optional<uint32_t> older;
         std::optional<uint32_t> after;
         int recovery_m{0};
@@ -328,6 +335,7 @@ public:
         CAmount awaiting_maturity{0};
         std::optional<int> earliest_blocks_remaining;
         std::vector<std::string> lost_signers;
+        std::vector<VaultParticipant> participants;
         std::vector<VaultRecoveryStage> recovery_stages;
     };
     virtual VaultStatus getVaultStatus() = 0;
@@ -339,6 +347,10 @@ public:
     //! phrases are accepted only in-process.
     virtual util::Result<std::vector<VaultMnemonicMatch>> restoreVaultPolicy(
         const std::string& package_json, const std::vector<SecureString>& mnemonics) = 0;
+    //! Rescan a fully installed timestamp-zero vault from genesis. This is
+    //! deliberately separate from secret import so callers can cleanse phrase
+    //! buffers before a potentially long scan and safely retry scan failures.
+    virtual util::Result<void> rescanFromGenesis() = 0;
 
     // Return whether wallet uses an external signer.
     virtual bool hasExternalSigner() = 0;
@@ -387,6 +399,16 @@ public:
     virtual util::Result<std::string> exportWatchOnlyWallet(const fs::path& destination) = 0;
 };
 
+enum class FixedVaultInstallMode {
+    CREATE,
+    RESTORE,
+};
+
+struct FixedVaultInstallResult {
+    std::unique_ptr<Wallet> wallet;
+    std::vector<Wallet::VaultMnemonicMatch> matches;
+};
+
 //! Wallet chain client that in addition to having chain client methods for
 //! starting up, shutting down, and registering RPCs, also has additional
 //! methods (called by the GUI) to load and create wallets.
@@ -397,6 +419,18 @@ public:
     //! needed for a wallet rescan beginning at genesis. This is a read-only
     //! preflight; callers must still handle the chain changing afterward.
     virtual util::Result<void> checkRescanFromGenesis() = 0;
+
+    //! Atomically publish a complete fixed 30/60-day vault. The package must
+    //! be the exact canonical public JSON and phrases may be empty. CREATE
+    //! timestamps descriptors at installation time; RESTORE uses timestamp
+    //! zero. The final wallet name is not created until a complete SQLite
+    //! staging wallet has been closed and is ready for atomic publication.
+    virtual util::Result<FixedVaultInstallResult> installFixedVault(
+        const std::string& name,
+        const std::string& canonical_package,
+        const std::vector<SecureString>& mnemonics,
+        FixedVaultInstallMode mode,
+        std::vector<bilingual_str>& warnings) = 0;
 
     //! Create new wallet.
     virtual util::Result<std::unique_ptr<Wallet>> createWallet(const std::string& name, const SecureString& passphrase, uint64_t wallet_creation_flags, std::vector<bilingual_str>& warnings) = 0;

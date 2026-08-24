@@ -67,6 +67,7 @@
 #include <wallet/crypter.h>
 #include <wallet/db.h>
 #include <wallet/external_signer_scriptpubkeyman.h>
+#include <wallet/multisig.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/transaction.h>
 #include <wallet/types.h>
@@ -284,8 +285,57 @@ void WaitForDeleteWallet(std::shared_ptr<CWallet>&& wallet)
 }
 
 namespace {
-std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings)
+bool CleanupWalletAfterFailedLoad(WalletContext& context, std::shared_ptr<CWallet>& wallet, bool notification_started)
 {
+    if (!wallet) return true;
+
+    bool cleanup_ok{true};
+    try {
+        wallet->DisconnectChainNotifications();
+    } catch (const std::exception& e) {
+        LogError("Failed to disconnect wallet notifications after load failure: %s\n", e.what());
+        cleanup_ok = false;
+    } catch (...) {
+        LogError("Failed to disconnect wallet notifications after load failure: unknown exception\n");
+        cleanup_ok = false;
+    }
+
+    // AddWallet() may throw from NotifyCanGetAddressesChanged() after adding
+    // the wallet to context.wallets, so do not rely on its return value to
+    // decide whether cleanup is needed.
+    {
+        LOCK(context.wallets_mutex);
+        std::erase(context.wallets, wallet);
+    }
+
+    // Notify upper layers even when NotifyWalletLoaded() itself threw. An
+    // earlier load callback may already have retained the wallet interface.
+    if (notification_started) {
+        try {
+            wallet->NotifyUnload();
+        } catch (const std::exception& e) {
+            LogError("Failed to notify wallet unload after load failure: %s\n", e.what());
+            cleanup_ok = false;
+        } catch (...) {
+            LogError("Failed to notify wallet unload after load failure: unknown exception\n");
+            cleanup_ok = false;
+        }
+    }
+
+    const bool still_registered{WITH_LOCK(context.wallets_mutex, return std::ranges::find(context.wallets, wallet) != context.wallets.end())};
+    if (still_registered) {
+        LogError("Wallet remained registered after load failure\n");
+        cleanup_ok = false;
+    }
+    wallet.reset();
+    return cleanup_ok;
+}
+
+std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings, bool* cleanup_ok_out = nullptr, bool defer_genesis_rescan = false)
+{
+    if (cleanup_ok_out) *cleanup_ok_out = true;
+    std::shared_ptr<CWallet> wallet;
+    bool notification_started{false};
     try {
         std::unique_ptr<WalletDatabase> database = MakeWalletDatabase(name, options, status, error);
         if (!database) {
@@ -294,13 +344,14 @@ std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::s
         }
 
         context.chain->initMessage(_("Loading wallet…"));
-        std::shared_ptr<CWallet> wallet = CWallet::LoadExisting(context, name, std::move(database), error, warnings);
+        wallet = CWallet::LoadExisting(context, name, std::move(database), error, warnings, defer_genesis_rescan);
         if (!wallet) {
             error = Untranslated("Wallet loading failed.") + Untranslated(" ") + error;
             status = DatabaseStatus::FAILED_LOAD;
             return nullptr;
         }
 
+        notification_started = true;
         NotifyWalletLoaded(context, wallet);
         AddWallet(context, wallet);
         wallet->postInitProcess();
@@ -309,8 +360,20 @@ std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::s
         UpdateWalletSetting(*context.chain, name, load_on_start, warnings);
 
         return wallet;
-    } catch (const std::runtime_error& e) {
-        error = Untranslated(e.what());
+    } catch (const std::exception& e) {
+        const bool cleanup_ok{CleanupWalletAfterFailedLoad(context, wallet, notification_started)};
+        if (cleanup_ok_out) *cleanup_ok_out = cleanup_ok;
+        error = cleanup_ok
+            ? Untranslated(e.what())
+            : Untranslated(strprintf("%s Wallet load cleanup did not complete safely.", e.what()));
+        status = DatabaseStatus::FAILED_LOAD;
+        return nullptr;
+    } catch (...) {
+        const bool cleanup_ok{CleanupWalletAfterFailedLoad(context, wallet, notification_started)};
+        if (cleanup_ok_out) *cleanup_ok_out = cleanup_ok;
+        error = Untranslated(cleanup_ok
+            ? "Unknown wallet load failure."
+            : "Unknown wallet load failure. Wallet load cleanup did not complete safely.");
         status = DatabaseStatus::FAILED_LOAD;
         return nullptr;
     }
@@ -382,6 +445,147 @@ std::shared_ptr<CWallet> LoadWallet(WalletContext& context, const std::string& n
     }
     auto wallet = LoadWalletInternal(context, name, load_on_start, options, status, error, warnings);
     WITH_LOCK(g_loading_wallet_mutex, g_loading_wallet_set.erase(result.first));
+    return wallet;
+}
+
+std::shared_ptr<CWallet> PublishStagedVaultWallet(
+    WalletContext& context,
+    const fs::path& staging_dir,
+    const fs::path& staging_database,
+    const std::string& name,
+    std::optional<bool> load_on_start,
+    DatabaseStatus& status,
+    bilingual_str& error,
+    std::vector<bilingual_str>& warnings)
+{
+    const fs::path wallet_dir{GetWalletDir().lexically_normal()};
+    const fs::path normalized_stage{staging_dir.lexically_normal()};
+    const fs::path normalized_database{staging_database.lexically_normal()};
+    const fs::path name_path{fs::PathFromString(name)};
+    const std::string stage_name{fs::PathToString(normalized_stage.filename())};
+    if (name.empty() || name_path.has_parent_path() || name_path.filename() != name_path ||
+        normalized_stage.parent_path() != wallet_dir || normalized_database.parent_path() != normalized_stage ||
+        !stage_name.starts_with(".bitcoin-fixed-vault-stage-")) {
+        status = DatabaseStatus::FAILED_BAD_PATH;
+        error = Untranslated("Fixed vault installation requires a simple wallet name and an internal same-directory staging wallet");
+        return nullptr;
+    }
+    std::error_code path_error;
+    if (!fs::is_regular_file(normalized_database, path_error) || path_error) {
+        status = DatabaseStatus::FAILED_NOT_FOUND;
+        error = Untranslated("Fixed vault staging database is missing");
+        return nullptr;
+    }
+    const auto final_path_result{GetWalletPath(name)};
+    if (!final_path_result) {
+        status = DatabaseStatus::FAILED_BAD_PATH;
+        error = util::ErrorString(final_path_result);
+        return nullptr;
+    }
+    const fs::path final_path{final_path_result->lexically_normal()};
+    if (final_path.parent_path() != wallet_dir) {
+        status = DatabaseStatus::FAILED_BAD_PATH;
+        error = Untranslated("Fixed vault wallet must be created directly inside the wallet directory");
+        return nullptr;
+    }
+
+    auto loading = WITH_LOCK(g_loading_wallet_mutex, return g_loading_wallet_set.insert(name));
+    if (!loading.second) {
+        status = DatabaseStatus::FAILED_ALREADY_LOADED;
+        error = Untranslated("Wallet already loading.");
+        return nullptr;
+    }
+    auto release_loading{interfaces::MakeCleanupHandler([name] {
+        WITH_LOCK(g_loading_wallet_mutex, g_loading_wallet_set.erase(name));
+    })};
+    if (GetWallet(context, name)) {
+        status = DatabaseStatus::FAILED_ALREADY_LOADED;
+        error = Untranslated("Wallet is already loaded.");
+        return nullptr;
+    }
+
+    // A hard link publishes the already closed SQLite file atomically and,
+    // unlike rename-over helpers, is guaranteed to fail if the destination
+    // appeared during candidate preparation. Both paths are in wallet_dir, so
+    // unsupported/cross-filesystem hard links fail without a fallback that
+    // could weaken no-overwrite semantics.
+    std::error_code link_error;
+    fs::create_hard_link(normalized_database, final_path, link_error);
+    if (link_error) {
+        std::error_code exists_error;
+        const bool final_exists{std::filesystem::exists(final_path.std_path(), exists_error)};
+        status = final_exists ? DatabaseStatus::FAILED_ALREADY_EXISTS : DatabaseStatus::FAILED_CREATE;
+        error = final_exists
+            ? Untranslated("A wallet with this name was created concurrently; the existing wallet was not changed")
+            : Untranslated(strprintf("Unable to atomically publish fixed vault wallet: %s", link_error.message()));
+        return nullptr;
+    }
+
+    const auto rollback_final = [&](bool wallet_cleanup_ok = true) -> std::optional<std::string> {
+        if (!wallet_cleanup_ok) {
+            return "wallet load cleanup did not complete, so its database cannot be safely removed";
+        }
+        if (GetWallet(context, name)) {
+            return "the wallet is still registered, so its database cannot be safely removed";
+        }
+
+        std::error_code status_error;
+        const fs::file_status before{fs::symlink_status(final_path, status_error)};
+        if (status_error) {
+            return strprintf("the published path could not be inspected: %s", status_error.message());
+        }
+        if (before.type() == fs::file_type::not_found) {
+            DirectoryCommit(wallet_dir);
+            return std::nullopt;
+        }
+        if (before.type() != fs::file_type::regular) {
+            return "the published path was replaced with a non-wallet path; refusing to remove it";
+        }
+
+        std::error_code remove_error;
+        fs::remove(final_path, remove_error);
+        DirectoryCommit(wallet_dir);
+
+        std::error_code verify_error;
+        const fs::file_status after{fs::symlink_status(final_path, verify_error)};
+        if (verify_error) {
+            return strprintf("final-path removal could not be verified: %s", verify_error.message());
+        }
+        if (after.type() != fs::file_type::not_found) {
+            return remove_error
+                ? strprintf("final-path removal failed (%s) and the path still exists", remove_error.message())
+                : "the final path still exists after rollback";
+        }
+        return std::nullopt;
+    };
+    std::error_code cleanup_error;
+    fs::remove_all(normalized_stage, cleanup_error);
+    std::error_code stage_exists_error;
+    const bool stage_exists{std::filesystem::exists(normalized_stage.std_path(), stage_exists_error)};
+    if (cleanup_error || stage_exists_error || stage_exists) {
+        const auto rollback_error{rollback_final()};
+        status = DatabaseStatus::FAILED_CREATE;
+        error = rollback_error
+            ? Untranslated(strprintf("The fixed vault staging wallet could not be removed, and final-name publication rollback failed: %s. The final wallet name may still exist and must be inspected before retrying.", *rollback_error))
+            : Untranslated("The fixed vault staging wallet could not be removed, so final-name publication was rolled back");
+        return nullptr;
+    }
+    DirectoryCommit(wallet_dir);
+
+    DatabaseOptions load_options;
+    ReadDatabaseArgs(*Assert(context.args), load_options);
+    load_options.require_existing = true;
+    load_options.require_format = DatabaseFormat::SQLITE;
+    bool load_cleanup_ok{true};
+    std::shared_ptr<CWallet> wallet{LoadWalletInternal(
+        context, name, load_on_start, load_options, status, error, warnings,
+        &load_cleanup_ok, /*defer_genesis_rescan=*/true)};
+    if (!wallet) {
+        if (const auto rollback_error{rollback_final(load_cleanup_ok)}) {
+            status = DatabaseStatus::FAILED_CREATE;
+            error = Untranslated(strprintf("%s Fixed vault final-name publication rollback failed: %s. The final wallet name may still exist and must be inspected before retrying.", error.original, *rollback_error));
+        }
+    }
     return wallet;
 }
 
@@ -2168,6 +2372,7 @@ void MaybeResendWalletTxs(WalletContext& context)
 bool CWallet::SignTransaction(CMutableTransaction& tx) const
 {
     AssertLockHeld(cs_wallet);
+    if (IsWalletFlagSet(WALLET_FLAG_GENESIS_RESCAN_REQUIRED)) return false;
 
     // MuSig2 is two-round. ProduceSignature (the 4-arg SignTransaction path) is a
     // single pass and cannot finish tr(musig). FillPSBT loops nonce → partial →
@@ -2182,6 +2387,14 @@ bool CWallet::SignTransaction(CMutableTransaction& tx) const
 
 bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors) const
 {
+    LOCK(cs_wallet);
+    if (IsWalletFlagSet(WALLET_FLAG_GENESIS_RESCAN_REQUIRED)) {
+        for (size_t i = 0; i < tx.vin.size(); ++i) {
+            input_errors.emplace(i, _("Vault restore must finish rescanning from genesis before signing"));
+        }
+        return false;
+    }
+
     // Try to sign with all ScriptPubKeyMans
     for (ScriptPubKeyMan* spk_man : GetAllScriptPubKeyMans()) {
         // spk_man->SignTransaction will return true if the transaction is complete,
@@ -2206,6 +2419,10 @@ std::optional<PSBTError> CWallet::FillPSBTLocked(PartiallySignedTransaction& psb
     AssertLockHeld(cs_wallet);
     if (n_signed) {
         *n_signed = 0;
+    }
+    if (options.sign && IsWalletFlagSet(WALLET_FLAG_GENESIS_RESCAN_REQUIRED)) {
+        complete = false;
+        return PSBTError::WALLET_RESCAN_REQUIRED;
     }
     // Get all of the previous transactions
     for (PSBTInput& input : psbtx.inputs) {
@@ -2263,7 +2480,8 @@ std::optional<PSBTError> CWallet::FillPSBTLocked(PartiallySignedTransaction& psb
 
 #ifdef ENABLE_EXTERNAL_SIGNER
         if (options.sign && IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
-            const auto error{ExternalSignerScriptPubKeyMan::SignPSBT(psbtx, options.finalize)};
+            const auto error{ExternalSignerScriptPubKeyMan::SignPSBT(
+                psbtx, options.finalize, /*allow_native_default=*/IsFixedStagedVault(*this))};
             if (error) {
                 return error;
             }
@@ -2773,7 +2991,8 @@ util::Result<void> CWallet::DisplayAddress(const CTxDestination& dest, const std
         return util::Error{_("There is no ScriptPubKeyManager for this address")};
     }
 
-    auto signers = ExternalSignerScriptPubKeyMan::GetExternalSigners();
+    auto signers = ExternalSignerScriptPubKeyMan::GetExternalSigners(
+        /*allow_native_default=*/IsFixedStagedVault(*this));
     if (!signers) throw std::runtime_error(util::ErrorString(signers).original);
 
     auto matches = [&](const ExternalSigner& signer) {
@@ -3272,7 +3491,7 @@ std::shared_ptr<CWallet> CWallet::CreateNew(WalletContext& context, const std::s
     return walletInstance;
 }
 
-std::shared_ptr<CWallet> CWallet::LoadExisting(WalletContext& context, const std::string& name, std::unique_ptr<WalletDatabase> database, bilingual_str& error, std::vector<bilingual_str>& warnings)
+std::shared_ptr<CWallet> CWallet::LoadExisting(WalletContext& context, const std::string& name, std::unique_ptr<WalletDatabase> database, bilingual_str& error, std::vector<bilingual_str>& warnings, bool defer_genesis_rescan)
 {
     interfaces::Chain* chain = context.chain;
     const std::string& walletFile = database->Filename();
@@ -3299,13 +3518,20 @@ std::shared_ptr<CWallet> CWallet::LoadExisting(WalletContext& context, const std
             }
         }
     }
+    if (walletInstance->IsWalletFlagSet(WALLET_FLAG_GENESIS_RESCAN_REQUIRED)) {
+        LOCK(walletInstance->cs_wallet);
+        if (!IsFixedStagedVault(*walletInstance)) {
+            error = Untranslated("Wallet has an invalid fixed-vault genesis-rescan marker");
+            return nullptr;
+        }
+    }
 
     walletInstance->WalletLogPrintf("Wallet completed loading in %15dms\n", Ticks<std::chrono::milliseconds>(SteadyClock::now() - start));
 
     // Try to top up keypool. No-op if the wallet is locked.
     walletInstance->TopUpKeyPool();
 
-    if (chain && !AttachChain(walletInstance, *chain, rescan_required, error, warnings)) {
+    if (chain && !AttachChain(walletInstance, *chain, rescan_required, error, warnings, defer_genesis_rescan)) {
         walletInstance->DisconnectChainNotifications();
         return nullptr;
     }
@@ -3316,9 +3542,11 @@ std::shared_ptr<CWallet> CWallet::LoadExisting(WalletContext& context, const std
 }
 
 
-bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interfaces::Chain& chain, const bool rescan_required, bilingual_str& error, std::vector<bilingual_str>& warnings)
+bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interfaces::Chain& chain, const bool rescan_required, bilingual_str& error, std::vector<bilingual_str>& warnings, bool defer_genesis_rescan)
 {
     LOCK(walletInstance->cs_wallet);
+    const bool genesis_rescan_required{walletInstance->IsWalletFlagSet(WALLET_FLAG_GENESIS_RESCAN_REQUIRED)};
+    defer_genesis_rescan &= genesis_rescan_required;
     // allow setting the chain if it hasn't been set already but prevent changing it
     assert(!walletInstance->m_chain || walletInstance->m_chain == &chain);
     walletInstance->m_chain = &chain;
@@ -3347,7 +3575,7 @@ bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interf
 
     // If rescan_required = true, rescan_height remains equal to 0
     int rescan_height = 0;
-    if (!rescan_required)
+    if (!rescan_required && !genesis_rescan_required)
     {
         WalletBatch batch(walletInstance->GetDatabase());
         CBlockLocator locator;
@@ -3364,8 +3592,9 @@ bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interf
     } else {
         walletInstance->SetLastBlockProcessedInMem(-1, uint256());
     }
+    if (defer_genesis_rescan && tip_height) rescan_height = *tip_height;
 
-    if (tip_height && *tip_height != rescan_height)
+    if (tip_height && (*tip_height != rescan_height || (genesis_rescan_required && !defer_genesis_rescan)))
     {
         // No need to read and scan block if block was created before
         // our wallet birthday (as adjusted for block time variability)
@@ -3408,7 +3637,10 @@ bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interf
                         "blocks are being downloaded out of order when using assumeutxo "
                         "snapshots. Wallet should be able to load successfully after "
                         "node sync reaches height %s"), block_height);
-                return false;
+                if (!genesis_rescan_required) return false;
+                warnings.push_back(error + Untranslated(" The fixed vault remains marked as requiring a genesis rescan and will retry when loaded again."));
+                error.clear();
+                return true;
             }
         }
 
@@ -3419,17 +3651,26 @@ bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interf
             WalletRescanReserver reserver(*walletInstance);
             if (!reserver.reserve()) {
                 error = _("Failed to acquire rescan reserver during wallet initialization");
-                return false;
+                if (!genesis_rescan_required) return false;
+                warnings.push_back(error + Untranslated(" The fixed vault remains marked as requiring a genesis rescan and will retry when loaded again."));
+                error.clear();
+                return true;
             }
             ScanResult scan_res = walletInstance->ScanForWalletTransactions(chain.getBlockHash(rescan_height), rescan_height, /*max_height=*/{}, reserver, /*save_progress=*/true);
             if (ScanResult::SUCCESS != scan_res.status) {
                 error = _("Failed to rescan the wallet during initialization");
-                return false;
+                if (!genesis_rescan_required) return false;
+                warnings.push_back(error + Untranslated(" The fixed vault remains marked as requiring a genesis rescan and will retry when loaded again."));
+                error.clear();
+                return true;
             }
             // Set and update the best block record
             // Set last block scanned as the last block processed as it may be different in case of a reorg.
             // Also save the best block locator because rescanning only updates it intermittently.
             walletInstance->SetLastBlockProcessed(*scan_res.last_scanned_height, scan_res.last_scanned_block);
+            if (genesis_rescan_required) {
+                walletInstance->UnsetWalletFlag(WALLET_FLAG_GENESIS_RESCAN_REQUIRED);
+            }
         }
     }
 

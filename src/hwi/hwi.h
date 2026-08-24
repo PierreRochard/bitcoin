@@ -80,6 +80,10 @@ struct DescriptorSets {
     std::vector<std::string> internal;
 };
 
+//! Expand descriptor index zero and return its address. This performs no
+//! device interaction and is exposed for hardware-driver implementations.
+std::string AddressFromDescriptor(const std::string& descriptor);
+
 //! Per-device driver. Mirrors hwilib.hwwclient.HardwareWalletClient.
 //! Device implementations supply key export and signing; descriptor assembly
 //! lives in the command helpers below so it can use Core's descriptor language.
@@ -101,6 +105,10 @@ public:
     //! MuSig2 nonce and partial-signature support for PSBTv2. Drivers must opt
     //! in explicitly; ordinary Taproot signing is not sufficient.
     virtual bool CanSignMuSig2() const { return false; }
+    //! True only when the driver can ask the physical device to display and
+    //! confirm a multisig descriptor address. Host-side derivation is not a
+    //! substitute for this capability.
+    virtual bool CanDisplayMultisigAddress() const { return false; }
     virtual void Close() = 0;
 
     virtual KeyFingerprint GetMasterFingerprint() const;
@@ -114,6 +122,9 @@ protected:
 };
 
 std::vector<DeviceInfo> Enumerate();
+//! Connect the exact enumerated device, retaining path identity even when two
+//! devices report the same fingerprint.
+std::unique_ptr<HardwareWalletClient> ConnectDevice(const DeviceInfo& info);
 std::unique_ptr<HardwareWalletClient> FindDevice(const std::string& fingerprint,
                                                  std::optional<std::string> type = std::nullopt);
 

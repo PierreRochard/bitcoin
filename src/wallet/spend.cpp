@@ -1497,6 +1497,10 @@ util::Result<CreatedTransactionResult> CreateTransaction(
 
     LOCK(wallet.cs_wallet);
 
+    if (wallet.IsWalletFlagSet(WALLET_FLAG_GENESIS_RESCAN_REQUIRED)) {
+        return util::Error{_("Vault restore must finish rescanning from genesis before creating transactions")};
+    }
+
     auto res = CreateTransactionInternal(wallet, vecSend, change_pos, coin_control, sign);
     TRACEPOINT(coin_selection, normal_create_tx_internal,
            wallet.GetName().c_str(),

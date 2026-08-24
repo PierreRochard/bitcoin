@@ -356,5 +356,43 @@ BOOST_AUTO_TEST_CASE(mixed_vault_unplug_blocks_keypath)
     ExpectIncomplete(SignSpk(*vault.full, vault.spk, CTxIn::SEQUENCE_FINAL), "unplugged mock blocks n-of-n key-path");
 }
 
+BOOST_AUTO_TEST_CASE(fixed_vault_native_default_signs_without_signer_option)
+{
+    BOOST_REQUIRE(!gArgs.IsArgSet("-signer"));
+    const CExtKey local{RandomMaster()};
+    const CExtKey hardware_a{UniqueMockMaster()};
+    const CExtKey hardware_b{UniqueMockMaster()};
+    hwi::MockRegistration mock_a{hardware_a};
+    hwi::MockRegistration mock_b{hardware_b};
+    auto wallet{MakeMixedWallet()};
+
+    CScript spk;
+    {
+        LOCK(wallet->cs_wallet);
+        AddUnused(*wallet, local);
+        std::vector<MultisigKeySpec> specs{
+            LocalSpec(local),
+            XpubSpec(hardware_a),
+            XpubSpec(hardware_b),
+        };
+        MultisigOptions options;
+        options.type = OutputType::BECH32M;
+        options.fallback_older = 4320;
+        options.fallback_older_one_key = 8640;
+        auto created{CreateMultisigDescriptor(*wallet, /*nrequired=*/2, specs, options)};
+        BOOST_REQUIRE_MESSAGE(created, util::ErrorString(created).original);
+        BOOST_REQUIRE(IsFixedStagedVault(*wallet));
+        const CTxDestination dest{*Assert(wallet->GetNewDestination(OutputType::BECH32M, ""))};
+        spk = GetScriptForDestination(dest);
+        ExpectKeypath(SignSpk(*wallet, spk, CTxIn::SEQUENCE_FINAL), "fixed native-default key-path");
+    }
+
+    // An explicitly empty option is a deliberate disable, never an implicit
+    // request to fall back to native hardware discovery.
+    gArgs.ForceSetArg("-signer", "");
+    LOCK(wallet->cs_wallet);
+    ExpectIncomplete(SignSpk(*wallet, spk, CTxIn::SEQUENCE_FINAL), "explicitly disabled native signer");
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace wallet
