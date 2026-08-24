@@ -43,6 +43,9 @@ public:
     ~ReceiveCoinsDialog();
 
     void setModel(WalletModel *model);
+    //! Display a request for an address that was already derived and verified,
+    //! without consuming another address from the wallet.
+    void showRequestForAddress(const QString& address);
 
 public Q_SLOTS:
     void clear();

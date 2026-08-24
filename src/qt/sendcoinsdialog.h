@@ -27,9 +27,9 @@ namespace Ui {
 }
 
 QT_BEGIN_NAMESPACE
-class QCheckBox;
 class QComboBox;
 class QLabel;
+class QRadioButton;
 class QUrl;
 QT_END_NAMESPACE
 
@@ -76,9 +76,12 @@ private:
     bool fNewRecipientAllowed{true};
     bool fFeeMinimized{true};
     const PlatformStyle *platformStyle;
-    QCheckBox* m_vault_recovery{nullptr};
+    QWidget* m_vault_mode_box{nullptr};
+    QRadioButton* m_vault_normal{nullptr};
+    QRadioButton* m_vault_recovery{nullptr};
     QComboBox* m_vault_recovery_stage{nullptr};
     QLabel* m_vault_lost{nullptr};
+    QString m_vault_send_block_reason;
     bool updateVaultSendState();
 
     // Copy PSBT to clipboard and offer to save it.

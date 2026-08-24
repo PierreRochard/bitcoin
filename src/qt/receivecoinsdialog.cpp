@@ -157,6 +157,18 @@ void ReceiveCoinsDialog::updateDisplayUnit()
     }
 }
 
+void ReceiveCoinsDialog::showRequestForAddress(const QString& address)
+{
+    if (!model || !model->getRecentRequestsTableModel() || address.isEmpty()) return;
+    SendCoinsRecipient info(address, tr("Vault test payment"), /*amount=*/0, /*message=*/{});
+    auto* dialog = new ReceiveRequestDialog(this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setModel(model);
+    dialog->setInfo(info);
+    dialog->show();
+    model->getRecentRequestsTableModel()->addNewRequest(info);
+}
+
 void ReceiveCoinsDialog::on_receiveButton_clicked()
 {
     if(!model || !model->getOptionsModel() || !model->getAddressTableModel() || !model->getRecentRequestsTableModel())

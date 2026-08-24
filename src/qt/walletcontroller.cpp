@@ -14,6 +14,7 @@
 #include <external_signer.h>
 #include <interfaces/handler.h>
 #include <interfaces/node.h>
+#include <support/cleanse.h>
 #include <util/string.h>
 #include <util/threadnames.h>
 #include <util/translation.h>
@@ -440,13 +441,18 @@ void RestoreWalletActivity::finish()
     Q_EMIT finished();
 }
 
-MnemonicRestoreActivity::MnemonicRestoreActivity(WalletController* wallet_controller, QWidget* parent_widget)
+MnemonicRestoreActivity::MnemonicRestoreActivity(WalletController* wallet_controller, QWidget* parent_widget,
+                                                 RescanFn rescan_override)
     : WalletControllerActivity(wallet_controller, parent_widget)
+    , m_rescan_override(std::move(rescan_override))
 {
 }
 
 MnemonicRestoreActivity::~MnemonicRestoreActivity()
 {
+    for (SecureString& mnemonic : m_mnemonics) {
+        if (!mnemonic.empty()) memory_cleanse(mnemonic.data(), mnemonic.size());
+    }
     m_mnemonics.clear();
 }
 
@@ -465,25 +471,55 @@ void MnemonicRestoreActivity::restore(const std::string& wallet_name, const std:
         auto rescan_ready{node().walletLoader().checkRescanFromGenesis()};
         if (!rescan_ready) {
             m_error_message = util::ErrorString(rescan_ready);
+            for (SecureString& mnemonic : m_mnemonics) {
+                if (!mnemonic.empty()) memory_cleanse(mnemonic.data(), mnemonic.size());
+            }
             m_mnemonics.clear();
             m_policy_json.clear();
             QTimer::singleShot(0, this, &MnemonicRestoreActivity::finish);
             return;
         }
-        const uint64_t flags = WALLET_FLAG_DESCRIPTORS | WALLET_FLAG_BLANK_WALLET;
-        auto wallet{node().walletLoader().createWallet(m_wallet_name, SecureString{}, flags, m_warning_message)};
-        if (!wallet) {
-            m_error_message = util::ErrorString(wallet);
-        } else {
-            auto restored = (*wallet)->restoreVaultPolicy(m_policy_json, m_mnemonics);
-            if (!restored) {
-                m_error_message = util::ErrorString(restored);
-            } else {
-                m_wallet_model = m_wallet_controller->getOrCreateWallet(std::move(*wallet));
-            }
+        auto installed{node().walletLoader().installFixedVault(
+            m_wallet_name, m_policy_json, m_mnemonics,
+            interfaces::FixedVaultInstallMode::RESTORE, m_warning_message)};
+        for (SecureString& mnemonic : m_mnemonics) {
+            if (!mnemonic.empty()) memory_cleanse(mnemonic.data(), mnemonic.size());
         }
         m_mnemonics.clear();
+        if (!installed) {
+            m_error_message = util::ErrorString(installed);
+        } else {
+            auto rescanned{m_rescan_override ? m_rescan_override(*installed->wallet)
+                                             : installed->wallet->rescanFromGenesis()};
+            if (!rescanned) {
+                m_rescan_error = QString::fromStdString(
+                    "The vault policy and available keys were restored, but the genesis rescan did not complete. "
+                    "Retry the scan from height 0: " + util::ErrorString(rescanned).original);
+            }
+            m_wallet_model = m_wallet_controller->getOrCreateWallet(std::move(installed->wallet));
+        }
         m_policy_json.clear();
+        QTimer::singleShot(0, this, &MnemonicRestoreActivity::finish);
+    });
+}
+
+void MnemonicRestoreActivity::rescan(WalletModel* wallet_model)
+{
+    m_wallet_model = wallet_model;
+    m_rescan_error.clear();
+    showProgressDialog(
+        tr("Retry Scrooge Vault Rescan"),
+        tr("Rescanning <b>%1</b> from genesis…")
+            .arg(wallet_model->getDisplayName().toHtmlEscaped()));
+
+    QTimer::singleShot(0, worker(), [this] {
+        auto rescanned{m_rescan_override ? m_rescan_override(m_wallet_model->wallet())
+                                         : m_wallet_model->wallet().rescanFromGenesis()};
+        if (!rescanned) {
+            m_rescan_error = QString::fromStdString(
+                "The genesis rescan did not complete. Retry when the complete block history is available: " +
+                util::ErrorString(rescanned).original);
+        }
         QTimer::singleShot(0, this, &MnemonicRestoreActivity::finish);
     });
 }
@@ -493,12 +529,15 @@ void MnemonicRestoreActivity::finish()
     if (!m_error_message.empty()) {
         QMessageBox::critical(m_parent_widget, tr("Restore vault failed"),
                               QString::fromStdString(m_error_message.translated));
-        Q_EMIT failed();
+        Q_EMIT failed(QString::fromStdString(m_error_message.translated));
+    } else if (!m_rescan_error.isEmpty()) {
+        QMessageBox::warning(m_parent_widget, tr("Vault rescan incomplete"), m_rescan_error);
+        Q_EMIT rescanFailed(m_wallet_model, m_rescan_error);
     } else if (!m_warning_message.empty()) {
         QMessageBox::warning(m_parent_widget, tr("Restore vault warning"),
                              QString::fromStdString(Join(m_warning_message, Untranslated("\n")).translated));
     }
-    if (m_wallet_model) Q_EMIT restored(m_wallet_model);
+    if (m_wallet_model && m_error_message.empty() && m_rescan_error.isEmpty()) Q_EMIT restored(m_wallet_model);
     Q_EMIT finished();
 }
 

@@ -136,6 +136,9 @@ public:
 
     interfaces::Node& node() const { return m_node; }
     interfaces::Wallet& wallet() const { return *m_wallet; }
+    //! Clear persisted restore-time unavailability only when raw HWI
+    //! discovery reproduces the exact fixed-vault fingerprint, path, and xpub.
+    interfaces::Wallet::VaultStatus reconcileVaultHardwareSigners();
     ClientModel& clientModel() const { return *m_client_model; }
     void setClientModel(ClientModel* client_model);
 

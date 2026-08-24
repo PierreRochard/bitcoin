@@ -8,9 +8,11 @@
 #include <qt/sendcoinsrecipient.h>
 #include <support/allocators/secure.h>
 #include <sync.h>
+#include <util/result.h>
 #include <util/translation.h>
 
 #include <map>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -187,15 +189,22 @@ class MnemonicRestoreActivity : public WalletControllerActivity
     Q_OBJECT
 
 public:
-    MnemonicRestoreActivity(WalletController* wallet_controller, QWidget* parent_widget);
+    using RescanFn = std::function<util::Result<void>(interfaces::Wallet&)>;
+
+    MnemonicRestoreActivity(WalletController* wallet_controller, QWidget* parent_widget,
+                            RescanFn rescan_override = {});
     ~MnemonicRestoreActivity() override;
 
     void restore(const std::string& wallet_name, const std::string& policy_json,
                  std::vector<SecureString> mnemonics);
+    //! Retry only the timestamp-zero genesis rescan of an already installed
+    //! vault. No mnemonic material is needed or retained for this operation.
+    void rescan(WalletModel* wallet_model);
 
 Q_SIGNALS:
     void restored(WalletModel* wallet_model);
-    void failed();
+    void failed(const QString& error);
+    void rescanFailed(WalletModel* wallet_model, const QString& error);
 
 private:
     void finish();
@@ -203,6 +212,8 @@ private:
     std::string m_wallet_name;
     std::string m_policy_json;
     std::vector<SecureString> m_mnemonics;
+    QString m_rescan_error;
+    RescanFn m_rescan_override;
 };
 
 class MigrateWalletActivity : public WalletControllerActivity

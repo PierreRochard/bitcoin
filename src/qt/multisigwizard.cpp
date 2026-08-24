@@ -11,6 +11,7 @@
 #include <common/args.h>
 #include <crypto/sha256.h>
 #include <external_signer.h>
+#include <interfaces/external_signer.h>
 #include <interfaces/node.h>
 #include <interfaces/wallet.h>
 #include <node/context.h>
@@ -30,6 +31,7 @@
 #include <util/translation.h>
 #include <wallet/external_signer_scriptpubkeyman.h>
 #include <wallet/bip39.h>
+#include <wallet/vault_policy_qr.h>
 #include <wallet/walletutil.h>
 
 #include <algorithm>
@@ -39,6 +41,7 @@
 
 #include <QAbstractItemView>
 #include <QButtonGroup>
+#include <QBuffer>
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
@@ -55,6 +58,7 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QKeyEvent>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QLockFile>
@@ -63,6 +67,7 @@
 #include <QPageLayout>
 #include <QPageSize>
 #include <QPalette>
+#include <QPainter>
 #ifndef QT_NO_PDF
 #include <QPdfWriter>
 #endif
@@ -77,6 +82,7 @@
 #include <QTemporaryFile>
 #include <QTextDocument>
 #include <QTimer>
+#include <QToolButton>
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QWizardPage>
@@ -88,6 +94,122 @@ using wallet::WALLET_FLAG_DISABLE_PRIVATE_KEYS;
 using wallet::WALLET_FLAG_EXTERNAL_SIGNER;
 
 namespace {
+/** Secret mnemonic entry whose persistent backing store is cleansing locked
+ * memory. It intentionally offers no clipboard or context-menu path and never
+ * mirrors plaintext into a QString/QLineEdit property. */
+class SecureMnemonicEdit final : public QFrame
+{
+public:
+    explicit SecureMnemonicEdit(QWidget* parent = nullptr) : QFrame(parent)
+    {
+        setFrameShape(QFrame::StyledPanel);
+        setFrameShadow(QFrame::Sunken);
+        setFocusPolicy(Qt::StrongFocus);
+        setContextMenuPolicy(Qt::NoContextMenu);
+        setMinimumHeight(fontMetrics().height() + 18);
+        setProperty("secureMnemonicBacking", true);
+        setAccessibleDescription(tr("Secret phrase entry. Plaintext is held only in cleansing locked memory; the screen shows only a word count."));
+    }
+
+    ~SecureMnemonicEdit() override { clearSecure(); }
+
+    bool trimmedEmpty() const
+    {
+        return std::ranges::all_of(m_value, [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; });
+    }
+
+    SecureString takeTrimmed()
+    {
+        while (!m_value.empty() && IsSpace(m_value.front())) m_value.erase(m_value.begin());
+        while (!m_value.empty() && IsSpace(m_value.back())) m_value.pop_back();
+        SecureString result;
+        result.swap(m_value);
+        update();
+        return result;
+    }
+
+    void restoreSecure(SecureString value)
+    {
+        clearSecure();
+        m_value = std::move(value);
+        update();
+    }
+
+    void clearSecure()
+    {
+        if (!m_value.empty()) memory_cleanse(m_value.data(), m_value.size());
+        SecureString{}.swap(m_value);
+        update();
+    }
+
+protected:
+    void keyPressEvent(QKeyEvent* event) override
+    {
+        if (event->matches(QKeySequence::Paste) || event->matches(QKeySequence::Copy) ||
+            event->matches(QKeySequence::Cut)) {
+            event->accept();
+            return;
+        }
+        if (event->key() == Qt::Key_Backspace) {
+            if (!m_value.empty()) {
+                m_value.back() = 0;
+                m_value.pop_back();
+                update();
+            }
+            event->accept();
+            return;
+        }
+        if (event->key() == Qt::Key_Delete) {
+            clearSecure();
+            event->accept();
+            return;
+        }
+        QByteArray typed{event->text().toUtf8()};
+        bool accepted{false};
+        for (char c : typed) {
+            const unsigned char byte{static_cast<unsigned char>(c)};
+            if (byte >= 'A' && byte <= 'Z') {
+                m_value.push_back(static_cast<char>(byte - 'A' + 'a'));
+                accepted = true;
+            } else if ((byte >= 'a' && byte <= 'z') || byte == ' ') {
+                m_value.push_back(static_cast<char>(byte));
+                accepted = true;
+            }
+        }
+        if (!typed.isEmpty()) memory_cleanse(typed.data(), typed.size());
+        if (accepted) {
+            update();
+            event->accept();
+            return;
+        }
+        QFrame::keyPressEvent(event);
+    }
+
+    void paintEvent(QPaintEvent* event) override
+    {
+        QFrame::paintEvent(event);
+        size_t words{0};
+        bool in_word{false};
+        for (char c : m_value) {
+            if (IsSpace(c)) {
+                in_word = false;
+            } else if (!in_word) {
+                ++words;
+                in_word = true;
+            }
+        }
+        const QString display{words == 0 ? tr("Type the 24-word phrase (paste is disabled)")
+                                         : tr("%1 of 24 words entered • phrase hidden").arg(words)};
+        QPainter painter(this);
+        painter.setPen(palette().color(words == 0 ? QPalette::PlaceholderText : QPalette::Text));
+        painter.drawText(rect().adjusted(8, 2, -8, -2), Qt::AlignVCenter | Qt::AlignLeft, display);
+    }
+
+private:
+    static bool IsSpace(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
+    SecureString m_value;
+};
+
 // 10-minute block target, same approximation the policy page shows.
 QString ApproxDuration(uint32_t blocks)
 {
@@ -105,6 +227,32 @@ QString BlockCount(uint32_t blocks)
 QString FormattedHeight(uint32_t height)
 {
     return QLocale().toString(static_cast<qulonglong>(height));
+}
+
+util::Result<std::string> DecodeVaultPolicyInput(const QString& input)
+{
+    const QString trimmed{input.trimmed()};
+    if (!trimmed.startsWith(QString::fromStdString(std::string{wallet::VAULT_POLICY_QR_FORMAT}) + "|")) {
+        std::string bytes{trimmed.toStdString()};
+        // QPlainTextEdit omits a terminal newline from toPlainText(). The
+        // canonical package format includes one, so restore that one byte only
+        // when every parsed field otherwise reproduces the canonical bytes.
+        if (auto package = wallet::ParseVaultPolicyPackage(bytes)) {
+            const std::string canonical{wallet::FormatVaultPolicyPackage(*package)};
+            if (canonical == bytes ||
+                (canonical.size() == bytes.size() + 1 && canonical.back() == '\n' &&
+                 std::equal(bytes.begin(), bytes.end(), canonical.begin()))) {
+                return canonical;
+            }
+        }
+        return bytes;
+    }
+    std::vector<std::string> parts;
+    for (const QString& line : trimmed.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
+        const QString part{line.trimmed()};
+        if (!part.isEmpty()) parts.push_back(part.toStdString());
+    }
+    return wallet::ReassembleVaultPolicyQrParts(parts);
 }
 
 QString ValidatePublicKeyInput(const std::string& fingerprint, const std::string& path, const std::string& xpub)
@@ -154,6 +302,26 @@ bool PublicOnlyPolicy(const wallet::VaultPolicyPackage& package, QString& error)
     return true;
 }
 
+util::Result<CTxDestination> FirstDescriptorDestination(const std::string& encoded)
+{
+    FlatSigningProvider keys;
+    std::string parse_error;
+    auto descriptors = Parse(encoded, keys, parse_error, /*require_checksum=*/true);
+    if (descriptors.size() != 1) {
+        return util::Error{Untranslated(parse_error.empty() ? "The imported receive descriptor is ambiguous" : parse_error)};
+    }
+    std::vector<CScript> scripts;
+    FlatSigningProvider expanded;
+    if (!descriptors.front()->Expand(/*pos=*/0, keys, scripts, expanded) || scripts.size() != 1) {
+        return util::Error{Untranslated("The imported receive descriptor cannot derive its first address")};
+    }
+    CTxDestination destination;
+    if (!ExtractDestination(scripts.front(), destination) || !IsValidDestination(destination)) {
+        return util::Error{Untranslated("The imported receive descriptor did not produce a valid address")};
+    }
+    return destination;
+}
+
 // Vertical step list shown as QWizard::sideWidget. ClassicStyle +
 // ExtendedWatermarkPixmap (qwizard.cpp) paints this as a full-height column
 // next to the page and the Back/Continue row — Fusion's native wizard chrome,
@@ -182,19 +350,20 @@ public:
         layout->addWidget(heading);
         layout->addSpacing(6);
 
-        const std::vector<std::pair<int, QString>> steps{
-            {MultisigWizard::Page_Intro, tr("Start")},
-            {MultisigWizard::Page_Template, tr("Template")},
-            {MultisigWizard::Page_Setup, tr("Type")},
-            {MultisigWizard::Page_Keys, tr("Keys")},
-            {MultisigWizard::Page_Threshold, tr("Policy")},
-            {MultisigWizard::Page_Backup, tr("Backup")},
-            {MultisigWizard::Page_Verify, tr("Verify")},
-            {MultisigWizard::Page_Done, tr("Ready")},
+        struct StepTitle { int page; QString advanced; QString fixed; };
+        const std::vector<StepTitle> steps{
+            {MultisigWizard::Page_Intro, tr("Start"), {}},
+            {MultisigWizard::Page_Template, tr("Template"), {}},
+            {MultisigWizard::Page_Setup, tr("Type"), {}},
+            {MultisigWizard::Page_Keys, tr("Keys"), tr("Review Vault")},
+            {MultisigWizard::Page_Threshold, tr("Policy"), {}},
+            {MultisigWizard::Page_Backup, tr("Backup"), tr("Secure Recovery")},
+            {MultisigWizard::Page_Verify, tr("Verify"), tr("Confirm Address")},
+            {MultisigWizard::Page_Done, tr("Ready"), tr("Ready")},
         };
         m_dots.reserve(steps.size());
         m_names.reserve(steps.size());
-        for (const auto& [page_id, title] : steps) {
+        for (const auto& step : steps) {
             auto* row = new QWidget;
             auto* h = new QHBoxLayout(row);
             h->setContentsMargins(0, 1, 0, 1);
@@ -202,14 +371,16 @@ public:
             auto* dot = new QLabel;
             dot->setFixedSize(22, 22);
             dot->setAlignment(Qt::AlignCenter);
-            auto* name = new QLabel(title);
+            auto* name = new QLabel(step.advanced);
             h->addWidget(dot, 0, Qt::AlignVCenter);
             h->addWidget(name, 1, Qt::AlignVCenter);
             layout->addWidget(row);
             m_dots.push_back(dot);
             m_names.push_back(name);
             m_rows.push_back(row);
-            m_page_ids.push_back(page_id);
+            m_page_ids.push_back(step.page);
+            m_advanced_titles.push_back(step.advanced);
+            m_fixed_titles.push_back(step.fixed);
         }
         layout->addStretch();
         m_policy = new QLabel;
@@ -226,10 +397,11 @@ public:
         for (int i = 0; i < static_cast<int>(m_page_ids.size()); ++i) {
             const int id = m_page_ids[i];
             const bool show = m_wizard->advancedFlow() ||
-                id == MultisigWizard::Page_Intro || id == MultisigWizard::Page_Keys ||
+                id == MultisigWizard::Page_Keys ||
                 id == MultisigWizard::Page_Backup || id == MultisigWizard::Page_Verify ||
                 id == MultisigWizard::Page_Done;
             m_rows[i]->setVisible(show);
+            m_names[i]->setText(m_wizard->advancedFlow() ? m_advanced_titles[i] : m_fixed_titles[i]);
             if (show) visible.push_back(i);
         }
         int current_step{0};
@@ -240,15 +412,15 @@ public:
             const int i = visible[pos];
             QLabel* dot = m_dots[i];
             QLabel* name = m_names[i];
+            const bool unnumbered_ready = !m_wizard->advancedFlow() &&
+                m_page_ids[i] == MultisigWizard::Page_Done;
             QFont name_font = name->font();
             name_font.setBold(pos == current_step);
             name->setFont(name_font);
             if (pos == current_step) {
-                // Same orange as BitcoinGUI's progress bar (#FF8000). Fusion's
-                // Highlight is white-on-white in the offscreen/minimal palette.
-                dot->setText(QString::number(pos + 1));
+                dot->setText(unnumbered_ready ? QStringLiteral("✓") : QString::number(pos + 1));
                 dot->setStyleSheet(QStringLiteral(
-                    "QLabel { background: #FF8000; color: white; border-radius: 11px; font-weight: 600; }"));
+                    "QLabel { background: palette(highlight); color: palette(highlighted-text); border-radius: 11px; font-weight: 600; }"));
                 name->setStyleSheet(QStringLiteral("QLabel { color: palette(window-text); }"));
             } else if (pos < current_step) {
                 dot->setText(QStringLiteral("✓"));
@@ -256,7 +428,7 @@ public:
                     "QLabel { background: palette(mid); color: white; border-radius: 11px; }"));
                 name->setStyleSheet(QStringLiteral("QLabel { color: palette(window-text); }"));
             } else {
-                dot->setText(QString::number(pos + 1));
+                dot->setText(unnumbered_ready ? QString{} : QString::number(pos + 1));
                 dot->setStyleSheet(QStringLiteral(
                     "QLabel { border: 1px solid palette(mid); color: palette(mid); border-radius: 11px; }"));
                 name->setStyleSheet(QStringLiteral("QLabel { color: palette(mid); }"));
@@ -299,6 +471,8 @@ private:
     std::vector<int> m_page_ids;
     std::vector<QLabel*> m_dots;
     std::vector<QLabel*> m_names;
+    std::vector<QString> m_advanced_titles;
+    std::vector<QString> m_fixed_titles;
     QLabel* m_policy{nullptr};
     MultisigWizard* m_wizard;
 };
@@ -374,239 +548,404 @@ public:
     }
 };
 
-class MnemonicRestoreDialog final : public QDialog
+class VaultRestoreWizard final : public QWizard
 {
 public:
-    explicit MnemonicRestoreDialog(MultisigWizard* wizard) : QDialog(wizard, GUIUtil::dialog_flags), m_wizard(wizard)
-    {
-        setWindowTitle(tr("Restore from a printed recovery kit"));
-        setMinimumSize(720, 580);
-        auto* layout = new QVBoxLayout(this);
-        auto* warning = new QLabel(tr(
-            "Enter the exact public policy JSON and one, two, or three printed 24-word phrases. "
-            "Each phrase is matched by its derived account xpub, not by entry order. One recovered key can use the 60-day path; two can use the 30-day path; all three restore immediate signing. "
-            "The wallet will rescan from genesis for existing funds."));
-        warning->setWordWrap(true);
-        layout->addWidget(warning);
+    enum PageId { Policy, RecoveryKeys, Authority, Rescan };
 
+    explicit VaultRestoreWizard(MultisigWizard* wizard) : QWizard(wizard, GUIUtil::dialog_flags), m_wizard(wizard)
+    {
+        setWindowTitle(tr("Restore a Recovery Vault"));
+        setWizardStyle(QWizard::ClassicStyle);
+#ifdef Q_OS_MACOS
+        QPixmap background(1, 1);
+        background.fill(Qt::transparent);
+        setPixmap(QWizard::BackgroundPixmap, background);
+#endif
+        setMinimumSize(760, 600);
+        setButtonText(QWizard::NextButton, tr("Continue"));
+        setButtonText(QWizard::BackButton, tr("Back"));
+        setButtonText(QWizard::FinishButton, tr("Restore and Rescan"));
+        setButtonText(QWizard::CancelButton, tr("Cancel"));
+
+        auto* policy_page = new QWizardPage;
+        policy_page->setTitle(tr("Policy"));
+        policy_page->setSubTitle(tr("Load the public Recovery Kit before entering any private phrase."));
+        auto* policy_layout = new QVBoxLayout(policy_page);
         auto* form = new QFormLayout;
         m_name = new QLineEdit(wizard->walletName());
         m_name->setObjectName("restoreWalletNameEdit");
+        m_name->setAccessibleName(tr("Restored wallet name"));
         form->addRow(tr("New wallet name"), m_name);
-        layout->addLayout(form);
+        policy_layout->addLayout(form);
 
         auto* policy_row = new QHBoxLayout;
-        auto* policy_label = new QLabel(tr("Public policy JSON"));
-        auto* load_policy = new QPushButton(tr("Load JSON…"));
+        auto* policy_label = new QLabel(tr("Public Recovery Kit policy"));
+        auto* load_policy = new QPushButton(tr("Load Policy…"));
         load_policy->setObjectName("loadRestorePolicyButton");
         load_policy->setAutoDefault(false);
         policy_row->addWidget(policy_label);
         policy_row->addStretch();
         policy_row->addWidget(load_policy);
-        layout->addLayout(policy_row);
+        policy_layout->addLayout(policy_row);
         m_policy = new QPlainTextEdit;
         m_policy->setObjectName("restorePolicyEdit");
-        m_policy->setPlaceholderText(tr("Paste the exact bitcoin-core-vault-policy JSON printed on the sheet"));
+        m_policy->setPlaceholderText(tr("Paste the exact public policy JSON, or newline-separated BCVP QR parts"));
         m_policy->setFont(GUIUtil::fixedPitchFont());
-        layout->addWidget(m_policy, 1);
+        policy_layout->addWidget(m_policy, 1);
+        m_policy_summary = new QLabel;
+        m_policy_summary->setObjectName("restorePolicySummary");
+        m_policy_summary->setWordWrap(true);
+        m_policy_summary->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        policy_layout->addWidget(m_policy_summary);
+        m_policy_status = new QLabel;
+        m_policy_status->setObjectName("restorePolicyStatus");
+        m_policy_status->setWordWrap(true);
+        policy_layout->addWidget(m_policy_status);
+        setPage(Policy, policy_page);
 
-        auto* phrases = new QGroupBox(tr("Printed BIP39 phrases (passphrase: none)"));
-        auto* phrase_layout = new QFormLayout(phrases);
-        for (size_t index = 0; index < m_phrases.size(); ++index) {
-            auto* entry = new QLineEdit;
-            entry->setObjectName(QStringLiteral("restoreMnemonic%1Edit").arg(index + 1));
-            entry->setEchoMode(QLineEdit::PasswordEchoOnEdit);
-            entry->setPlaceholderText(tr("24 words; leave unused rows empty"));
-            m_phrases[index] = entry;
-            phrase_layout->addRow(tr("Phrase %1").arg(index + 1), entry);
-        }
-        layout->addWidget(phrases);
+        auto* keys_page = new QWizardPage;
+        keys_page->setTitle(tr("Recovery Keys"));
+        keys_page->setSubTitle(tr("Add only printed software-key phrases that belong to this policy."));
+        auto* keys_layout = new QVBoxLayout(keys_page);
+        auto* seed_warning = new QLabel(tr("Never enter a hardware-wallet seed here."));
+        seed_warning->setObjectName("restoreHardwareSeedWarning");
+        QFont warning_font = seed_warning->font();
+        warning_font.setBold(true);
+        seed_warning->setFont(warning_font);
+        keys_layout->addWidget(seed_warning);
+        auto* phrase_help = new QLabel(tr(
+            "Enter one 24-word software-key phrase at a time. Bitcoin Core checks its BIP39 checksum, derivation path, fingerprint, and complete account xpub, then matches it by identity rather than entry order. BIP39 passphrase: none."));
+        phrase_help->setWordWrap(true);
+        keys_layout->addWidget(phrase_help);
+        m_phrase = new SecureMnemonicEdit;
+        m_phrase->setObjectName("restoreMnemonicEdit");
+        m_phrase->setAccessibleName(tr("Software-key recovery phrase"));
+        keys_layout->addWidget(m_phrase);
+        m_add_key = new QPushButton(tr("Add Another Key"));
+        m_add_key->setObjectName("restoreAddKeyButton");
+        m_add_key->setAutoDefault(false);
+        keys_layout->addWidget(m_add_key, 0, Qt::AlignLeft);
+        m_key_list = new QListWidget;
+        m_key_list->setObjectName("restoreAcceptedKeys");
+        m_key_list->setSelectionMode(QAbstractItemView::NoSelection);
+        keys_layout->addWidget(m_key_list);
+        m_key_status = new QLabel;
+        m_key_status->setObjectName("restoreKeyStatus");
+        m_key_status->setWordWrap(true);
+        keys_layout->addWidget(m_key_status);
+        m_key_authority = new QLabel;
+        m_key_authority->setObjectName("restoreIncrementalAuthority");
+        m_key_authority->setWordWrap(true);
+        keys_layout->addWidget(m_key_authority);
+        setPage(RecoveryKeys, keys_page);
 
-        m_status = new QLabel;
-        m_status->setObjectName("restoreMnemonicStatus");
-        m_status->setWordWrap(true);
-        m_status->setStyleSheet(QStringLiteral("QLabel { color: red; }"));
-        layout->addWidget(m_status);
-        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
-        buttons->button(QDialogButtonBox::Ok)->setText(tr("Restore wallet"));
-        buttons->button(QDialogButtonBox::Ok)->setObjectName("restoreMnemonicConfirmButton");
-        connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
-        connect(buttons, &QDialogButtonBox::accepted, this, [this] { restore(); });
+        auto* authority_page = new QWizardPage;
+        authority_page->setTitle(tr("Recovered Authority"));
+        authority_page->setSubTitle(tr("Review what the restored wallet can authorize before it is created."));
+        auto* authority_layout = new QVBoxLayout(authority_page);
+        m_authority_summary = new QLabel;
+        m_authority_summary->setObjectName("restoreAuthoritySummary");
+        m_authority_summary->setWordWrap(true);
+        QFont authority_font = m_authority_summary->font();
+        authority_font.setPointSize(authority_font.pointSize() + 1);
+        m_authority_summary->setFont(authority_font);
+        authority_layout->addWidget(m_authority_summary);
+        auto* authority_rules = new QLabel(tr(
+            "The policy itself remains unchanged: all three participants are required now, any two can make an explicit recovery spend after 4,320 blocks, and any one can recover after 8,640 blocks. Recovery is never automatic."));
+        authority_rules->setWordWrap(true);
+        authority_layout->addWidget(authority_rules);
+        authority_layout->addStretch();
+        setPage(Authority, authority_page);
+
+        auto* rescan_page = new QWizardPage;
+        rescan_page->setTitle(tr("Rescan"));
+        rescan_page->setSubTitle(tr("Create the restored wallet and search the complete blockchain history."));
+        rescan_page->setFinalPage(true);
+        auto* rescan_layout = new QVBoxLayout(rescan_page);
+        m_rescan_summary = new QLabel;
+        m_rescan_summary->setObjectName("restoreRescanSummary");
+        m_rescan_summary->setWordWrap(true);
+        rescan_layout->addWidget(m_rescan_summary);
+        auto* rescan_note = new QLabel(tr(
+            "Descriptors are imported with timestamp zero. The rescan begins at genesis and may take time. If it is interrupted, the restored public policy remains identifiable by its policy ID."));
+        rescan_note->setWordWrap(true);
+        rescan_layout->addWidget(rescan_note);
+        rescan_layout->addStretch();
+        setPage(Rescan, rescan_page);
+
         connect(load_policy, &QPushButton::clicked, this, [this] {
-            const QString path = QFileDialog::getOpenFileName(this, tr("Open public vault policy"), {}, tr("JSON files (*.json);;All files (*)"));
+            const QString path = QFileDialog::getOpenFileName(
+                this, tr("Open public vault policy"), {}, tr("Vault policy (*.json *.txt);;All files (*)"));
             if (path.isEmpty()) return;
             QFile file(path);
             if (!file.open(QIODevice::ReadOnly) || file.size() > 1024 * 1024) {
-                m_status->setText(tr("Could not read a policy JSON smaller than 1 MiB from that file."));
+                m_policy_status->setText(tr("Could not read a public policy smaller than 1 MiB from that file."));
                 return;
             }
             m_policy->setPlainText(QString::fromUtf8(file.readAll()));
         });
-        layout->addWidget(buttons);
+        connect(m_add_key, &QPushButton::clicked, this, [this] { addCurrentPhrase(); });
+        connect(this, &QWizard::currentIdChanged, this, [this](int page_id) {
+            if (page_id == Authority || page_id == Rescan) updateAuthority();
+        });
+        connect(m_wizard, &MultisigWizard::restoreAttemptFailed, this, [this](const QString& error) {
+            if (!m_restore_started) return;
+            m_restore_started = false;
+            m_rescan_summary->setText(error);
+            setButtonText(QWizard::FinishButton, tr("Restore and Rescan"));
+            button(QWizard::FinishButton)->setEnabled(true);
+            button(QWizard::BackButton)->setEnabled(true);
+            button(QWizard::CancelButton)->setEnabled(true);
+        });
+        connect(m_wizard, &MultisigWizard::restoreRescanRetryRequired, this,
+                [this](WalletModel* wallet_model, const QString& error) {
+            if (!m_restore_started) return;
+            m_retry_wallet = wallet_model;
+            m_restore_started = false;
+            m_rescan_summary->setText(tr("The vault is installed, but its historical rescan is incomplete. No recovery phrase is needed again. %1")
+                                          .arg(error.toHtmlEscaped()));
+            setButtonText(QWizard::FinishButton, tr("Retry Rescan from Genesis"));
+            button(QWizard::FinishButton)->setEnabled(true);
+            button(QWizard::BackButton)->setEnabled(false);
+            button(QWizard::CancelButton)->setEnabled(true);
+        });
+        connect(m_wizard, &MultisigWizard::restoreCompleted, this, [this] {
+            if (m_restore_started) QWizard::accept();
+        });
+        updateAuthority();
     }
 
-    ~MnemonicRestoreDialog() override { clearPhrases(); }
+    ~VaultRestoreWizard() override { clearPhrases(); }
 
 private:
     void clearPhrases()
     {
-        for (QLineEdit* entry : m_phrases) {
-            if (!entry) continue;
-            const qsizetype size = entry->text().size();
-            if (size > 0) entry->setText(QString(size, QChar{0}));
-            entry->clear();
+        if (m_phrase) m_phrase->clearSecure();
+        for (SecureString& phrase : m_phrases) {
+            if (!phrase.empty()) memory_cleanse(phrase.data(), phrase.size());
+        }
+        std::vector<SecureString>{}.swap(m_phrases);
+    }
+
+    bool preflightPolicy()
+    {
+        m_policy_status->clear();
+        if (const QString name_error = m_wizard->walletNameError(m_name->text()); !name_error.isEmpty()) {
+            m_policy_status->setText(name_error);
+            m_name->setFocus();
+            return false;
+        }
+        if (m_policy->toPlainText().toUtf8().size() > 1024 * 1024) {
+            m_policy_status->setText(tr("The public policy is larger than 1 MiB."));
+            return false;
+        }
+        auto decoded = DecodeVaultPolicyInput(m_policy->toPlainText());
+        if (!decoded) {
+            m_policy_status->setText(QString::fromStdString(util::ErrorString(decoded).original));
+            return false;
+        }
+        auto package = wallet::ParseVaultPolicyPackage(*decoded);
+        if (!package) {
+            m_policy_status->setText(QString::fromStdString(util::ErrorString(package).original));
+            return false;
+        }
+        auto fixed = wallet::ValidateFixedStagedVaultPolicy(*package);
+        if (!fixed) {
+            m_policy_status->setText(QString::fromStdString(util::ErrorString(fixed).original));
+            return false;
+        }
+        auto participants = wallet::FixedVaultParticipants(*package);
+        if (!participants) {
+            m_policy_status->setText(QString::fromStdString(util::ErrorString(participants).original));
+            return false;
+        }
+        const std::string canonical{wallet::FormatVaultPolicyPackage(*package)};
+        if (canonical != *decoded) {
+            m_policy_status->setText(tr("The public policy must use the exact canonical Recovery Kit format."));
+            return false;
+        }
+        auto rescan_ready = m_wizard->node().walletLoader().checkRescanFromGenesis();
+        if (!rescan_ready) {
+            m_policy_status->setText(QString::fromStdString(util::ErrorString(rescan_ready).translated));
+            return false;
+        }
+        clearPhrases();
+        m_recovered_software.clear();
+        m_connected_hardware.clear();
+        m_package = *package;
+        m_canonical_policy = *decoded;
+        const interfaces::ExternalSignerDiscovery discovery{
+            m_wizard->node().discoverExternalSigners(participants->front().path)};
+        if (discovery.status == interfaces::ExternalSignerDiscoveryStatus::SUCCESS) {
+            for (const auto& device : discovery.devices) {
+                if (!device.IsUsableForStagedVault()) continue;
+                const auto match = std::find_if(participants->begin(), participants->end(), [&](const auto& participant) {
+                    return participant.path == discovery.account_path &&
+                           participant.fingerprint == device.fingerprint &&
+                           participant.xpub == *device.account_xpub;
+                });
+                if (match != participants->end()) m_connected_hardware.insert(match->fingerprint);
+            }
+        }
+        m_policy_summary->setText(tr(
+            "Network: %1\nPolicy ID: %2\nNow: all 3 participants\nAfter 4,320 blocks: any 2\nAfter 8,640 blocks: any 1\nExact hardware participants connected: %3")
+            .arg(QString::fromStdString(m_package.network),
+                 QString::fromStdString(m_package.policy_id),
+                 QString::number(m_connected_hardware.size())));
+        m_policy_status->setText(discovery.status == interfaces::ExternalSignerDiscoveryStatus::SUCCESS
+                ? tr("Policy and rescan preflight complete. No private phrase has been requested yet.")
+                : tr("Policy and rescan preflight complete. Hardware discovery is unavailable, so no device is counted as signing authority. No private phrase has been requested yet."));
+        updateAuthority();
+        return true;
+    }
+
+    bool addCurrentPhrase()
+    {
+        if (m_phrase->trimmedEmpty()) return true;
+        if (m_phrases.size() >= 3) {
+            m_key_status->setText(tr("This fixed policy has only three participants."));
+            return false;
+        }
+        m_phrases.push_back(m_phrase->takeTrimmed());
+        auto matches = wallet::ValidateVaultPolicyMnemonics(m_package, m_phrases);
+        if (!matches || matches->size() != m_phrases.size()) {
+            SecureString rejected{std::move(m_phrases.back())};
+            m_phrases.pop_back();
+            m_phrase->restoreSecure(std::move(rejected));
+            m_key_status->setText(matches
+                ? tr("That phrase did not match the complete public policy.")
+                : QString::fromStdString(util::ErrorString(matches).original));
+            return false;
+        }
+        const size_t added_index = m_phrases.size() - 1;
+        const auto match = std::find_if(matches->begin(), matches->end(), [added_index](const wallet::VaultMnemonicMatch& item) {
+            return item.mnemonic_index == added_index;
+        });
+        if (match == matches->end()) {
+            SecureString rejected{std::move(m_phrases.back())};
+            m_phrases.pop_back();
+            m_phrase->restoreSecure(std::move(rejected));
+            m_key_status->setText(tr("That phrase could not be matched by identity."));
+            return false;
+        }
+        m_recovered_software.insert(match->fingerprint);
+        m_key_list->addItem(tr("Software key %1 matched · fingerprint %2")
+            .arg(m_phrases.size()).arg(QString::fromStdString(match->fingerprint)));
+        m_key_status->setText(tr("Key matched by fingerprint, derivation path, and full account xpub."));
+        m_add_key->setEnabled(m_phrases.size() < 3);
+        updateAuthority();
+        return true;
+    }
+
+    void updateAuthority()
+    {
+        std::set<std::string> available{m_connected_hardware};
+        available.insert(m_recovered_software.begin(), m_recovered_software.end());
+        const size_t count{available.size()};
+        const QString sources{tr("%1 software, %2 exact hardware")
+                                  .arg(m_recovered_software.size())
+                                  .arg(m_connected_hardware.size())};
+        QString authority;
+        switch (count) {
+        case 0:
+            authority = tr("Public policy only. No software signing key is restored. Reconnect exact hardware participants to regain signing capability.");
+            break;
+        case 1:
+            authority = tr("One participant is available (%1). It can use only the 8,640-block (~60 day) recovery path by itself.").arg(sources);
+            break;
+        case 2:
+            authority = tr("Two participants are available (%1). Together they can use the 4,320-block (~30 day) recovery path; either one can use the final path.").arg(sources);
+            break;
+        default:
+            authority = tr("All three participants are available (%1). Immediate spending and both explicit recovery paths are available.").arg(sources);
+            break;
+        }
+        if (m_key_authority) m_key_authority->setText(authority);
+        if (m_authority_summary) m_authority_summary->setText(authority);
+        if (m_rescan_summary) {
+            m_rescan_summary->setText(tr("Restore %1 with policy ID %2. %3")
+                .arg(m_name ? m_name->text().trimmed().toHtmlEscaped() : QString{},
+                     QString::fromStdString(m_package.policy_id).toHtmlEscaped(),
+                     authority.toHtmlEscaped()));
         }
     }
 
-    void restore()
+    bool validateCurrentPage() override
     {
-        std::vector<SecureString> mnemonics;
-        for (QLineEdit* entry : m_phrases) {
-            QByteArray bytes = entry->text().trimmed().toUtf8();
-            if (!bytes.isEmpty()) mnemonics.emplace_back(bytes.begin(), bytes.end());
-            if (!bytes.isEmpty()) memory_cleanse(bytes.data(), bytes.size());
-        }
-        if (mnemonics.empty()) {
-            m_status->setText(tr("Enter at least one complete 24-word recovery phrase."));
-            return;
-        }
+        if (currentId() == Policy) return preflightPolicy();
+        if (currentId() == RecoveryKeys) return addCurrentPhrase();
+        return QWizard::validateCurrentPage();
+    }
+
+    void accept() override
+    {
+        if (currentId() != Rescan || m_restore_started) return;
         QString error;
-        if (!m_wizard->restoreFromRecoverySheets(m_name->text().trimmed(), m_policy->toPlainText(), mnemonics, error)) {
-            m_status->setText(error);
+        const bool started{m_retry_wallet
+                ? m_wizard->retryRecoveryRescan(m_retry_wallet, error)
+                : m_wizard->restoreFromRecoverySheets(m_name->text().trimmed(),
+                                                       QString::fromStdString(m_canonical_policy),
+                                                       m_phrases, error)};
+        if (!started) {
+            m_rescan_summary->setText(error);
             return;
         }
+        m_restore_started = true;
+        button(QWizard::FinishButton)->setEnabled(false);
+        button(QWizard::BackButton)->setEnabled(false);
+        button(QWizard::CancelButton)->setEnabled(false);
         clearPhrases();
-        accept();
     }
 
     MultisigWizard* m_wizard;
     QLineEdit* m_name{nullptr};
     QPlainTextEdit* m_policy{nullptr};
-    std::array<QLineEdit*, 3> m_phrases{};
-    QLabel* m_status{nullptr};
+    QLabel* m_policy_summary{nullptr};
+    QLabel* m_policy_status{nullptr};
+    SecureMnemonicEdit* m_phrase{nullptr};
+    QPushButton* m_add_key{nullptr};
+    QListWidget* m_key_list{nullptr};
+    QLabel* m_key_status{nullptr};
+    QLabel* m_key_authority{nullptr};
+    QLabel* m_authority_summary{nullptr};
+    QLabel* m_rescan_summary{nullptr};
+    wallet::VaultPolicyPackage m_package;
+    std::string m_canonical_policy;
+    std::vector<SecureString> m_phrases;
+    std::set<std::string> m_recovered_software;
+    std::set<std::string> m_connected_hardware;
+    bool m_restore_started{false};
+    WalletModel* m_retry_wallet{nullptr};
 };
 } // namespace
 
 class MultisigIntroPage : public QWizardPage
 {
 public:
-    explicit MultisigIntroPage(MultisigWizard* wizard) : QWizardPage(wizard), m_wizard(wizard)
+    explicit MultisigIntroPage(MultisigWizard* wizard) : QWizardPage(wizard)
     {
+        setTitle(tr("Create a vault wallet"));
+        setSubTitle(tr("Review the recovery model before choosing a template, key sources, and policy details."));
         auto* layout = new QVBoxLayout(this);
         layout->setSpacing(10);
-
-        m_fixed = new QWidget;
-        auto* fixed_layout = new QVBoxLayout(m_fixed);
-        fixed_layout->setContentsMargins(0, 0, 0, 0);
-        fixed_layout->setSpacing(10);
-        auto* form = new QFormLayout;
-        m_name = new QLineEdit;
-        m_name->setObjectName("stagedWalletNameEdit");
-        m_name->setText(wizard->walletName());
-        m_name->setPlaceholderText(tr("Family vault"));
-        form->addRow(tr("Wallet name"), m_name);
-        fixed_layout->addLayout(form);
-        m_name_error = new QLabel;
-        m_name_error->setObjectName("walletNameErrorLabel");
-        m_name_error->setWordWrap(true);
-        m_name_error->setStyleSheet(QStringLiteral("QLabel { color: red; }"));
-        fixed_layout->addWidget(m_name_error);
-        m_restore = new QPushButton(tr("Restore from a printed recovery kit…"));
-        m_restore->setObjectName("restoreFromMnemonicButton");
-        m_restore->setAutoDefault(false);
-        fixed_layout->addWidget(m_restore, 0, Qt::AlignLeft);
-        fixed_layout->addWidget(MakeTitledCard(
-            tr("All three keys spend now"),
-            tr("The immediate path combines all three keys into one MuSig2 signature. Losing one key freezes immediate spending.")));
-        fixed_layout->addWidget(MakeTitledCard(
-            tr("Any two recover after about 30 days"),
-            tr("After 4,320 blocks, any two of the same three keys can make an explicit recovery spend.")));
-        fixed_layout->addWidget(MakeTitledCard(
-            tr("Any one recovers after about 60 days"),
-            tr("After 8,640 blocks, any one key can recover. Recovery is never automatic; each coin has its own clock, and change starts both waits again.")));
-        auto* note = new QLabel(tr("Block times vary, so 30 and 60 days are estimates. The exact on-chain delays are 4,320 and 8,640 blocks."));
-        note->setWordWrap(true);
-        note->setStyleSheet(QStringLiteral("QLabel { color: palette(window-text); }"));
-        fixed_layout->addWidget(note);
-        layout->addWidget(m_fixed);
-
-        m_advanced = new QWidget;
-        auto* advanced_layout = new QVBoxLayout(m_advanced);
-        advanced_layout->setContentsMargins(0, 0, 0, 0);
-        advanced_layout->setSpacing(10);
-        advanced_layout->addWidget(MakeTitledCard(
+        layout->addWidget(MakeTitledCard(
             tr("A lost key can freeze spending now"),
             tr("A delayed recovery policy is not ordinary multisig. If an immediate-path key is lost, the remaining keys cannot spend until the configured recovery condition is satisfied.")));
-        advanced_layout->addWidget(MakeTitledCard(
+        layout->addWidget(MakeTitledCard(
             tr("Recovery is not automatic"),
             tr("Mature coins do not move themselves. Someone must explicitly construct and sign a recovery spend.")));
-        advanced_layout->addWidget(MakeTitledCard(
+        layout->addWidget(MakeTitledCard(
             tr("Each coin has its own clock"),
             tr("Relative delays apply separately to each received coin. Change and consolidation start a new wait; block-time calendar estimates vary.")));
-        layout->addWidget(m_advanced);
         layout->addStretch();
-        connect(m_name, &QLineEdit::textChanged, this, [this] {
-            refreshNameAvailability();
-        });
-        connect(m_restore, &QPushButton::clicked, this, [this] {
-            m_wizard->setWalletName(m_name->text().trimmed());
-            MnemonicRestoreDialog dialog(m_wizard);
-            dialog.exec();
-        });
-        refreshMode();
-    }
-    void refreshNameAvailability()
-    {
-        const bool advanced = m_wizard->advancedFlow();
-        const QString error = advanced ? QString{} : m_wizard->walletNameError(m_name->text());
-        m_name_available = error.isEmpty();
-        m_name_error->setText(error);
-        m_name_error->setVisible(!advanced && !error.isEmpty());
-        Q_EMIT completeChanged();
     }
     void refreshMode()
     {
-        const bool advanced = m_wizard->advancedFlow();
-        m_fixed->setVisible(!advanced);
-        m_restore->setVisible(!advanced);
-        m_advanced->setVisible(advanced);
-        setTitle(advanced ? tr("Create a vault wallet") : tr("Create a 30 / 60 day Scrooge Vault"));
-        setSubTitle(advanced
-            ? tr("Review the recovery model before choosing a template, key sources, and policy details.")
-            : tr("A fixed three-key Taproot vault. Compatible connected hardware wallets fill key slots; Bitcoin Core creates the remaining software keys."));
-        refreshNameAvailability();
+        setTitle(tr("Create a vault wallet"));
+        setSubTitle(tr("Review the recovery model before choosing a template, key sources, and policy details."));
     }
-    void initializePage() override
-    {
-        m_name->setText(m_wizard->walletName());
-        refreshMode();
-    }
-    bool isComplete() const override
-    {
-        return m_wizard->advancedFlow() || m_name_available;
-    }
-    bool validatePage() override
-    {
-        if (!m_wizard->advancedFlow()) {
-            refreshNameAvailability();
-            if (!m_name_available) return false;
-            m_wizard->setWalletName(m_name->text().trimmed());
-        }
-        return true;
-    }
-    int nextId() const override
-    {
-        return m_wizard->advancedFlow() ? MultisigWizard::Page_Template : MultisigWizard::Page_Keys;
-    }
-
-private:
-    MultisigWizard* m_wizard;
-    QWidget* m_fixed{nullptr};
-    QWidget* m_advanced{nullptr};
-    QLineEdit* m_name{nullptr};
-    QLabel* m_name_error{nullptr};
-    QPushButton* m_restore{nullptr};
-    bool m_name_available{false};
+    int nextId() const override { return MultisigWizard::Page_Template; }
 };
 
 class MultisigTemplatePage : public QWizardPage
@@ -764,10 +1103,129 @@ public:
 
     explicit MultisigKeysPage(MultisigWizard* wizard) : QWizardPage(wizard), m_wizard(wizard)
     {
-        setTitle(tr("Keys"));
-        setSubTitle(tr("Choose software, hardware, or offline keys. Hardware is optional."));
+        setTitle(tr("Create a Recovery Vault"));
+        setSubTitle(tr("Review who can spend now and how recovery changes over time."));
         auto* layout = new QVBoxLayout(this);
         layout->setSpacing(8);
+
+        m_fixed_review = new QWidget;
+        auto* review_layout = new QVBoxLayout(m_fixed_review);
+        review_layout->setContentsMargins(0, 0, 0, 0);
+        review_layout->setSpacing(9);
+        auto* name_form = new QFormLayout;
+        m_name = new QLineEdit;
+        m_name->setObjectName("stagedWalletNameEdit");
+        m_name->setText(wizard->walletName());
+        m_name->setPlaceholderText(tr("Family vault"));
+        m_name->setAccessibleName(tr("Vault wallet name"));
+        name_form->addRow(tr("Wallet name"), m_name);
+        review_layout->addLayout(name_form);
+        m_name_error = new QLabel;
+        m_name_error->setObjectName("walletNameErrorLabel");
+        m_name_error->setWordWrap(true);
+        m_name_error->setStyleSheet(QStringLiteral("QLabel { color: palette(bright-text); }"));
+        review_layout->addWidget(m_name_error);
+
+        auto* timeline = new QHBoxLayout;
+        timeline->setSpacing(20);
+        const std::array<QString, 3> timeline_copy{
+            tr("Now\nall 3 keys"),
+            tr("After ~30 days\nany 2 keys"),
+            tr("After ~60 days\nany 1 key"),
+        };
+        for (const QString& copy : timeline_copy) {
+            auto* label = new QLabel(copy);
+            label->setAlignment(Qt::AlignCenter);
+            QFont font = label->font();
+            font.setBold(true);
+            font.setPointSize(font.pointSize() + 1);
+            label->setFont(font);
+            label->setMinimumHeight(44);
+            timeline->addWidget(label, 1);
+        }
+        review_layout->addLayout(timeline);
+
+        m_authority = new QLabel;
+        m_authority->setObjectName("fixedAuthorityLabel");
+        m_authority->setWordWrap(true);
+        QFont authority_font = m_authority->font();
+        authority_font.setPointSize(authority_font.pointSize() + 1);
+        m_authority->setFont(authority_font);
+        review_layout->addWidget(m_authority);
+
+        m_fixed_roster = new QWidget;
+        auto* roster_layout = new QVBoxLayout(m_fixed_roster);
+        roster_layout->setContentsMargins(0, 0, 0, 0);
+        roster_layout->setSpacing(5);
+        for (int slot = 0; slot < MultisigWizard::kStagedVaultKeyCount; ++slot) {
+            auto* row = new QWidget;
+            auto* row_layout = new QHBoxLayout(row);
+            row_layout->setContentsMargins(10, 5, 10, 5);
+            row_layout->setSpacing(12);
+            auto* number = new QLabel(QString::number(slot + 1));
+            number->setAlignment(Qt::AlignCenter);
+            number->setFixedWidth(22);
+            m_slot_primary[slot] = new QLabel;
+            QFont primary_font = m_slot_primary[slot]->font();
+            primary_font.setBold(true);
+            m_slot_primary[slot]->setFont(primary_font);
+            m_slot_secondary[slot] = new QLabel;
+            m_slot_secondary[slot]->setStyleSheet(QStringLiteral("QLabel { color: palette(placeholder-text); }"));
+            m_slot_secondary[slot]->setTextInteractionFlags(Qt::TextSelectableByMouse);
+            row_layout->addWidget(number);
+            row_layout->addWidget(m_slot_primary[slot], 1);
+            row_layout->addWidget(m_slot_secondary[slot]);
+            roster_layout->addWidget(row);
+        }
+        review_layout->addWidget(m_fixed_roster);
+
+        auto* discovery_row = new QHBoxLayout;
+        m_discovery_status = new QLabel;
+        m_discovery_status->setObjectName("hardwareDiscoveryStatus");
+        m_discovery_status->setWordWrap(true);
+        m_retry = new QPushButton(tr("Retry"));
+        m_retry->setObjectName("refreshDevicesButton");
+        m_retry->setAutoDefault(false);
+        discovery_row->addWidget(m_discovery_status, 1);
+        discovery_row->addWidget(m_retry, 0, Qt::AlignTop);
+        review_layout->addLayout(discovery_row);
+
+        auto* details = new QToolButton;
+        details->setObjectName("technicalDetailsButton");
+        details->setText(tr("Technical details"));
+        details->setCheckable(true);
+        details->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+        details->setArrowType(Qt::RightArrow);
+        m_technical = new QLabel(tr(
+            "Taproot (Bech32m). Immediate spending uses all three participants. "
+            "Explicit recovery uses any two after exactly 4,320 blocks or any one after exactly 8,640 blocks. "
+            "Each received or change output has its own relative-delay clock."));
+        m_technical->setObjectName("fixedTechnicalDetails");
+        m_technical->setWordWrap(true);
+        m_technical->setVisible(false);
+        review_layout->addWidget(details, 0, Qt::AlignLeft);
+        review_layout->addWidget(m_technical);
+        connect(details, &QToolButton::toggled, this, [this, details](bool shown) {
+            details->setArrowType(shown ? Qt::DownArrow : Qt::RightArrow);
+            m_technical->setVisible(shown);
+        });
+
+        auto* boundary = new QLabel(tr("Next, you’ll print and secure one complete Recovery Kit before this wallet is created."));
+        boundary->setObjectName("recoveryKitNextLabel");
+        boundary->setWordWrap(true);
+        review_layout->addWidget(boundary);
+        auto* secondary_actions = new QHBoxLayout;
+        m_restore = new QPushButton(tr("Restore a Vault…"));
+        m_restore->setObjectName("restoreFromMnemonicButton");
+        m_restore->setAutoDefault(false);
+        m_advanced = new QPushButton(tr("Advanced…"));
+        m_advanced->setObjectName("advancedVaultButton");
+        m_advanced->setAutoDefault(false);
+        secondary_actions->addWidget(m_restore);
+        secondary_actions->addWidget(m_advanced);
+        secondary_actions->addStretch();
+        review_layout->addLayout(secondary_actions);
+        layout->addWidget(m_fixed_review);
 
         m_plan = new QLabel;
         m_plan->setObjectName("automaticKeyPlanLabel");
@@ -813,7 +1271,7 @@ public:
         hw_layout->addWidget(hw_empty);
         hw_layout->addWidget(hardware);
         auto* refresh = new QPushButton(tr("Refresh devices"));
-        refresh->setObjectName("refreshDevicesButton");
+        refresh->setObjectName("advancedRefreshDevicesButton");
         refresh->setAutoDefault(false);
         hw_layout->addWidget(refresh, 0, Qt::AlignLeft);
         layout->addWidget(m_hardware_box);
@@ -867,6 +1325,20 @@ public:
         });
         connect(refresh, &QPushButton::clicked, this, [this] {
             m_wizard->refreshHardware();
+        });
+        connect(m_retry, &QPushButton::clicked, this, [this] { m_wizard->refreshHardware(); });
+        connect(m_name, &QLineEdit::textChanged, this, [this] {
+            refreshNameAvailability();
+            Q_EMIT completeChanged();
+        });
+        connect(m_restore, &QPushButton::clicked, this, [this] {
+            m_wizard->setWalletName(m_name->text().trimmed());
+            VaultRestoreWizard dialog(m_wizard);
+            dialog.exec();
+        });
+        connect(m_advanced, &QPushButton::clicked, this, [this] {
+            m_wizard->enableAdvancedFlow();
+            m_wizard->restart();
         });
         connect(hardware, &QListWidget::itemChanged, this, [this](QListWidgetItem* item) {
             if (!m_wizard->advancedFlow()) return;
@@ -938,17 +1410,21 @@ public:
     void initializePage() override
     {
         const bool advanced = m_wizard->advancedFlow();
-        setCommitPage(!advanced);
-        setTitle(advanced ? tr("Keys") : tr("Your three signing keys"));
+        setCommitPage(false);
+        setTitle(advanced ? tr("Keys") : tr("Create a Recovery Vault"));
         setSubTitle(advanced
             ? tr("Choose software, hardware, or offline keys. Hardware is optional.")
-            : tr("Every compatible connected hardware wallet fills a slot. Bitcoin Core generates software keys for the slots left over."));
-        m_plan->setVisible(!advanced);
-        m_local_box->setTitle(advanced ? tr("Software keys on this computer") : tr("What this key mix means"));
-        m_local_count_label->setVisible(advanced);
-        local_count->setVisible(advanced);
-        m_hardware_box->setTitle(advanced ? tr("Connected hardware") : tr("Three-key roster"));
+            : tr("Review who can spend now and how recovery changes over time."));
+        m_fixed_review->setVisible(!advanced);
+        m_plan->setVisible(false);
+        m_local_box->setVisible(advanced);
+        m_hardware_box->setVisible(advanced);
         m_air_box->setVisible(advanced);
+        m_count->setVisible(advanced);
+        if (!advanced) {
+            m_name->setText(m_wizard->walletName());
+            refreshNameAvailability();
+        }
 
         local_count->blockSignals(true);
         local_count->setValue(m_wizard->localKeyCount());
@@ -974,8 +1450,7 @@ public:
         m_wizard->rebuildKeyList();
         if (!m_wizard->advancedFlow()) {
             return m_discovery_valid && m_wizard->keys().size() == MultisigWizard::kStagedVaultKeyCount &&
-                   m_wizard->nActiveKeys() == MultisigWizard::kStagedVaultKeyCount &&
-                   m_local_risk && m_local_risk->isChecked();
+                   m_wizard->nActiveKeys() == MultisigWizard::kStagedVaultKeyCount && m_name_available;
         }
         return m_wizard->keys().size() >= 2 &&
                (m_wizard->localKeyCount() <= 1 || (m_local_risk && m_local_risk->isChecked()));
@@ -988,22 +1463,18 @@ public:
                                   tr("This build cannot create the required recovery PDF, so no wallet was created."));
             return false;
 #endif
+            m_wizard->setWalletName(m_name->text().trimmed());
+            refreshNameAvailability();
+            if (!m_name_available) return false;
             if (const QString name_error = m_wizard->walletNameError(m_wizard->walletName()); !name_error.isEmpty()) {
                 QMessageBox::warning(this, tr("Choose another wallet name"), name_error);
-                QTimer::singleShot(0, m_wizard, [wizard = m_wizard] {
-                    if (wizard->currentId() == MultisigWizard::Page_Keys) {
-                        wizard->back();
-                        if (auto* intro = dynamic_cast<MultisigIntroPage*>(wizard->page(MultisigWizard::Page_Intro))) {
-                            intro->refreshNameAvailability();
-                        }
-                    }
-                });
+                m_name->setFocus();
                 return false;
             }
             // Re-enumerate at the commit boundary. A disconnected, newly
             // connected, or reordered device must never be silently replaced
             // after the user acknowledged the roster.
-            populateHardware();
+            populateHardware(/*require_unchanged=*/true);
             updateLocalWarning();
             updateCount();
             m_wizard->rebuildKeyList();
@@ -1031,20 +1502,12 @@ public:
                 // with the same friendly, actionable collision message.
                 if (const QString name_error = m_wizard->walletNameError(m_wizard->walletName()); !name_error.isEmpty()) {
                     QMessageBox::warning(this, tr("Choose another wallet name"), name_error);
-                    QTimer::singleShot(0, m_wizard, [wizard = m_wizard] {
-                        if (wizard->currentId() == MultisigWizard::Page_Keys) {
-                            wizard->back();
-                            if (auto* intro = dynamic_cast<MultisigIntroPage*>(wizard->page(MultisigWizard::Page_Intro))) {
-                                intro->refreshNameAvailability();
-                            }
-                        }
-                    });
+                    m_name->setFocus();
                     return false;
                 }
-                QMessageBox::critical(this, tr("Could not create wallet"), m_wizard->createError());
+                QMessageBox::critical(this, tr("Could not prepare vault"), m_wizard->createError());
                 return false;
             }
-            m_wizard->lockCommittedJourney();
             return true;
         }
         m_wizard->rebuildKeyList();
@@ -1066,42 +1529,49 @@ public:
         return m_wizard->advancedFlow() ? MultisigWizard::Page_Threshold : MultisigWizard::Page_Backup;
     }
 
+    void showNameError(const QString& error)
+    {
+        m_name_available = false;
+        m_name_error->setText(error);
+        m_name_error->setVisible(true);
+        m_name->setFocus();
+        Q_EMIT completeChanged();
+    }
+
 private:
+    void refreshNameAvailability()
+    {
+        if (m_wizard->advancedFlow()) {
+            m_name_available = true;
+            return;
+        }
+        const QString error = m_wizard->walletNameError(m_name->text());
+        m_name_available = error.isEmpty();
+        m_name_error->setText(error);
+        m_name_error->setVisible(!error.isEmpty());
+    }
+
     void updateLocalWarning()
     {
         const int count = m_wizard->localKeyCount();
         if (!m_wizard->advancedFlow()) {
             const int connected = static_cast<int>(m_wizard->m_hardware.size());
-            m_plan->setText(tr(
-                "<b>Fixed Scrooge Vault policy:</b> all 3 keys spend now; any 2 recover after 4,320 blocks (~30 days); "
-                "any 1 recovers after 8,640 blocks (~60 days). Recovery is always an explicit spend."));
             if (!m_discovery_valid && !m_discovery_error.isEmpty()) {
-                m_local_warning->setText(m_discovery_error);
-                m_local_risk->setText(tr("Resolve the device problem and refresh before creating the wallet."));
-                m_local_risk->setChecked(false);
-                m_local_risk->setEnabled(false);
-                m_local_risk->show();
+                m_authority->setText(tr("The key roster is not ready. No software slot was substituted."));
+                m_discovery_status->setText(m_discovery_error);
+                m_retry->setVisible(true);
                 return;
             }
-            m_local_risk->setEnabled(true);
-            m_local_risk->show();
+            m_discovery_status->setText(tr("Compatible hardware wallets refresh automatically."));
+            m_retry->setVisible(false);
             if (connected == 0) {
-                m_local_warning->setText(tr(
-                    "No usable unlocked hardware wallet was detected, so this wallet will hold all three software keys. "
-                    "This wallet file or its backup alone can spend immediately."));
-                m_local_risk->setText(tr("I understand this one computer and wallet backup control all three keys and can spend immediately."));
+                m_authority->setText(tr("This computer holds all three keys. This wallet or its recovery kit can spend immediately."));
             } else if (connected == 1) {
-                m_local_warning->setText(tr(
-                    "One hardware wallet fills a slot. This wallet will hold the other two software keys, so this wallet file or its backup alone can recover after about 30 days."));
-                m_local_risk->setText(tr("I understand this computer and wallet backup hold the two-key 30-day recovery quorum."));
+                m_authority->setText(tr("This computer holds two keys. Together they can recover after about 30 days; the hardware wallet is also required to spend immediately."));
             } else if (connected == 2) {
-                m_local_warning->setText(tr(
-                    "Two hardware wallets fill slots. This wallet will hold one software key, which can recover alone after about 60 days."));
-                m_local_risk->setText(tr("I understand this computer and wallet backup hold a key that can recover alone after about 60 days."));
+                m_authority->setText(tr("This computer holds one key. It can recover alone after about 60 days."));
             } else {
-                m_local_warning->setText(tr(
-                    "All three slots use hardware wallets. Any pair can recover after about 30 days, and any one device can recover after about 60 days."));
-                m_local_risk->setText(tr("I understand any two devices can recover after 30 days and any one device can recover after 60 days."));
+                m_authority->setText(tr("No private keys are stored on this computer. Any two devices can recover after about 30 days; any one can recover after about 60 days."));
             }
             return;
         }
@@ -1143,7 +1613,7 @@ private:
         }
         m_wizard->refreshSidebar();
     }
-    void populateHardware()
+    void populateHardware(bool require_unchanged = false)
     {
         hardware->clear();
         hw_empty->hide();
@@ -1152,38 +1622,75 @@ private:
             m_discovery_valid = true;
             m_discovery_error.clear();
             std::vector<MultisigKeySpec> detected;
+            std::map<std::string, std::pair<std::string, std::string>> accounts;
+            std::set<std::string> address_display_devices;
+            std::vector<std::string> signature;
             try {
-                std::vector<std::unique_ptr<interfaces::ExternalSigner>> signers;
+                interfaces::ExternalSignerDiscovery discovery;
+                const std::string account_path{wallet::DefaultMultisigPath(OutputType::BECH32M, 0)};
                 if (auto* ctx = m_wizard->node().context(); ctx && ctx->args) {
-                    signers = m_wizard->node().listExternalSigners();
+                    discovery = m_wizard->node().discoverExternalSigners(account_path);
+                } else {
+                    discovery.status = interfaces::ExternalSignerDiscoveryStatus::NOT_CONFIGURED;
+                    discovery.account_path = account_path;
                 }
-                std::set<std::string> fingerprints;
-                for (const auto& signer : signers) {
-                    const std::string fingerprint = signer->getFingerprint();
-                    if (fingerprint.size() != 8 || !IsHex(fingerprint)) {
+
+                if (discovery.status == interfaces::ExternalSignerDiscoveryStatus::NOT_CONFIGURED) {
+                    m_discovery_valid = false;
+                    m_discovery_error = tr("Hardware-wallet discovery is not configured. Configure native HWI, then retry. No software keys were substituted.");
+                } else if (discovery.status == interfaces::ExternalSignerDiscoveryStatus::FAILED) {
+                    m_discovery_valid = false;
+                    m_discovery_error = tr("Hardware-wallet discovery failed: %1. Check the signer backend, then retry. No software keys were substituted.")
+                                            .arg(QString::fromStdString(discovery.error.value_or("unknown discovery error")));
+                }
+
+                signature.reserve(discovery.devices.size());
+                for (const auto& device : discovery.devices) {
+                    signature.push_back(strprintf("%s|%s|%s|%s", device.path,
+                                                  device.fingerprint,
+                                                  device.account_xpub.value_or(""),
+                                                  device.IsUsableForStagedVault() ? "ready" : "blocked"));
+                    if (!m_discovery_valid) continue;
+
+                    const QString device_name = QString::fromStdString(
+                        !device.model.empty() ? device.model : (!device.type.empty() ? device.type : "Hardware wallet"));
+                    const QString fingerprint = QString::fromStdString(device.fingerprint);
+                    if (device.locked) {
                         m_discovery_valid = false;
-                        m_discovery_error = tr("A connected device is locked, unsupported, or did not provide a valid fingerprint. Unlock or disconnect it, then refresh.");
-                        break;
-                    }
-                    const std::optional<bool> staged_vault = signer->supportsStagedVault();
-                    if (!staged_vault || !*staged_vault) {
+                        m_discovery_error = tr("%1 is locked or did not provide a fingerprint. Unlock it, then retry. No software key was substituted.").arg(device_name);
+                    } else if (device.duplicate) {
                         m_discovery_valid = false;
-                        m_discovery_error = !staged_vault
-                            ? tr("The signer for device %1 does not advertise staged-vault capability. Use native HWI support or disconnect it, then refresh.")
-                                  .arg(QString::fromStdString(fingerprint))
-                            : tr("Device %1 cannot complete the Taproot MuSig2 path and cannot be used in this Scrooge Vault. Disconnect it, then refresh.")
-                                  .arg(QString::fromStdString(fingerprint));
-                        break;
-                    }
-                    if (!fingerprints.insert(fingerprint).second) {
+                        m_discovery_error = tr("%1 (%2) was discovered more than once. Disconnect the duplicate path, then retry. No software key was substituted.")
+                                                .arg(device_name, fingerprint);
+                    } else if (device.error) {
                         m_discovery_valid = false;
-                        m_discovery_error = tr("The same hardware-wallet fingerprint was detected more than once. Disconnect the duplicate connection, then refresh.");
-                        break;
+                        m_discovery_error = tr("%1 could not be inspected: %2. Fix or disconnect it, then retry. No software key was substituted.")
+                                                .arg(device_name, QString::fromStdString(*device.error));
+                    } else if (!device.supports_staged_vault.has_value()) {
+                        m_discovery_valid = false;
+                        m_discovery_error = tr("%1 does not report whether it supports Taproot MuSig2 vault signing. Update or disconnect it, then retry.").arg(device_name);
+                    } else if (!*device.supports_staged_vault) {
+                        m_discovery_valid = false;
+                        m_discovery_error = tr("%1 cannot complete Taproot MuSig2 vault signing. Disconnect it, then retry. No software key was substituted.").arg(device_name);
+                    } else if (device.account_xpub_error || !device.account_xpub) {
+                        m_discovery_valid = false;
+                        m_discovery_error = tr("%1 could not provide the required account key: %2. Reconnect it, then retry.")
+                                                .arg(device_name, QString::fromStdString(device.account_xpub_error.value_or("no account xpub returned")));
+                    } else if (!device.IsUsableForStagedVault()) {
+                        m_discovery_valid = false;
+                        m_discovery_error = tr("%1 is not ready for this vault. Fix or disconnect it, then retry.").arg(device_name);
                     }
+                    if (!m_discovery_valid) continue;
+
                     MultisigKeySpec spec;
-                    spec.fingerprint = fingerprint;
-                    spec.label = signer->getName();
+                    spec.fingerprint = device.fingerprint;
+                    spec.path = account_path;
+                    spec.label = device_name.toStdString();
                     detected.push_back(std::move(spec));
+                    accounts.emplace(device.fingerprint, std::pair{account_path, *device.account_xpub});
+                    if (device.supports_multisig_address_display.value_or(false)) {
+                        address_display_devices.insert(device.fingerprint);
+                    }
                 }
                 std::sort(detected.begin(), detected.end(), [](const MultisigKeySpec& a, const MultisigKeySpec& b) {
                     return a.fingerprint.value_or("") < b.fingerprint.value_or("");
@@ -1199,28 +1706,32 @@ private:
                                         .arg(detected.size());
             }
 
-            if (!m_discovery_valid && detected.empty()) {
-                m_local_risk->setChecked(false);
-                hardware->hide();
-                hw_empty->setText(m_discovery_error);
-                hw_empty->show();
+            const bool roster_changed = m_roster_initialized && signature != m_roster_signature;
+            if (m_discovery_valid && require_unchanged && roster_changed) {
+                m_discovery_valid = false;
+                m_discovery_error = tr("The hardware-wallet roster changed at the boundary. Review the devices shown, press Retry, and continue only after the roster remains stable. No wallet was created.");
+            }
+            if (!signature.empty() || m_discovery_valid) {
+                m_roster_initialized = true;
+                m_roster_signature = signature;
+            }
+
+            if (!m_discovery_valid) {
+                m_wizard->m_hardware.clear();
+                m_wizard->m_fixed_hardware_accounts.clear();
+                m_wizard->m_fixed_address_display_devices.clear();
+                m_wizard->m_local_key_count = 0;
+                m_wizard->rebuildKeyList();
+                renderFixedRoster();
                 updateLocalWarning();
+                Q_EMIT completeChanged();
                 return;
             }
 
-            std::vector<std::string> signature;
-            signature.reserve(detected.size() + 1);
-            for (const auto& key : detected) signature.push_back("H:" + key.fingerprint.value_or(""));
-            const int local_keys = m_discovery_valid
-                ? MultisigWizard::kStagedVaultKeyCount - static_cast<int>(detected.size())
-                : 0;
-            signature.push_back(strprintf("L:%d", local_keys));
-            const bool changed = !m_roster_initialized || signature != m_roster_signature;
-            m_roster_initialized = true;
-            m_roster_signature = std::move(signature);
-            if (changed || !m_discovery_valid) m_local_risk->setChecked(false);
-
+            const int local_keys = MultisigWizard::kStagedVaultKeyCount - static_cast<int>(detected.size());
             m_wizard->m_hardware = std::move(detected);
+            m_wizard->m_fixed_hardware_accounts = std::move(accounts);
+            m_wizard->m_fixed_address_display_devices = std::move(address_display_devices);
             m_wizard->m_local_key_count = local_keys;
             if (local_keys > 0) m_wizard->m_last_local_key_count = local_keys;
             m_wizard->rebuildKeyList();
@@ -1228,25 +1739,9 @@ private:
             local_count->setValue(local_keys);
             local_count->blockSignals(false);
 
-            int slot{1};
-            for (const auto& key : m_wizard->keys()) {
-                QString text;
-                if (key.fingerprint) {
-                    text = tr("Slot %1 · Hardware: %2 (%3)")
-                               .arg(slot)
-                               .arg(QString::fromStdString(key.label.empty() ? "device" : key.label))
-                               .arg(QString::fromStdString(*key.fingerprint));
-                } else {
-                    text = tr("Slot %1 · Software key generated in this wallet").arg(slot);
-                }
-                auto* item = new QListWidgetItem(text);
-                item->setFlags(item->flags() & ~Qt::ItemIsUserCheckable);
-                hardware->addItem(item);
-                ++slot;
-            }
-            hardware->setMinimumHeight(78);
-            hardware->setMaximumHeight(126);
+            renderFixedRoster();
             updateLocalWarning();
+            Q_EMIT completeChanged();
             return;
         }
 
@@ -1300,7 +1795,42 @@ private:
             airgapped->addItem(line);
         }
     }
+
+    void renderFixedRoster()
+    {
+        m_wizard->rebuildKeyList();
+        const auto& keys = m_wizard->keys();
+        for (int slot = 0; slot < MultisigWizard::kStagedVaultKeyCount; ++slot) {
+            if (slot >= static_cast<int>(keys.size())) {
+                m_slot_primary[slot]->setText(tr("Unavailable"));
+                m_slot_secondary[slot]->setText({});
+                continue;
+            }
+            const auto& key = keys[static_cast<size_t>(slot)];
+            if (key.fingerprint) {
+                m_slot_primary[slot]->setText(QString::fromStdString(
+                    key.label.empty() ? std::string{"Hardware wallet"} : key.label));
+                m_slot_secondary[slot]->setText(tr("Fingerprint %1")
+                    .arg(QString::fromStdString(*key.fingerprint)));
+            } else {
+                m_slot_primary[slot]->setText(tr("Software key"));
+                m_slot_secondary[slot]->setText(tr("Stored in this wallet on this computer"));
+            }
+        }
+    }
     MultisigWizard* m_wizard;
+    QWidget* m_fixed_review{nullptr};
+    QLineEdit* m_name{nullptr};
+    QLabel* m_name_error{nullptr};
+    QLabel* m_authority{nullptr};
+    QWidget* m_fixed_roster{nullptr};
+    std::array<QLabel*, MultisigWizard::kStagedVaultKeyCount> m_slot_primary{};
+    std::array<QLabel*, MultisigWizard::kStagedVaultKeyCount> m_slot_secondary{};
+    QLabel* m_discovery_status{nullptr};
+    QPushButton* m_retry{nullptr};
+    QLabel* m_technical{nullptr};
+    QPushButton* m_restore{nullptr};
+    QPushButton* m_advanced{nullptr};
     QLabel* m_plan{nullptr};
     QGroupBox* m_local_box{nullptr};
     QLabel* m_local_count_label{nullptr};
@@ -1311,6 +1841,7 @@ private:
     QLabel* m_local_warning{nullptr};
     QCheckBox* m_local_risk{nullptr};
     bool m_discovery_valid{true};
+    bool m_name_available{false};
     QString m_discovery_error;
     bool m_roster_initialized{false};
     std::vector<std::string> m_roster_signature;
@@ -1764,6 +2295,10 @@ public:
         m_wallet_backup_ack->setObjectName("localWalletBackupAckCheck");
         layout->addWidget(m_wallet_backup_ack);
 
+        m_ack_definition = new QLabel;
+        m_ack_definition->setObjectName("backupAcknowledgmentDefinition");
+        m_ack_definition->setWordWrap(true);
+        layout->addWidget(m_ack_definition);
         ack = new QCheckBox(tr("I printed or copied the policy JSON somewhere I will still have if this computer is gone."));
         ack->setObjectName("backupAckCheck");
         layout->addWidget(ack);
@@ -1781,29 +2316,37 @@ public:
         });
         connect(m_backup_wallet, &QPushButton::clicked, this, [this] { saveWalletBackup(); });
         connect(m_wallet_backup_ack, &QCheckBox::toggled, this, &QWizardPage::completeChanged);
-        connect(ack, &QCheckBox::toggled, this, &QWizardPage::completeChanged);
+        connect(ack, &QCheckBox::toggled, this, [this] {
+            Q_EMIT completeChanged();
+            if (m_wizard->advancedFlow()) return;
+            const bool ready{isComplete()};
+            m_print_policy->setDefault(!m_private_print_prepared || !m_print_opened);
+            if (auto* next = qobject_cast<QPushButton*>(m_wizard->button(QWizard::NextButton))) {
+                next->setDefault(ready);
+            }
+        });
     }
+
+    ~MultisigBackupPage() override { removePrivatePrintFile(); }
+
     void initializePage() override
     {
         m_wizard->rebuildKeyList();
         const int local_count = m_wizard->localKeyCount();
-        const int hardware_count = static_cast<int>(m_wizard->m_hardware.size());
         const bool needs_wallet_backup = local_count > 0;
         const bool simple = !m_wizard->advancedFlow();
         if (simple) {
-            setTitle(tr("Print the recovery PDF"));
-            setSubTitle(tr("One PDF contains the complete recovery kit. Print every page and store it securely off this computer."));
-            if (hardware_count == 0) {
-                m_warning->setText(tr("The PDF contains all three independent 24-word BIP39 phrases, complete restore instructions, and the exact policy JSON. Anyone with it can spend this vault immediately. Use a trusted local printer: PDF viewers, cloud services, printer memory, and print queues may retain copies. After printing, “I understand” confirms every page is legible, the complete kit is stored off this computer, and the PDF viewer is closed."));
-            } else if (hardware_count == 1) {
-                m_warning->setText(tr("The PDF contains both software-key phrases, restore instructions, and the exact policy JSON. Together they recover after about 30 days; either one recovers after about 60 days. It does not contain the hardware-wallet seed. After printing, “I understand” confirms every page is legible, the kit is stored off this computer, the hardware seed is backed up, and the PDF viewer is closed."));
-            } else if (hardware_count == 2) {
-                m_warning->setText(tr("The PDF contains the software-key phrase, restore instructions, and the exact policy JSON. That phrase recovers alone after about 60 days. It does not contain either hardware-wallet seed. After printing, “I understand” confirms every page is legible, the kit is stored off this computer, both hardware seeds are backed up, and the PDF viewer is closed."));
-            } else {
-                m_warning->setText(tr("The PDF contains the restore instructions and exact public policy JSON, but no hardware-wallet seeds. Preserve all three device seeds separately; any one can recover after about 60 days. After printing, “I understand” confirms the PDF is legible and stored off this computer, all three seeds are backed up, and the viewer is closed."));
-            }
+            setTitle(tr("Secure Recovery"));
+            setSubTitle(tr("Print one complete Recovery Kit before the vault is created."));
+            m_warning->setText(tr(
+                "<p><b>Private — this recovery kit can control your bitcoin.</b></p>"
+                "<ol><li>Print every page.</li><li>Store the complete kit offline.</li>"
+                "<li>Close the PDF viewer, then confirm.</li></ol>"
+                "<p>Use a trusted local printer. PDF viewers, cloud services, printer memory, print queues, and caches may retain copies. Hardware-wallet seeds are not included.</p>"));
+            m_warning->setTextFormat(Qt::RichText);
             ack->setText(tr("I understand"));
             ack->setToolTip(tr("Confirm the printed recovery kit is complete, legible, stored off this computer, and no longer open in the PDF viewer."));
+            m_ack_definition->setText(tr("“I understand” confirms that every page was printed legibly, the complete kit is stored offline, any hardware-wallet seeds were backed up separately, and the PDF viewer is closed."));
         } else {
             setTitle(tr("Save the backup"));
             setSubTitle(tr("The importable policy JSON is saved automatically in the Bitcoin data directory. Print or copy it somewhere separate."));
@@ -1814,6 +2357,7 @@ public:
             ack->setText(tr("I printed or copied the policy JSON somewhere I will still have if this computer is gone."));
             ack->setToolTip({});
         }
+        m_ack_definition->setVisible(simple);
         m_tabs->setVisible(!simple);
         m_copy_policy->setVisible(!simple);
         m_copy_human->setVisible(!simple);
@@ -1833,9 +2377,12 @@ public:
         m_wallet_backup_ack->setEnabled(false);
         m_wallet_backup_ack->setText(tr("I stored this unencrypted wallet backup somewhere separate and secure."));
         if (simple) {
+            m_print_policy->setAutoDefault(true);
             updatePrivatePrintButton();
             m_print_policy->setToolTip(tr("Create and open one PDF containing the complete recovery kit."));
         } else {
+            m_print_policy->setDefault(false);
+            m_print_policy->setAutoDefault(false);
             m_print_policy->setText(tr("Print public recovery policy…"));
             m_print_policy->setToolTip(tr("Create a printable PDF with the human transcript and exact importable JSON, then open it in your PDF viewer."));
             if (needs_wallet_backup) {
@@ -1851,6 +2398,12 @@ public:
             m_print_status->setText(tr("A previous private recovery PDF could not be deleted. Close its viewer, then press Continue again."));
         }
         refreshPackage();
+        if (simple) {
+            QTimer::singleShot(0, this, [this] {
+                m_print_policy->setDefault(true);
+                m_print_policy->setFocus(Qt::OtherFocusReason);
+            });
+        }
     }
     bool isComplete() const override
     {
@@ -1881,7 +2434,26 @@ public:
             m_private_print_cleanup_blocked = false;
             updatePrivatePrintButton();
         }
-        return isComplete();
+        if (!isComplete()) return false;
+        if (!m_wizard->advancedFlow()) {
+            if (!m_wizard->commitWalletCandidate()) {
+                const QString commit_error{m_wizard->createError()};
+                QMessageBox::critical(this, tr("Could not create vault"), commit_error);
+                // The final name can lose a race after the Recovery Kit was
+                // printed. Return to Review Vault so the user can choose a
+                // new name; re-entering this page requires a fresh print and
+                // acknowledgment while no partial wallet exists.
+                QTimer::singleShot(0, m_wizard, [wizard = m_wizard, commit_error] {
+                    wizard->back();
+                    if (auto* keys = dynamic_cast<MultisigKeysPage*>(wizard->page(MultisigWizard::Page_Keys))) {
+                        keys->showNameError(commit_error);
+                    }
+                });
+                return false;
+            }
+            m_wizard->lockCommittedJourney();
+        }
+        return true;
     }
     int nextId() const override { return MultisigWizard::Page_Verify; }
 
@@ -1898,12 +2470,16 @@ private:
 
     bool removePrivatePrintFile()
     {
-        if (!m_private_print_file) return true;
+        if (!m_private_print_file) {
+            m_private_print_lock.reset();
+            return true;
+        }
         const QString path{m_private_print_file->fileName()};
         m_private_print_file->close();
         if (QFileInfo::exists(path) && !m_private_print_file->remove()) return false;
         if (QFileInfo::exists(path)) return false;
         m_private_print_file.reset();
+        m_private_print_lock.reset();
         return true;
     }
 
@@ -2022,7 +2598,7 @@ private:
             }
         }
         if (!m_package_valid || m_policy_id.isEmpty()) return;
-        if (!m_wizard->advancedFlow() && m_wizard->localKeyCount() > 0) {
+        if (!m_wizard->advancedFlow()) {
             printPrivateRecoveryKit();
             return;
         }
@@ -2117,7 +2693,7 @@ private:
     {
 #ifndef QT_NO_PDF
         const int local_count = m_wizard->localKeyCount();
-        if (local_count <= 0 || m_wizard->m_software_recovery.size() != static_cast<size_t>(local_count)) {
+        if (local_count < 0 || m_wizard->m_software_recovery.size() != static_cast<size_t>(local_count)) {
             QMessageBox::critical(this, tr("Print failed"),
                                   tr("The software-key recovery material is incomplete, so the recovery PDF cannot be created."));
             return;
@@ -2140,6 +2716,7 @@ private:
             const QString pdf_path{m_private_print_file->fileName()};
             if (!QFileInfo::exists(pdf_path)) {
                 m_private_print_file.reset();
+                m_private_print_lock.reset();
                 m_private_print_prepared = false;
                 m_print_opened = false;
                 m_private_print_cleanup_blocked = false;
@@ -2180,19 +2757,79 @@ private:
         m_private_print_cleanup_blocked = false;
         ack->setChecked(false);
         ack->setEnabled(false);
+        const QString private_dir_path{QDir::temp().filePath(QStringLiteral("bitcoin-core-vault-recovery"))};
+        const QFileInfo private_dir_info{private_dir_path};
+        if (private_dir_info.isSymLink() ||
+            (!private_dir_info.exists() && !QDir{}.mkpath(private_dir_path)) ||
+            !QFileInfo{private_dir_path}.isDir() ||
+            !QFile::setPermissions(private_dir_path, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner)) {
+            QMessageBox::critical(this, tr("Print failed"),
+                                  tr("Bitcoin Core could not create a private owner-only recovery-print directory."));
+            return;
+        }
+
+        // Serialize stale-file scavenging with creation. A live PDF owns its
+        // adjacent lock; a PDF left by a crashed process is removed before a
+        // new bearer document is created.
+        QLockFile cleanup_lock{QDir{private_dir_path}.filePath(QStringLiteral("cleanup.lock"))};
+        cleanup_lock.setStaleLockTime(0);
+        if (!cleanup_lock.tryLock()) {
+            QMessageBox::critical(this, tr("Print failed"),
+                                  tr("Another Bitcoin Core process is preparing recovery material. Wait, then retry."));
+            return;
+        }
+        QDir private_dir{private_dir_path};
+        const auto stale_cleanup_failed = [this](const QString& detail) {
+            m_private_print_cleanup_blocked = true;
+            m_print_status->setText(tr("Bitcoin Core found an existing private recovery PDF and could not confirm its deletion. No new PDF was created. Close any other recovery wizard, then press “Print PDF” to retry cleanup."));
+            updatePrivatePrintButton();
+            Q_EMIT completeChanged();
+            QMessageBox::critical(this, tr("Print failed"), detail);
+        };
+        for (const QString& stale_name : private_dir.entryList({QStringLiteral("*.pdf")}, QDir::Files)) {
+            const QString stale_path{private_dir.filePath(stale_name)};
+            QLockFile stale_lock{stale_path + QStringLiteral(".lock")};
+            stale_lock.setStaleLockTime(0);
+            if (!stale_lock.tryLock()) {
+                if (QFileInfo::exists(stale_path)) {
+                    stale_cleanup_failed(tr("An existing private recovery PDF is still owned by another Bitcoin Core process. No new recovery PDF was created."));
+                    return;
+                }
+                continue;
+            }
+            const bool removed{m_wizard->removePrivatePrintPath(stale_path)};
+            const bool still_exists{QFileInfo::exists(stale_path)};
+            stale_lock.unlock();
+            if (!removed || still_exists) {
+                stale_cleanup_failed(tr("Bitcoin Core could not delete an existing temporary private recovery PDF. No new recovery PDF was created."));
+                return;
+            }
+        }
+
         auto output = std::make_unique<QTemporaryFile>(
-            QDir::temp().filePath(QStringLiteral("bitcoin-vault-complete-private-recovery-XXXXXX.pdf")));
+            private_dir.filePath(QStringLiteral("complete-recovery-XXXXXX.pdf")));
         output->setAutoRemove(true);
         if (!output->open()) {
             QMessageBox::critical(this, tr("Print failed"), output->errorString());
             return;
         }
         const QString pdf_path = output->fileName();
+        auto private_lock = std::make_unique<QLockFile>(pdf_path + QStringLiteral(".lock"));
+        private_lock->setStaleLockTime(0);
+        if (!private_lock->tryLock()) {
+            output->close();
+            output->remove();
+            QMessageBox::critical(this, tr("Print failed"),
+                                  tr("The temporary recovery PDF could not be exclusively locked."));
+            return;
+        }
+        cleanup_lock.unlock();
         const auto fail_private_pdf = [&](const QString& detail) {
             output->close();
             const bool removed = !QFileInfo::exists(pdf_path) || output->remove();
             if (!removed || QFileInfo::exists(pdf_path)) {
                 m_private_print_file = std::move(output);
+                m_private_print_lock = std::move(private_lock);
                 m_private_print_cleanup_blocked = true;
                 m_print_status->setText(tr("PDF creation failed, and Bitcoin Core could not delete its temporary private file. Close any viewer, then press “Print PDF” to retry cleanup."));
             }
@@ -2209,6 +2846,15 @@ private:
             fail_private_pdf(tr("The complete private recovery kit could not be validated."));
             return;
         }
+        auto qr_parts = wallet::EncodeVaultPolicyQrParts(m_wizard->m_policy_package.toStdString());
+        if (!qr_parts) {
+            html.fill(QChar{0});
+            fail_private_pdf(tr("The public-policy QR parts could not be validated."));
+            return;
+        }
+        constexpr int qr_parts_per_page{2};
+        const int expected_pages = local_count + 3 +
+            (static_cast<int>(qr_parts->size()) + qr_parts_per_page - 1) / qr_parts_per_page;
 
         bool rendered{false};
         int rendered_pages{0};
@@ -2231,8 +2877,14 @@ private:
         output->close();
         html.fill(QChar{0});
 
+        if (rendered_pages != expected_pages) {
+            fail_private_pdf(tr("The recovery kit rendered as %1 pages instead of the required %2 pages. Check the page layout and retry.")
+                                 .arg(rendered_pages)
+                                 .arg(expected_pages));
+            return;
+        }
         if (!rendered || !device_ok || !QFile::setPermissions(pdf_path, QFileDevice::ReadOwner | QFileDevice::WriteOwner) ||
-            rendered_pages < local_count + 3 || QFileInfo{pdf_path}.size() < 100) {
+            QFileInfo{pdf_path}.size() < 100) {
             fail_private_pdf(tr("The private recovery PDF could not be created securely."));
             return;
         }
@@ -2246,6 +2898,7 @@ private:
         }
         verify_pdf.close();
         m_private_print_file = std::move(output);
+        m_private_print_lock = std::move(private_lock);
         m_private_print_prepared = true;
         updatePrivatePrintButton();
         const bool opened = QDesktopServices::openUrl(QUrl::fromLocalFile(pdf_path));
@@ -2257,9 +2910,11 @@ private:
         } else {
             m_print_opened = true;
             ack->setEnabled(true);
-            m_print_status->setText(local_count == 1
-                ? tr("The complete recovery PDF was validated and opened with the software-key mnemonic, instructions, and exact policy JSON. Print every page, close the viewer, then check “I understand”.")
-                : tr("The complete recovery PDF was validated and opened with all %1 software-key mnemonics, instructions, and exact policy JSON. Print every page, close the viewer, then check “I understand”.").arg(local_count));
+            m_print_status->setText(local_count == 0
+                ? tr("The complete recovery PDF was validated and opened with restore instructions and the exact public policy. It contains no hardware-wallet seeds. Print every page, close the viewer, then check “I understand”.")
+                : local_count == 1
+                    ? tr("The complete recovery PDF was validated and opened with the software-key mnemonic, instructions, and exact policy JSON. Print every page, close the viewer, then check “I understand”.")
+                    : tr("The complete recovery PDF was validated and opened with all %1 software-key mnemonics, instructions, and exact policy JSON. Print every page, close the viewer, then check “I understand”.").arg(local_count));
         }
         Q_EMIT completeChanged();
 #else
@@ -2360,6 +3015,7 @@ private:
     }
     MultisigWizard* m_wizard;
     QLabel* m_warning{nullptr};
+    QLabel* m_ack_definition{nullptr};
     QTabWidget* m_tabs{nullptr};
     QPushButton* m_copy_policy{nullptr};
     QPushButton* m_copy_human{nullptr};
@@ -2382,6 +3038,7 @@ private:
     QString m_policy_id;
     QString m_policy_file;
     std::unique_ptr<QTemporaryFile> m_private_print_file;
+    std::unique_ptr<QLockFile> m_private_print_lock;
 };
 
 class MultisigVerifyPage : public QWizardPage
@@ -2401,7 +3058,7 @@ public:
         qr = new QRImageWidget;
         qr->setObjectName("verifyQr");
         qr->setAlignment(Qt::AlignCenter);
-        qr->setFixedSize(168, 168);
+        qr->setFixedSize(220, 220);
         row->addWidget(qr, 0, Qt::AlignTop);
 
         auto* addr_col = new QVBoxLayout;
@@ -2411,7 +3068,7 @@ public:
         address->setReadOnly(true);
         address->setFont(GUIUtil::fixedPitchFont());
         addr_col->addWidget(address);
-        auto* copy = new QPushButton(tr("Copy address"));
+        auto* copy = new QPushButton(tr("Copy Address"));
         copy->setObjectName("copyAddressButton");
         copy->setAutoDefault(false);
         addr_col->addWidget(copy, 0, Qt::AlignLeft);
@@ -2422,6 +3079,7 @@ public:
         devices = new QListWidget;
         devices->setObjectName("verifyDeviceList");
         devices->setMaximumHeight(96);
+        devices->setSelectionMode(QAbstractItemView::NoSelection);
         m_devices_empty = new QLabel(tr("No hardware verification is required for this wallet."));
         m_devices_empty->setWordWrap(true);
         m_devices_empty->setStyleSheet(QStringLiteral("QLabel { color: palette(window-text); }"));
@@ -2436,6 +3094,15 @@ public:
         status->setObjectName("verifyStatusLabel");
         status->setWordWrap(true);
         layout->addWidget(status);
+        m_independent_state = new QLabel;
+        m_independent_state->setObjectName("independentVerificationState");
+        m_independent_state->setWordWrap(true);
+        setIndependentState({}, /*warning=*/false);
+        layout->addWidget(m_independent_state);
+        m_import_policy = new QPushButton(tr("Verify with Imported Policy…"));
+        m_import_policy->setObjectName("verifyImportedPolicyButton");
+        m_import_policy->setAutoDefault(false);
+        layout->addWidget(m_import_policy, 0, Qt::AlignLeft);
         m_airgap_help = new QLabel(tr(
             "Air-gapped keys cannot display here. Import this address into the offline signer and confirm it matches."));
         m_airgap_help->setObjectName("airgapVerifyHelp");
@@ -2451,22 +3118,68 @@ public:
         layout->addStretch();
         connect(m_airgap_ack, &QCheckBox::toggled, this, &QWizardPage::completeChanged);
         connect(m_local_ack, &QCheckBox::toggled, this, &QWizardPage::completeChanged);
+        connect(m_import_policy, &QPushButton::clicked, this, [this] {
+            const QString path = QFileDialog::getOpenFileName(
+                this, tr("Open an independent public policy"), {}, tr("JSON files (*.json);;All files (*)"));
+            if (path.isEmpty()) return;
+            QFile file(path);
+            if (!file.open(QIODevice::ReadOnly) || file.size() > 1024 * 1024) {
+                status->setText(tr("Could not read a policy JSON smaller than 1 MiB from that file."));
+                return;
+            }
+            const QByteArray bytes = file.readAll();
+            auto decoded = DecodeVaultPolicyInput(QString::fromUtf8(bytes));
+            if (!decoded) {
+                status->setText(QString::fromStdString(util::ErrorString(decoded).original));
+                return;
+            }
+            auto imported = wallet::ParseVaultPolicyPackage(*decoded);
+            auto expected = wallet::ParseVaultPolicyPackage(m_wizard->m_policy_package.toStdString());
+            if (!imported || !expected || imported->policy_id != expected->policy_id ||
+                imported->descs != expected->descs ||
+                wallet::FormatVaultPolicyPackage(*imported) != wallet::FormatVaultPolicyPackage(*expected)) {
+                status->setText(tr("That policy does not reproduce this vault exactly."));
+                return;
+            }
+            auto independently_derived = FirstDescriptorDestination(imported->descs.front());
+            if (!independently_derived ||
+                QString::fromStdString(EncodeDestination(*independently_derived)) != address->text()) {
+                status->setText(tr("That policy does not derive the receive address shown here."));
+                return;
+            }
+            m_wizard->m_address_independently_verified = true;
+            setIndependentState(tr("Independently verified with the imported public policy."), /*warning=*/false);
+            Q_EMIT completeChanged();
+        });
         connect(copy, &QPushButton::clicked, this, [this] {
             GUIUtil::setClipboard(address->text());
             status->setText(tr("Address copied."));
         });
         connect(show, &QPushButton::clicked, this, [this] {
-            auto* item = devices->currentItem();
+            QListWidgetItem* item{nullptr};
+            for (int row = 0; row < devices->count(); ++row) {
+                const std::string fingerprint = devices->item(row)->data(Qt::UserRole).toString().toStdString();
+                if (!m_verified_hardware.count(fingerprint)) {
+                    item = devices->item(row);
+                    break;
+                }
+            }
             if (!item || !(item->flags() & Qt::ItemIsEnabled)) {
-                status->setText(tr("Select a device."));
+                status->setText(tr("Every connected device has completed its check."));
                 return;
             }
             const std::string fpr = item->data(Qt::UserRole).toString().toStdString();
             auto res = m_wizard->verifyOnDevice(fpr);
             if (res) {
-                status->setText(tr("The device-derived key matches this address. This check does not prove the address appeared on the physical device display."));
+                status->setText(tr("The address shown on the physical device matches this wallet."));
                 m_verified_hardware.insert(fpr);
-                item->setText(item->data(Qt::UserRole + 1).toString() + tr(" — verified"));
+                item->setText(QStringLiteral("✓ ") + item->data(Qt::UserRole + 1).toString());
+                if (m_verified_hardware.size() == static_cast<size_t>(devices->count())) {
+                    m_wizard->m_address_independently_verified = true;
+                    setIndependentState(tr("Verified by every connected hardware wallet."), /*warning=*/false);
+                } else {
+                    updateNextDeviceButton();
+                }
             } else {
                 status->setText(QString::fromStdString(util::ErrorString(res).original));
             }
@@ -2476,6 +3189,7 @@ public:
     void initializePage() override
     {
         m_verified_hardware.clear();
+        m_wizard->m_address_independently_verified = false;
         m_address_valid = false;
         QString shown;
         auto dest = m_wizard->firstReceiveAddress();
@@ -2491,7 +3205,7 @@ public:
         }
         if (m_address_valid && qr->setQR(shown)) {
             if (GUIUtil::HasPixmap(qr)) {
-                qr->setPixmap(qr->pixmap(Qt::ReturnByValue).scaled(168, 168, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+                qr->setPixmap(qr->pixmap(Qt::ReturnByValue).scaled(220, 220, Qt::KeepAspectRatio, Qt::SmoothTransformation));
             }
             qr->show();
         } else {
@@ -2502,6 +3216,10 @@ public:
         for (const auto& k : m_wizard->keys()) {
             if (k.xpub) has_airgap = true;
             if (!k.fingerprint || k.xpub) continue;
+            if (!m_wizard->advancedFlow() &&
+                !m_wizard->m_fixed_address_display_devices.contains(*k.fingerprint)) {
+                continue;
+            }
             const QString item_text = QString::fromStdString(k.label.empty() ? *k.fingerprint : k.label + " (" + *k.fingerprint + ")");
             auto* item = new QListWidgetItem(item_text);
             item->setData(Qt::UserRole, QString::fromStdString(*k.fingerprint));
@@ -2515,20 +3233,38 @@ public:
         m_devices_empty->setVisible(!have_hw && !has_airgap);
         m_devices_empty->setText(local_only
             ? tr("No independent signer can verify this address. All software keys are stored in this wallet on this computer.")
-            : tr("No hardware verification is required for this wallet."));
+            : (!m_wizard->advancedFlow() && !m_wizard->m_hardware.empty()
+                  ? tr("The connected hardware wallets can sign this vault, but none reports a physical multisig-address display capability.")
+                  : tr("No hardware verification is required for this wallet.")));
         if (m_show_button) m_show_button->setVisible(have_hw);
-        m_airgap_help->setVisible(has_airgap);
+        m_airgap_help->setVisible(m_wizard->advancedFlow() && has_airgap);
         m_airgap_ack->blockSignals(true);
-        m_airgap_ack->setVisible(has_airgap);
+        m_airgap_ack->setVisible(m_wizard->advancedFlow() && has_airgap);
         m_airgap_ack->setChecked(false);
         m_airgap_ack->blockSignals(false);
         m_local_ack->blockSignals(true);
-        m_local_ack->setVisible(local_only);
+        m_local_ack->setVisible(m_wizard->advancedFlow() && local_only);
         m_local_ack->setChecked(false);
         m_local_ack->blockSignals(false);
-        setSubTitle(local_only
-            ? tr("Review the address carefully. A separate watch-only import or device is needed for independent verification.")
-            : tr("Check that each connected device derives the key used in this address. Also compare the address independently before funding."));
+        if (!m_wizard->advancedFlow()) {
+            setTitle(have_hw ? tr("Verify Your First Address") : tr("Review Your First Address"));
+            setSubTitle(have_hw
+                ? tr("Check the same address on each device, one at a time.")
+                : tr("This computer cannot independently prove the address. Review it before funding."));
+            m_independent_state->setVisible(true);
+            setIndependentState(have_hw ? tr("Waiting for the first hardware-wallet check.")
+                                        : tr("Not independently verified"),
+                                /*warning=*/!have_hw);
+            m_import_policy->setVisible(!have_hw);
+            updateNextDeviceButton();
+        } else {
+            setTitle(tr("Verify the first address"));
+            setSubTitle(local_only
+                ? tr("Review the address carefully. A separate watch-only import or device is needed for independent verification.")
+                : tr("Check that each connected device derives the key used in this address. Also compare the address independently before funding."));
+            m_independent_state->setVisible(false);
+            m_import_policy->setVisible(false);
+        }
         status->clear();
         Q_EMIT completeChanged();
     }
@@ -2543,11 +3279,11 @@ public:
         for (const auto& k : m_wizard->keys()) {
             if (k.xpub) has_airgap = true;
         }
-        if (has_airgap) return m_airgap_ack && m_airgap_ack->isChecked();
+        if (m_wizard->advancedFlow() && has_airgap) return m_airgap_ack && m_airgap_ack->isChecked();
         // QWizard evaluates completeness while the page itself is still
         // hidden. isVisible() would therefore be false even though this gate
         // is explicitly shown for the page.
-        if (m_local_ack && !m_local_ack->isHidden()) return m_local_ack->isChecked();
+        if (m_wizard->advancedFlow() && m_local_ack && !m_local_ack->isHidden()) return m_local_ack->isChecked();
         return true;
     }
     bool validatePage() override
@@ -2559,12 +3295,39 @@ public:
     int nextId() const override { return MultisigWizard::Page_Done; }
 
 private:
+    void setIndependentState(const QString& text, bool warning)
+    {
+        m_independent_state->setText(text);
+        m_independent_state->setContentsMargins(10, 10, 10, 10);
+        m_independent_state->setAutoFillBackground(true);
+        m_independent_state->setBackgroundRole(warning ? QPalette::ToolTipBase : QPalette::AlternateBase);
+        m_independent_state->setForegroundRole(warning ? QPalette::ToolTipText : QPalette::WindowText);
+    }
+
+    void updateNextDeviceButton()
+    {
+        if (!m_show_button || devices->count() == 0) return;
+        for (int row = 0; row < devices->count(); ++row) {
+            auto* item = devices->item(row);
+            const std::string fingerprint = item->data(Qt::UserRole).toString().toStdString();
+            if (!m_verified_hardware.count(fingerprint)) {
+                m_show_button->setText(tr("Verify on %1").arg(item->data(Qt::UserRole + 1).toString()));
+                m_show_button->setEnabled(true);
+                return;
+            }
+        }
+        m_show_button->setText(tr("All devices verified"));
+        m_show_button->setEnabled(false);
+    }
+
     MultisigWizard* m_wizard;
     QPushButton* m_show_button{nullptr};
     QLabel* m_devices_empty{nullptr};
     QLabel* m_airgap_help{nullptr};
     QCheckBox* m_airgap_ack{nullptr};
     QCheckBox* m_local_ack{nullptr};
+    QLabel* m_independent_state{nullptr};
+    QPushButton* m_import_policy{nullptr};
     std::set<std::string> m_verified_hardware;
     bool m_address_valid{false};
 };
@@ -2574,83 +3337,108 @@ class MultisigDonePage : public QWizardPage
 public:
     explicit MultisigDonePage(MultisigWizard* wizard) : QWizardPage(wizard), m_wizard(wizard)
     {
-        setTitle(tr("Wallet is ready"));
-        setSubTitle(tr("Send a small test amount first. Skipping that is an explicit choice, not the default."));
+        setTitle(tr("Ready"));
+        setSubTitle(tr("Your recovery vault is ready for a small test payment."));
         setFinalPage(true);
         auto* layout = new QVBoxLayout(this);
         m_summary = new QLabel;
         m_summary->setObjectName("doneSummaryLabel");
         m_summary->setWordWrap(true);
         m_summary->setTextFormat(Qt::RichText);
-        m_summary->setTextInteractionFlags(Qt::TextSelectableByMouse);
         layout->addWidget(m_summary);
+        auto* policy_label = new QLabel(tr("Technical policy ID"));
+        m_policy_id = new QLineEdit;
+        m_policy_id->setObjectName("readyPolicyId");
+        m_policy_id->setReadOnly(true);
+        m_policy_id->setFont(GUIUtil::fixedPitchFont());
+        m_policy_id->setAccessibleName(tr("Technical policy ID"));
+        auto* policy_row = new QHBoxLayout;
+        policy_row->addWidget(m_policy_id, 1);
+        auto* copy_policy = new QPushButton(tr("Copy"));
+        copy_policy->setObjectName("copyReadyPolicyIdButton");
+        copy_policy->setAutoDefault(false);
+        policy_row->addWidget(copy_policy);
+        layout->addWidget(policy_label);
+        layout->addLayout(policy_row);
         layout->addStretch();
+        m_receive = new QPushButton(tr("Receive a Small Test Payment"));
+        m_receive->setObjectName("receiveTestPaymentButton");
+        m_receive->setAccessibleName(tr("Receive a Small Test Payment"));
+        m_receive->setAutoDefault(true);
+        layout->addWidget(m_receive, 0, Qt::AlignLeft);
+        connect(copy_policy, &QPushButton::clicked, this, [this] {
+            GUIUtil::setClipboard(m_policy_id->text());
+        });
+        connect(m_receive, &QPushButton::clicked, this, [this] {
+            if (!m_wizard->createdWallet()) return;
+            Q_EMIT m_wizard->receiveRequested(m_wizard->createdWallet(), m_wizard->m_receive_address);
+            m_wizard->accept();
+        });
     }
     void initializePage() override
     {
-        const int n_active = m_wizard->nActiveKeys();
-        const int n = static_cast<int>(m_wizard->keys().size());
-        const bool vault = m_wizard->outputType() == OutputType::BECH32M &&
-                           (m_wizard->fallbackOlder() || m_wizard->fallbackAfter());
-        QString extra;
-        if (vault) {
-            if (const auto older = m_wizard->fallbackOlder()) {
-                if (const auto final = m_wizard->fallbackOlderOneKey()) {
-                    extra = tr("<p>This is a <b>staged Scrooge vault</b>. After <b>%1</b> (%2), %3 of %4 recovery keys can spend. "
-                               "After <b>%5</b> (%6), any 1 recovery key can spend. Both paths remain available.</p>")
-                                .arg(BlockCount(*older)).arg(ApproxDuration(*older))
-                                .arg(m_wizard->nrequired()).arg(n)
-                                .arg(BlockCount(*final)).arg(ApproxDuration(*final));
-                } else {
-                    extra = tr("<p>This is a <b>Scrooge vault</b>. After <b>%1</b> (%2), %3 of %4 can recover without the missing keys.</p>")
-                                .arg(BlockCount(*older))
-                                .arg(ApproxDuration(*older))
-                                .arg(m_wizard->nrequired())
-                                .arg(n);
-                }
-            } else if (const auto after = m_wizard->fallbackAfter()) {
-                extra = tr("<p>This is a <b>Scrooge vault</b>. At block height <b>%1</b>, %2 of %3 can recover. Coins received after that height may already be recoverable.</p>")
-                            .arg(FormattedHeight(*after))
-                            .arg(m_wizard->nrequired())
-                            .arg(n);
+        QTimer::singleShot(0, this, [this] {
+            if (auto* done = qobject_cast<QPushButton*>(m_wizard->button(QWizard::FinishButton))) {
+                done->setDefault(false);
+                done->setAutoDefault(false);
             }
-        }
-        if (!m_wizard->m_policy_id.isEmpty()) {
-            extra += tr("<p>Policy ID: <code>%1</code></p>").arg(m_wizard->m_policy_id.toHtmlEscaped());
-        }
-        const QString lead = vault
-            ? tr("<p>The <b>%1</b> wallet requires <b>all %2 active keys</b> to spend immediately. "
-                 "First recovery is <b>%3 of %4</b> after its delay.</p>")
-                  .arg(m_wizard->walletName().toHtmlEscaped())
-                  .arg(n_active)
-                  .arg(m_wizard->nrequired())
-                  .arg(n)
-            : tr("<p>The <b>%1</b> wallet is ordinary <b>%2 of %3</b> multisig. There is no delayed recovery path.</p>")
-                  .arg(m_wizard->walletName().toHtmlEscaped())
-                  .arg(m_wizard->nrequired())
-                  .arg(n);
-        const QString send_item = vault
-            ? tr("<li><b>Send</b> — Immediate spends need every active signer. Recovery is an explicit choice after the delay.</li>")
-            : tr("<li><b>Send</b> — Needs %1 of %2 signatures.</li>").arg(m_wizard->nrequired()).arg(n);
-        const bool independently_verified = std::any_of(m_wizard->keys().begin(), m_wizard->keys().end(), [](const MultisigKeySpec& key) {
-            return key.fingerprint.has_value() || key.xpub.has_value();
+            m_receive->setDefault(true);
+            m_receive->setFocus(Qt::OtherFocusReason);
         });
-        const QString receive_item = independently_verified
-            ? tr("<li><b>Receive</b> — The first address was checked during setup. Repeat your normal signer check for later addresses.</li>")
-            : tr("<li><b>Receive</b> — No independent signer checked the first address. Compare the public policy in a separate watch-only wallet before funding.</li>");
-        m_summary->setText(
-            lead + extra +
-            tr("<ul>"
-               "<li><b>Test deposit</b> — Receive a small amount and confirm it arrived before moving a main balance.</li>"
-               "%1"
-               "%2"
-               "</ul>")
-                .arg(receive_item, send_item));
+        if (m_wizard->advancedFlow()) {
+            setTitle(tr("Wallet is ready"));
+            setSubTitle(tr("Review the policy that was created before receiving a test amount."));
+            const int n_active = m_wizard->nActiveKeys();
+            const int n = static_cast<int>(m_wizard->keys().size());
+            const bool vault = m_wizard->outputType() == OutputType::BECH32M &&
+                               (m_wizard->fallbackOlder() || m_wizard->fallbackAfter());
+            QString detail;
+            if (vault) {
+                if (const auto older = m_wizard->fallbackOlder()) {
+                    if (const auto final = m_wizard->fallbackOlderOneKey()) {
+                        detail = tr("<p>After <b>%1</b> (%2), %3 of %4 recovery keys can spend. "
+                                    "After <b>%5</b> (%6), any one recovery key can spend.</p>")
+                                     .arg(BlockCount(*older), ApproxDuration(*older))
+                                     .arg(m_wizard->nrequired()).arg(n)
+                                     .arg(BlockCount(*final), ApproxDuration(*final));
+                    } else {
+                        detail = tr("<p>After <b>%1</b> (%2), %3 of %4 keys can make an explicit recovery spend.</p>")
+                                     .arg(BlockCount(*older), ApproxDuration(*older))
+                                     .arg(m_wizard->nrequired()).arg(n);
+                    }
+                } else if (const auto after = m_wizard->fallbackAfter()) {
+                    detail = tr("<p>At block height <b>%1</b>, %2 of %3 keys can make an explicit recovery spend.</p>")
+                                 .arg(FormattedHeight(*after)).arg(m_wizard->nrequired()).arg(n);
+                }
+            }
+            const QString lead = vault
+                ? tr("<p><b>%1</b> requires all %2 active keys to spend immediately.</p>")
+                      .arg(m_wizard->walletName().toHtmlEscaped()).arg(n_active)
+                : tr("<p><b>%1</b> is ordinary %2 of %3 multisig with no delayed recovery path.</p>")
+                      .arg(m_wizard->walletName().toHtmlEscaped()).arg(m_wizard->nrequired()).arg(n);
+            m_summary->setText(lead + detail +
+                tr("<p>The first receive address was completed during setup. Send a small test amount before moving a main balance.</p>"));
+            m_policy_id->setText(m_wizard->m_policy_id);
+            return;
+        }
+        setTitle(tr("Ready"));
+        setSubTitle(tr("Your recovery vault is ready for a small test payment."));
+        m_summary->setText(tr(
+            "<p><b>Vault created.</b></p>"
+            "<p>✓ Recovery Kit secured<br>"
+            "%1<br>"
+            "✓ All 3 keys now · any 2 after ~30 days · any 1 after ~60 days</p>")
+            .arg(m_wizard->m_address_independently_verified
+                ? tr("✓ First address independently verified")
+                : tr("◦ First address reviewed — not independently verified")));
+        m_policy_id->setText(m_wizard->m_policy_id);
     }
 
 private:
     MultisigWizard* m_wizard;
     QLabel* m_summary;
+    QLineEdit* m_policy_id{nullptr};
+    QPushButton* m_receive{nullptr};
 };
 
 MultisigWizard::MultisigWizard(interfaces::Node& node, WalletController* wallet_controller, QWidget* parent)
@@ -2690,8 +3478,13 @@ MultisigWizard::MultisigWizard(interfaces::Node& node, WalletController* wallet_
         // The fixed Backup page intentionally exposes just Print PDF,
         // I understand, and Continue.
         const bool simple_backup = id == Page_Backup && !advancedFlow();
-        button(QWizard::BackButton)->setVisible(!simple_backup);
-        if (simple_backup) button(QWizard::CancelButton)->setVisible(false);
+        if (simple_backup) {
+            setButtonLayout({QWizard::Stretch, QWizard::NextButton});
+        } else if (!m_setup_committed) {
+            setButtonLayout({QWizard::BackButton, QWizard::Stretch,
+                             QWizard::CancelButton, QWizard::NextButton,
+                             QWizard::CommitButton, QWizard::FinishButton});
+        }
     });
 
     setPage(Page_Intro, new MultisigIntroPage(this));
@@ -2702,15 +3495,15 @@ MultisigWizard::MultisigWizard(interfaces::Node& node, WalletController* wallet_
     setPage(Page_Backup, new MultisigBackupPage(this));
     setPage(Page_Verify, new MultisigVerifyPage(this));
     setPage(Page_Done, new MultisigDonePage(this));
-    setStartId(Page_Intro);
+    setStartId(Page_Keys);
 }
 
 void MultisigWizard::lockCommittedJourney()
 {
     m_setup_committed = true;
     setOption(QWizard::NoCancelButton, true);
-    setButtonLayout({QWizard::BackButton, QWizard::Stretch,
-                     QWizard::NextButton, QWizard::CommitButton, QWizard::FinishButton});
+    setButtonLayout({QWizard::Stretch, QWizard::NextButton,
+                     QWizard::CommitButton, QWizard::FinishButton});
 }
 
 void MultisigWizard::publishCreatedWallet()
@@ -2731,6 +3524,11 @@ void MultisigWizard::clearSoftwareRecovery()
         if (!item.mnemonic.empty()) memory_cleanse(item.mnemonic.data(), item.mnemonic.size());
     }
     std::vector<wallet::GeneratedMnemonic>{}.swap(m_software_recovery);
+}
+
+bool MultisigWizard::removePrivatePrintPath(const QString& path) const
+{
+    return m_private_print_remover ? m_private_print_remover(path) : QFile::remove(path);
 }
 
 void MultisigWizard::accept()
@@ -2761,6 +3559,12 @@ void MultisigWizard::closeEvent(QCloseEvent* event)
 }
 
 void MultisigWizard::setWalletName(const QString& name) { m_wallet_name = name; }
+
+void MultisigWizard::enableAdvancedFlow()
+{
+    m_advanced_flow = true;
+    if (currentId() < 0 || currentId() == Page_Keys) setStartId(Page_Intro);
+}
 
 QString MultisigWizard::walletNameError(const QString& name) const
 {
@@ -2799,7 +3603,7 @@ QString MultisigWizard::suggestedWalletName(const QString& base) const
 }
 void MultisigWizard::setLocalKeyCount(int count)
 {
-    m_advanced_flow = true;
+    enableAdvancedFlow();
     m_local_key_count = std::clamp(count, 0, kMaxLocalSoftwareKeys);
     if (m_local_key_count > 0) m_last_local_key_count = m_local_key_count;
     rebuildKeyList();
@@ -2811,7 +3615,7 @@ void MultisigWizard::setIncludeLocalKey(bool include)
 }
 void MultisigWizard::setOutputType(OutputType type)
 {
-    m_advanced_flow = true;
+    enableAdvancedFlow();
     m_type = type;
     if (type != OutputType::BECH32M) {
         for (auto& key : m_airgapped) key.recovery_only = false;
@@ -2822,33 +3626,33 @@ void MultisigWizard::setOutputType(OutputType type)
 }
 void MultisigWizard::setNRequired(int n)
 {
-    m_advanced_flow = true;
+    enableAdvancedFlow();
     m_nrequired = n;
     refreshSidebar();
 }
 void MultisigWizard::setFallbackOlder(std::optional<uint32_t> blocks)
 {
-    m_advanced_flow = true;
+    enableAdvancedFlow();
     m_fallback_older = blocks;
     if (!blocks) m_fallback_older_one_key.reset();
     refreshSidebar();
 }
 void MultisigWizard::setFallbackOlderOneKey(std::optional<uint32_t> blocks)
 {
-    m_advanced_flow = true;
+    enableAdvancedFlow();
     m_fallback_older_one_key = blocks;
     refreshSidebar();
 }
 void MultisigWizard::setFallbackAfter(std::optional<uint32_t> height)
 {
-    m_advanced_flow = true;
+    enableAdvancedFlow();
     m_fallback_after = height;
     if (height) m_fallback_older_one_key.reset();
     refreshSidebar();
 }
 void MultisigWizard::setVaultTemplate(VaultTemplate tmpl)
 {
-    m_advanced_flow = true;
+    enableAdvancedFlow();
     m_template = tmpl;
     refreshSidebar();
 }
@@ -2863,7 +3667,7 @@ void MultisigWizard::refreshSidebar()
 
 void MultisigWizard::applyTemplate()
 {
-    m_advanced_flow = true;
+    enableAdvancedFlow();
     if (m_template != VaultTemplate::Custom) {
         for (auto& key : m_airgapped) key.recovery_only = false;
         m_last_airgap_recovery_only = false;
@@ -2924,7 +3728,7 @@ void MultisigWizard::applyTemplate()
 
 void MultisigWizard::addHardwareKey(const std::string& fingerprint, const std::string& label)
 {
-    m_advanced_flow = true;
+    enableAdvancedFlow();
     for (auto& k : m_hardware) {
         if (k.fingerprint && *k.fingerprint == fingerprint) {
             k.label = label;
@@ -2941,7 +3745,7 @@ void MultisigWizard::addHardwareKey(const std::string& fingerprint, const std::s
 
 void MultisigWizard::addAirgappedKey(const std::string& fingerprint, const std::string& path, const std::string& xpub, const std::string& label, bool recovery_only)
 {
-    m_advanced_flow = true;
+    enableAdvancedFlow();
     if (m_template == VaultTemplate::Inheritance) {
         for (auto& key : m_airgapped) key.recovery_only = false;
     }
@@ -3011,11 +3815,14 @@ QString MultisigWizard::transcript() const
 
 QString MultisigWizard::privateRecoveryKitHtml() const
 {
-    if (m_advanced_flow || m_software_recovery.empty() ||
+    if (m_advanced_flow || m_local_key_count < 0 ||
         m_software_recovery.size() != static_cast<size_t>(m_local_key_count)) return {};
 
     auto package = wallet::ParseVaultPolicyPackage(m_policy_package.toStdString());
     if (!package || !wallet::ValidateFixedStagedVaultPolicy(*package)) return {};
+    auto qr_parts_result = wallet::EncodeVaultPolicyQrParts(m_policy_package.toStdString());
+    if (!qr_parts_result) return {};
+    const std::vector<std::string>& qr_parts{*qr_parts_result};
 
     // Re-derive every phrase immediately before rendering. This proves that
     // each printed secret maps to the exact fingerprint/path/account xpub in
@@ -3025,20 +3832,24 @@ QString MultisigWizard::privateRecoveryKitHtml() const
     for (const auto& recovery : m_software_recovery) {
         phrases.emplace_back(recovery.mnemonic.begin(), recovery.mnemonic.end());
     }
-    auto matches = wallet::ValidateVaultPolicyMnemonics(*package, phrases);
-    if (!matches || matches->size() != m_software_recovery.size()) return {};
-    for (const auto& recovery : m_software_recovery) {
-        const auto match = std::find_if(matches->begin(), matches->end(), [&](const wallet::VaultMnemonicMatch& item) {
-            return item.mnemonic_index < m_software_recovery.size() &&
-                &recovery == &m_software_recovery[item.mnemonic_index];
-        });
-        if (match == matches->end() || match->fingerprint != recovery.fingerprint ||
-            match->path != recovery.path || match->xpub != recovery.xpub) return {};
+    if (!phrases.empty()) {
+        auto matches = wallet::ValidateVaultPolicyMnemonics(*package, phrases);
+        if (!matches || matches->size() != m_software_recovery.size()) return {};
+        for (const auto& recovery : m_software_recovery) {
+            const auto match = std::find_if(matches->begin(), matches->end(), [&](const wallet::VaultMnemonicMatch& item) {
+                return item.mnemonic_index < m_software_recovery.size() &&
+                    &recovery == &m_software_recovery[item.mnemonic_index];
+            });
+            if (match == matches->end() || match->fingerprint != recovery.fingerprint ||
+                match->path != recovery.path || match->xpub != recovery.xpub) return {};
+        }
     }
 
     const int local_count = static_cast<int>(m_software_recovery.size());
     const int hardware_count = kStagedVaultKeyCount - local_count;
-    const int total_pages = local_count + 3; // cover, key pages, restore, JSON
+    constexpr int qr_parts_per_page{2};
+    const int qr_page_count = (static_cast<int>(qr_parts.size()) + qr_parts_per_page - 1) / qr_parts_per_page;
+    const int total_pages = local_count + 3 + qr_page_count; // cover, key pages, restore, QR pages, JSON
     const QString network = QString::fromStdString(package->network).toHtmlEscaped();
     const QString policy_id = QString::fromStdString(package->policy_id).toHtmlEscaped();
     const QString wallet_name = m_wallet_name.toHtmlEscaped();
@@ -3051,17 +3862,22 @@ QString MultisigWizard::privateRecoveryKitHtml() const
         ? tr("This kit contains all three software keys. The document alone can spend the vault immediately.")
         : local_count == 2
             ? tr("This kit contains two software keys. The document alone can make an explicit recovery spend after 4,320 blocks (about 30 days); either phrase can recover after 8,640 blocks (about 60 days). The hardware key is still required for an immediate spend.")
-            : tr("This kit contains one software key. The document alone can make an explicit recovery spend after 8,640 blocks (about 60 days). A second key is required at 4,320 blocks, and all three keys are required immediately.");
+            : local_count == 1
+                ? tr("This kit contains one software key. The document alone can make an explicit recovery spend after 8,640 blocks (about 60 days). A second key is required at 4,320 blocks, and all three keys are required immediately.")
+                : tr("This kit contains the complete public policy but no private keys. Reconnect the exact hardware wallets to sign: all three spend immediately, any two recover after 4,320 blocks, and any one recovers after 8,640 blocks.");
     const QString hardware_note = hardware_count == 0
         ? tr("This vault has no hardware-wallet participant.")
         : tr("This PDF does not contain the %n hardware-wallet seed(s). Back those up separately.", nullptr, hardware_count);
+    const QString kit_banner = local_count > 0
+        ? tr("PRIVATE — COMPLETE SCROOGE VAULT RECOVERY KIT")
+        : tr("PUBLIC POLICY — SCROOGE VAULT RECOVERY KIT");
 
     auto page_header = [&](int page, const QString& title, bool last = false) {
         return QStringLiteral("<div class=\"page%1\"><div class=\"banner\">%2</div>"
                               "<div class=\"meta\">%3: <b>%4</b> &nbsp;|&nbsp; %5: <b>%6</b> &nbsp;|&nbsp; %7 %8/%9</div>"
                               "<h1>%10</h1>")
             .arg(last ? QStringLiteral(" last") : QString{},
-                 tr("PRIVATE — COMPLETE SCROOGE VAULT RECOVERY KIT").toHtmlEscaped(),
+                 kit_banner.toHtmlEscaped(),
                  tr("Network").toHtmlEscaped(), network,
                  tr("Policy ID").toHtmlEscaped(), policy_id,
                  tr("Page").toHtmlEscaped())
@@ -3071,7 +3887,20 @@ QString MultisigWizard::privateRecoveryKitHtml() const
     };
     auto page_footer = [&] {
         return QStringLiteral("<div class=\"footer\">%1</div></div>")
-            .arg(tr("PRIVATE: possession of these mnemonic words grants signing authority. Never photograph, email, upload, or share this document.").toHtmlEscaped());
+            .arg((local_count > 0
+                ? tr("PRIVATE: possession of these mnemonic words grants signing authority. Never photograph, email, upload, or share this document.")
+                : tr("PUBLIC POLICY ONLY: this page has no private keys, but it reveals the vault structure and transaction history."))
+                     .toHtmlEscaped());
+    };
+    auto qr_image_uri = [](const std::string& part) -> QString {
+        QRImageWidget widget;
+        if (!widget.setQR(QString::fromStdString(part))) return {};
+        const QImage image{widget.exportImage()};
+        if (image.isNull()) return {};
+        QByteArray png;
+        QBuffer buffer{&png};
+        if (!buffer.open(QIODevice::WriteOnly) || !image.save(&buffer, "PNG")) return {};
+        return QStringLiteral("data:image/png;base64,") + QString::fromLatin1(png.toBase64());
     };
 
     QString html;
@@ -3079,7 +3908,7 @@ QString MultisigWizard::privateRecoveryKitHtml() const
     html += QStringLiteral(
         "<!doctype html><html><head><meta charset=\"utf-8\"><style>"
         "body{font-family:sans-serif;color:#111;font-size:10.5pt;}"
-        ".page{page-break-after:always;} .page.last{page-break-after:avoid;}"
+        ".page{page-break-after:always;} .page.last{page-break-after:auto;}"
         ".banner{background:#8b0000;color:white;font-weight:bold;font-size:15pt;padding:9px;}"
         ".meta{font-size:8.5pt;border-bottom:1px solid #555;padding:6px 0;}"
         "h1{font-size:21pt;margin:13px 0 8px;} h2{font-size:14pt;margin:12px 0 5px;}"
@@ -3091,11 +3920,14 @@ QString MultisigWizard::privateRecoveryKitHtml() const
         ".crosscheck{font-size:8pt;overflow-wrap:anywhere;}"
         ".footer{border-top:1px solid #8b0000;color:#8b0000;font-weight:bold;font-size:8pt;margin-top:14px;padding-top:6px;}"
         ".policy{font-size:7.5pt;white-space:pre-wrap;overflow-wrap:anywhere;}"
+        ".qrrow{width:100%;border-collapse:collapse;} .qrrow td{width:50%;text-align:center;vertical-align:top;padding:4px;}"
+        ".qrpart{font-size:7pt;overflow-wrap:anywhere;}"
         "</style></head><body>");
 
     html += page_header(1, tr("Read this before printing"));
     html += QStringLiteral("<div class=\"danger\"><b>%1</b><br>%2<br><br>%3</div>")
-        .arg(tr("THIS IS AN UNENCRYPTED BEARER BACKUP.").toHtmlEscaped(),
+        .arg((local_count > 0 ? tr("THIS IS AN UNENCRYPTED BEARER BACKUP.")
+                              : tr("THIS COPY CONTAINS PUBLIC POLICY ONLY.")).toHtmlEscaped(),
              authority.toHtmlEscaped(), hardware_note.toHtmlEscaped());
     html += QStringLiteral("<p><b>%1:</b> %2</p>")
         .arg(tr("Wallet label").toHtmlEscaped(), wallet_name);
@@ -3110,7 +3942,9 @@ QString MultisigWizard::privateRecoveryKitHtml() const
     html += QStringLiteral("<h2>%1</h2><ol><li>%2</li><li>%3</li><li>%4</li><li>%5</li></ol>")
         .arg(tr("Print and storage checklist").toHtmlEscaped(),
              tr("Use a trusted, directly connected local printer. Avoid cloud, office, or shared printers.").toHtmlEscaped(),
-             tr("Print every page. Confirm that each software-key page has 24 numbered words and that the policy JSON appendix is present.").toHtmlEscaped(),
+             (local_count > 0
+                 ? tr("Print every page. Confirm that each software-key page has 24 numbered words and that the public-policy QR and JSON appendices are present.")
+                 : tr("Print every page. Confirm that the public-policy QR and JSON appendices are present.")).toHtmlEscaped(),
              tr("Store the complete paper kit offline, away from this computer, protected from theft, fire, and water.").toHtmlEscaped(),
              tr("Close the PDF viewer and ask Bitcoin Core to delete its temporary file. Viewer caches, recent-file lists, printer memory, and print queues may still retain copies.").toHtmlEscaped());
     html += page_footer();
@@ -3166,8 +4000,10 @@ QString MultisigWizard::privateRecoveryKitHtml() const
     html += QStringLiteral("<ol><li>%1</li><li>%2</li><li>%3</li><li>%4</li><li>%5</li><li>%6</li></ol>")
         .arg(tr("Use a fully synchronized, unpruned node with block history back to genesis.").toHtmlEscaped(),
              tr("Open the 30 / 60 day Scrooge Vault wizard and choose “Restore from a printed recovery kit”.").toHtmlEscaped(),
-             tr("Choose a new wallet name and paste the exact policy JSON from the appendix. Verify the network and policy ID shown above.").toHtmlEscaped(),
-             tr("Enter one, two, or all available 24-word phrases. Entry order does not matter; Bitcoin Core matches each phrase by its derived account xpub. Leave the BIP39 passphrase empty.").toHtmlEscaped(),
+             tr("Choose a new wallet name and scan every public-policy QR part, or paste the exact policy JSON appendix. Verify the network and policy ID shown above.").toHtmlEscaped(),
+             (local_count > 0
+                 ? tr("Enter one, two, or all available 24-word software-key phrases. Entry order does not matter; Bitcoin Core matches each phrase by its derived account xpub. Leave the BIP39 passphrase empty. Never enter a hardware-wallet seed.")
+                 : tr("This kit has no software-key phrase to enter. Restore it as a public watch/external-signer wallet, then reconnect the exact hardware wallets.")).toHtmlEscaped(),
              tr("Wait for the rescan from genesis to finish. Compare the restored policy ID and first receive address with an independent copy before accepting funds.").toHtmlEscaped(),
              tr("One recovered key enables the 8,640-block path; any two enable the 4,320-block path; all three enable immediate spending. Hardware-wallet seeds are still required for hardware participants.").toHtmlEscaped());
     html += QStringLiteral("<h2>%1</h2><p>%2</p><p><b>%3:</b> <code>%4</code></p>")
@@ -3176,7 +4012,29 @@ QString MultisigWizard::privateRecoveryKitHtml() const
              tr("Policy JSON SHA-256").toHtmlEscaped(), policy_sha256);
     html += page_footer();
 
-    html += page_header(local_count + 3, tr("Exact importable public policy JSON"), true);
+    for (int qr_page = 0; qr_page < qr_page_count; ++qr_page) {
+        const int first_part = qr_page * qr_parts_per_page;
+        const int last_part = std::min(first_part + qr_parts_per_page, static_cast<int>(qr_parts.size()));
+        html += page_header(local_count + 3 + qr_page,
+                            tr("Machine-readable public policy — parts %1–%2 of %3")
+                                .arg(first_part + 1).arg(last_part).arg(qr_parts.size()));
+        html += QStringLiteral("<p>%1</p><table class=\"qrrow\"><tr>")
+            .arg(tr("Scan every part in numbered order. Missing, reordered, duplicate, mixed, or damaged parts are rejected. These QR codes never contain mnemonic words.").toHtmlEscaped());
+        for (int part_index = first_part; part_index < last_part; ++part_index) {
+            const QString uri{qr_image_uri(qr_parts[part_index])};
+            if (uri.isEmpty()) {
+                html.fill(QChar{0});
+                return {};
+            }
+            html += QStringLiteral("<td><b>%1 %2/%3</b><br><img width=\"210\" height=\"210\" src=\"%4\"><div class=\"qrpart\"><code>%5</code></div></td>")
+                .arg(tr("Part").toHtmlEscaped()).arg(part_index + 1).arg(qr_parts.size())
+                .arg(uri, QString::fromStdString(qr_parts[part_index]).toHtmlEscaped());
+        }
+        html += QStringLiteral("</tr></table>");
+        html += page_footer();
+    }
+
+    html += page_header(total_pages, tr("Exact importable public policy JSON"), true);
     html += QStringLiteral("<p>%1</p><p><b>%2:</b> <code>%3</code></p><pre class=\"policy\">%4</pre>")
         .arg(tr("This appendix is public-key material: it cannot spend by itself, but it reveals the vault structure and can expose transaction history. Preserve it exactly with the mnemonic pages.").toHtmlEscaped(),
              tr("SHA-256").toHtmlEscaped(), policy_sha256,
@@ -3198,6 +4056,7 @@ bool MultisigWizard::createWallet()
     m_create_error.clear();
     m_wallet_model = nullptr;
     m_public_descs.clear();
+    m_candidate_keys.clear();
     m_policy_id.clear();
     m_policy_package.clear();
     rebuildKeyList();
@@ -3229,23 +4088,18 @@ bool MultisigWizard::createWallet()
         return false;
     }
 
-    const bool has_device = std::any_of(m_keys.begin(), m_keys.end(), [](const MultisigKeySpec& k) {
-        return k.fingerprint.has_value() && !k.xpub;
-    });
-    uint64_t flags = WALLET_FLAG_DESCRIPTORS | WALLET_FLAG_BLANK_WALLET;
-    if (has_device) flags |= WALLET_FLAG_EXTERNAL_SIGNER;
-    if (m_local_key_count == 0) flags |= WALLET_FLAG_DISABLE_PRIVATE_KEYS;
-
     try {
-        // Resolve and validate every public signer before creating a persistent
-        // wallet. A malformed paste or disconnected device must not strand an
-        // empty wallet with the requested name.
+        // Resolve and validate every public signer before any persistent
+        // wallet is created. Fixed-flow software keys are also generated here,
+        // entirely in memory, so Secure Recovery can protect the exact final
+        // candidate before the chosen wallet name is committed.
         const std::string default_path = wallet::DefaultMultisigPath(m_type, 0);
-        std::vector<interfaces::Wallet::MultisigKey> iface_keys;
-        iface_keys.reserve(m_keys.size());
+        std::vector<wallet::MultisigKeySpec> resolved_specs;
+        resolved_specs.reserve(m_keys.size());
         for (const auto& k : m_keys) {
-            interfaces::Wallet::MultisigKey resolved{k.path, k.fingerprint, k.hdkey, k.xpub, k.recovery_only, k.generate_local, {}};
+            wallet::MultisigKeySpec resolved{k};
             const std::string path = k.path.value_or(default_path);
+            resolved.path = path;
             std::vector<uint32_t> parsed_path;
             if (!ParseHDKeypath(path, parsed_path)) {
                 m_create_error = tr("Derivation path is not a valid BIP32 path.");
@@ -3268,54 +4122,109 @@ bool MultisigWizard::createWallet()
                     m_create_error = tr("Fingerprint must be exactly 8 hexadecimal characters.");
                     return false;
                 }
-                auto signer = wallet::ExternalSignerScriptPubKeyMan::GetExternalSigner(*k.fingerprint);
-                if (!signer) {
-                    m_create_error = QString::fromStdString(util::ErrorString(signer).original);
-                    return false;
+                std::string fetched;
+                if (!m_advanced_flow) {
+                    const auto account = m_fixed_hardware_accounts.find(*k.fingerprint);
+                    if (account == m_fixed_hardware_accounts.end() || account->second.first != path) {
+                        m_create_error = tr("The reviewed hardware-wallet account binding is missing or changed. Return to Review Vault and retry discovery.");
+                        return false;
+                    }
+                    fetched = account->second.second;
+                } else {
+                    auto signer = wallet::ExternalSignerScriptPubKeyMan::GetExternalSigner(*k.fingerprint);
+                    if (!signer) {
+                        m_create_error = QString::fromStdString(util::ErrorString(signer).original);
+                        return false;
+                    }
+                    const UniValue result = signer->GetXpub(path);
+                    if (!result.exists("xpub") || !result["xpub"].isStr()) {
+                        m_create_error = tr("Signer getxpub did not return an xpub.");
+                        return false;
+                    }
+                    fetched = result["xpub"].get_str();
                 }
-                const UniValue result = signer->GetXpub(path);
-                if (!result.exists("xpub") || !result["xpub"].isStr()) {
-                    m_create_error = tr("Signer getxpub did not return an xpub.");
-                    return false;
-                }
-                const std::string fetched = result["xpub"].get_str();
                 if (!DecodeExtPubKey(fetched).pubkey.IsValid()) {
                     m_create_error = tr("Signer returned an invalid xpub.");
                     return false;
                 }
                 resolved.xpub = fetched;
             }
-            iface_keys.push_back(std::move(resolved));
+            resolved_specs.push_back(std::move(resolved));
         }
 
-        std::vector<bilingual_str> warnings;
-        auto created = m_node.walletLoader().createWallet(m_wallet_name.toStdString(), SecureString{}, flags, warnings);
-        if (!created) {
-            m_create_error = QString::fromStdString(util::ErrorString(created).translated);
-            return false;
-        }
-        WalletModel* const wallet_model = m_wallet_controller->getOrCreateWallet(std::move(*created));
+        std::vector<std::string> descriptors;
+        std::vector<wallet::GeneratedMnemonic> generated_recovery;
+        if (!m_advanced_flow) {
+            wallet::MultisigOptions options;
+            options.type = m_type;
+            options.account = 0;
+            options.fallback_older = m_fallback_older;
+            options.fallback_after = m_fallback_after;
+            options.fallback_older_one_key = m_fallback_older_one_key;
+            auto prepared = wallet::PrepareMultisigDescriptor(m_nrequired, resolved_specs, options);
+            if (!prepared) {
+                m_create_error = QString::fromStdString(util::ErrorString(prepared).original);
+                return false;
+            }
+            descriptors = std::move(prepared->descs);
+            generated_recovery = std::move(prepared->recovery);
+            m_candidate_keys = std::move(resolved_specs);
+        } else {
+            const bool has_device = std::any_of(m_keys.begin(), m_keys.end(), [](const MultisigKeySpec& k) {
+                return k.fingerprint.has_value() && !k.xpub;
+            });
+            uint64_t flags = WALLET_FLAG_DESCRIPTORS | WALLET_FLAG_BLANK_WALLET;
+            if (has_device) flags |= WALLET_FLAG_EXTERNAL_SIGNER;
+            if (m_local_key_count == 0) flags |= WALLET_FLAG_DISABLE_PRIVATE_KEYS;
 
-        auto imported = wallet_model->wallet().createMultisigDescriptor(m_nrequired, iface_keys, m_type, m_fallback_older, m_fallback_after, m_fallback_older_one_key);
-        if (!imported) {
-            m_create_error = QString::fromStdString(util::ErrorString(imported).original);
-            return false;
+            std::vector<interfaces::Wallet::MultisigKey> iface_keys;
+            iface_keys.reserve(resolved_specs.size());
+            for (const auto& key : resolved_specs) {
+                iface_keys.push_back({key.path, key.fingerprint, key.hdkey, key.xpub,
+                                      key.recovery_only, key.generate_local, key.recovery_mnemonic});
+            }
+            std::vector<bilingual_str> warnings;
+            auto created = m_node.walletLoader().createWallet(m_wallet_name.toStdString(), SecureString{}, flags, warnings);
+            if (!created) {
+                m_create_error = QString::fromStdString(util::ErrorString(created).translated);
+                return false;
+            }
+            auto imported = (*created)->createMultisigDescriptor(m_nrequired, iface_keys, m_type,
+                                                                  m_fallback_older, m_fallback_after,
+                                                                  m_fallback_older_one_key);
+            if (!imported) {
+                m_create_error = QString::fromStdString(util::ErrorString(imported).original);
+                return false;
+            }
+            descriptors = std::move(imported->descs);
+            generated_recovery.reserve(imported->recovery.size());
+            for (auto& item : imported->recovery) {
+                generated_recovery.push_back(wallet::GeneratedMnemonic{
+                    item.key_index,
+                    std::move(item.mnemonic),
+                    std::move(item.fingerprint),
+                    std::move(item.path),
+                    std::move(item.xpub),
+                });
+            }
+            m_wallet_model = m_wallet_controller->getOrCreateWallet(std::move(*created));
         }
-        if (imported->descs.size() != 2) {
+
+        if (descriptors.size() != 2) {
             m_create_error = tr("Wallet creation did not produce one receive descriptor and one change descriptor.");
             return false;
         }
         const size_t expected_recovery = static_cast<size_t>(std::count_if(
             m_keys.begin(), m_keys.end(), [](const MultisigKeySpec& key) { return key.generate_local; }));
-        if (imported->recovery.size() != expected_recovery) {
+        if (generated_recovery.size() != expected_recovery) {
             m_create_error = tr("Wallet creation did not return one recovery phrase for every generated software key.");
             return false;
         }
         std::set<size_t> recovery_indexes;
         std::set<std::string> recovery_xpubs;
         std::vector<wallet::GeneratedMnemonic> software_recovery;
-        software_recovery.reserve(imported->recovery.size());
-        for (auto& item : imported->recovery) {
+        software_recovery.reserve(generated_recovery.size());
+        for (auto& item : generated_recovery) {
             if (item.key_index >= m_keys.size() || !m_keys[item.key_index].generate_local ||
                 item.mnemonic.empty() || item.fingerprint.size() != 8 || !IsHex(item.fingerprint) ||
                 item.path.empty() || !DecodeExtPubKey(item.xpub).pubkey.IsValid() ||
@@ -3347,7 +4256,7 @@ bool MultisigWizard::createWallet()
                 package.recovery_stages.push_back({1, m_fallback_older_one_key, {}});
             }
         }
-        package.descs = imported->descs;
+        package.descs = descriptors;
         package.policy_id = wallet::VaultPolicyId(package.descs.front());
         const QString policy_package = QString::fromStdString(wallet::FormatVaultPolicyPackage(package));
         auto parsed_package = wallet::ParseVaultPolicyPackage(policy_package.toStdString());
@@ -3360,14 +4269,74 @@ bool MultisigWizard::createWallet()
             m_create_error = public_error;
             return false;
         }
-        m_public_descs = std::move(imported->descs);
+        if (!m_advanced_flow) {
+            auto fixed = wallet::ValidateFixedStagedVaultPolicy(*parsed_package);
+            if (!fixed) {
+                m_create_error = QString::fromStdString(util::ErrorString(fixed).original);
+                return false;
+            }
+        }
+        m_public_descs = std::move(descriptors);
         if (!m_public_descs.empty()) m_policy_id = QString::fromStdString(wallet::VaultPolicyId(m_public_descs.front()));
         m_policy_package = policy_package;
         m_software_recovery = std::move(software_recovery);
-        m_wallet_model = wallet_model;
         return true;
     } catch (const std::exception& e) {
         m_create_error = QString::fromStdString(e.what());
+        return false;
+    }
+}
+
+bool MultisigWizard::commitWalletCandidate()
+{
+    if (m_advanced_flow) return m_wallet_model != nullptr;
+    if (m_wallet_model) return true;
+    m_create_error.clear();
+    if (!m_wallet_controller) {
+        m_create_error = tr("The GUI wallet controller is not available.");
+        return false;
+    }
+    if (const QString name_error = walletNameError(m_wallet_name); !name_error.isEmpty()) {
+        m_create_error = name_error;
+        return false;
+    }
+    auto package = wallet::ParseVaultPolicyPackage(m_policy_package.toStdString());
+    if (!package || !wallet::ValidateFixedStagedVaultPolicy(*package) ||
+        package->descs != m_public_descs || m_candidate_keys.size() != kStagedVaultKeyCount ||
+        m_software_recovery.size() != static_cast<size_t>(m_local_key_count)) {
+        m_create_error = tr("The prepared Recovery Kit no longer matches the fixed vault candidate.");
+        return false;
+    }
+
+    std::vector<SecureString> mnemonics;
+    mnemonics.reserve(m_software_recovery.size());
+    for (const auto& recovery : m_software_recovery) {
+        mnemonics.emplace_back(recovery.mnemonic.begin(), recovery.mnemonic.end());
+    }
+
+    try {
+        std::vector<bilingual_str> warnings;
+        auto installed = m_node.walletLoader().installFixedVault(
+            m_wallet_name.toStdString(), m_policy_package.toStdString(), mnemonics,
+            interfaces::FixedVaultInstallMode::CREATE, warnings);
+        for (SecureString& mnemonic : mnemonics) {
+            if (!mnemonic.empty()) memory_cleanse(mnemonic.data(), mnemonic.size());
+        }
+        if (!installed) {
+            m_create_error = tr("The Recovery Kit is safe, but the wallet could not be committed: %1")
+                                 .arg(QString::fromStdString(util::ErrorString(installed).translated));
+            return false;
+        }
+        m_wallet_model = m_wallet_controller->getOrCreateWallet(std::move(installed->wallet));
+        clearSoftwareRecovery();
+        std::vector<wallet::MultisigKeySpec>{}.swap(m_candidate_keys);
+        return true;
+    } catch (const std::exception& e) {
+        for (SecureString& mnemonic : mnemonics) {
+            if (!mnemonic.empty()) memory_cleanse(mnemonic.data(), mnemonic.size());
+        }
+        m_create_error = tr("The Recovery Kit is safe, but the wallet could not be committed: %1")
+                             .arg(QString::fromStdString(e.what()));
         return false;
     }
 }
@@ -3384,7 +4353,12 @@ bool MultisigWizard::restoreFromRecoverySheets(const QString& wallet_name, const
         error = name_error;
         return false;
     }
-    auto package = wallet::ParseVaultPolicyPackage(policy_json.toStdString());
+    auto decoded_policy = DecodeVaultPolicyInput(policy_json);
+    if (!decoded_policy) {
+        error = QString::fromStdString(util::ErrorString(decoded_policy).original);
+        return false;
+    }
+    auto package = wallet::ParseVaultPolicyPackage(*decoded_policy);
     if (!package) {
         error = QString::fromStdString(util::ErrorString(package).original);
         return false;
@@ -3394,42 +4368,101 @@ bool MultisigWizard::restoreFromRecoverySheets(const QString& wallet_name, const
         error = QString::fromStdString(util::ErrorString(fixed_policy).original);
         return false;
     }
-    auto preflight = wallet::ValidateVaultPolicyMnemonics(*package, mnemonics);
-    if (!preflight) {
-        error = QString::fromStdString(util::ErrorString(preflight).original);
-        return false;
+    size_t recovered_count{0};
+    if (!mnemonics.empty()) {
+        auto preflight = wallet::ValidateVaultPolicyMnemonics(*package, mnemonics);
+        if (!preflight) {
+            error = QString::fromStdString(util::ErrorString(preflight).original);
+            return false;
+        }
+        recovered_count = preflight->size();
     }
 
-    auto* activity = new MnemonicRestoreActivity(m_wallet_controller, this);
-    connect(activity, &MnemonicRestoreActivity::restored, this,
-            [this, package = *package, wallet_name, recovered_count = preflight->size()](WalletModel* wallet_model) {
-        QTimer::singleShot(0, this, [this, package, wallet_name, recovered_count, wallet_model] {
-            auto exported = wallet::ParseVaultPolicyPackage(wallet_model->wallet().exportVaultPolicy());
-            if (!exported || exported->policy_id != package.policy_id || exported->descs != package.descs) {
-                QMessageBox::critical(this, tr("Restore vault failed"),
-                                      tr("The restored wallet does not reproduce the printed public policy exactly."));
-                return;
-            }
-        clearSoftwareRecovery();
-        m_wallet_name = wallet_name;
-        m_type = OutputType::BECH32M;
-        m_local_key_count = static_cast<int>(recovered_count);
-        m_nrequired = package.nrequired;
-        m_fallback_older = package.fallback_older;
-        m_fallback_after = package.fallback_after;
-        m_fallback_older_one_key = package.fallback_older_one_key;
-        m_public_descs = package.descs;
-        m_policy_id = QString::fromStdString(package.policy_id);
-        m_policy_package = QString::fromStdString(wallet::FormatVaultPolicyPackage(package));
-        m_wallet_model = wallet_model;
-            publishCreatedWallet();
-            QMessageBox::information(this, tr("Vault restored"),
-                                     tr("The recovery phrases matched the public policy. The restored wallet is loaded and its historical rescan has completed."));
-            accept();
-        });
+    m_pending_restore_package = *package;
+    m_pending_restore_name = wallet_name;
+    m_pending_restore_recovered_count = recovered_count;
+
+    auto* activity = new MnemonicRestoreActivity(m_wallet_controller, this, m_restore_rescan_override);
+    connect(activity, &MnemonicRestoreActivity::failed, this,
+            [this](const QString& activity_error) {
+        m_pending_restore_package.reset();
+        Q_EMIT restoreAttemptFailed(activity_error);
     });
-    activity->restore(wallet_name.toStdString(), policy_json.toStdString(), mnemonics);
+    connect(activity, &MnemonicRestoreActivity::rescanFailed, this,
+            [this](WalletModel* wallet_model, const QString& activity_error) {
+        Q_EMIT restoreRescanRetryRequired(wallet_model, activity_error);
+    });
+    connect(activity, &MnemonicRestoreActivity::restored, this,
+            [this](WalletModel* wallet_model) { completeRecoveryRestore(wallet_model); });
+    activity->restore(wallet_name.toStdString(), *decoded_policy, mnemonics);
     return true;
+}
+
+bool MultisigWizard::retryRecoveryRescan(WalletModel* wallet_model, QString& error)
+{
+    error.clear();
+    if (!m_wallet_controller || !wallet_model) {
+        error = tr("The installed vault is no longer available for rescanning.");
+        return false;
+    }
+    auto* activity = new MnemonicRestoreActivity(m_wallet_controller, this, m_restore_rescan_override);
+    connect(activity, &MnemonicRestoreActivity::failed, this,
+            [this](const QString& activity_error) { Q_EMIT restoreAttemptFailed(activity_error); });
+    connect(activity, &MnemonicRestoreActivity::rescanFailed, this,
+            [this](WalletModel* failed_wallet, const QString& activity_error) {
+        Q_EMIT restoreRescanRetryRequired(failed_wallet, activity_error);
+    });
+    connect(activity, &MnemonicRestoreActivity::restored, this, [this](WalletModel* restored_wallet) {
+        completeRecoveryRestore(restored_wallet);
+    });
+    activity->rescan(wallet_model);
+    return true;
+}
+
+void MultisigWizard::completeRecoveryRestore(WalletModel* wallet_model)
+{
+    if (!wallet_model || !m_pending_restore_package) {
+        const QString error{tr("The completed rescan could not be matched to its pending vault restore.")};
+        QMessageBox::critical(this, tr("Restore vault failed"), error);
+        Q_EMIT restoreAttemptFailed(error);
+        return;
+    }
+    const wallet::VaultPolicyPackage package{*m_pending_restore_package};
+    auto exported = wallet::ParseVaultPolicyPackage(wallet_model->wallet().exportVaultPolicy());
+    if (!exported || exported->policy_id != package.policy_id || exported->descs != package.descs) {
+        const QString error{tr("The restored wallet does not reproduce the printed public policy exactly.")};
+        QMessageBox::critical(this, tr("Restore vault failed"), error);
+        Q_EMIT restoreAttemptFailed(error);
+        return;
+    }
+
+    clearSoftwareRecovery();
+    m_wallet_name = m_pending_restore_name;
+    m_type = OutputType::BECH32M;
+    m_local_key_count = static_cast<int>(m_pending_restore_recovered_count);
+    m_nrequired = package.nrequired;
+    m_fallback_older = package.fallback_older;
+    m_fallback_after = package.fallback_after;
+    m_fallback_older_one_key = package.fallback_older_one_key;
+    m_public_descs = package.descs;
+    m_policy_id = QString::fromStdString(package.policy_id);
+    m_policy_package = QString::fromStdString(wallet::FormatVaultPolicyPackage(package));
+    m_wallet_model = wallet_model;
+    m_pending_restore_package.reset();
+    m_pending_restore_name.clear();
+    m_pending_restore_recovered_count = 0;
+
+    const auto reconciled = wallet_model->reconcileVaultHardwareSigners();
+    const size_t available_count = kStagedVaultKeyCount -
+        std::min<size_t>(kStagedVaultKeyCount, reconciled.lost_signers.size());
+    publishCreatedWallet();
+    QMessageBox::information(this, tr("Vault restored"),
+                             tr("The restored wallet is loaded and its historical rescan has completed. %1 of 3 participant identities are available now; reconnect any missing exact hardware wallets to regain their signing authority.")
+                                 .arg(available_count));
+    Q_EMIT restoreCompleted();
+    // The parent wizard is still on Review Vault. The nested restore journey
+    // already performed validation, installation, and a complete rescan.
+    QDialog::done(QDialog::Accepted);
 }
 
 util::Result<CTxDestination> MultisigWizard::firstReceiveAddress()
@@ -3465,7 +4498,8 @@ util::Result<void> MultisigWizard::verifyOnDevice(const std::string& fingerprint
     // script. For an n-of-n MuSig2 key path that can lose the participant key
     // origins, so retry with the original public receive descriptor. The signer
     // must still echo the exact address the wizard is showing.
-    auto signer = wallet::ExternalSignerScriptPubKeyMan::GetExternalSigner(std::optional<std::string>{fingerprint});
+    auto signer = wallet::ExternalSignerScriptPubKeyMan::GetExternalSigner(
+        std::optional<std::string>{fingerprint}, /*allow_native_default=*/true);
     if (!signer) return util::Error{Untranslated(util::ErrorString(signer).original)};
     try {
         const UniValue result = signer->DisplayAddress(m_public_descs.front());

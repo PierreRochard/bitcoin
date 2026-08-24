@@ -25,7 +25,6 @@
 #include <QPainter>
 #include <QStatusTipEvent>
 
-#include <algorithm>
 #include <map>
 
 #define DECORATION_SIZE 54
@@ -160,53 +159,37 @@ OverviewPage::OverviewPage(const PlatformStyle *platformStyle, QWidget *parent) 
 
     if (auto* grid = ui->frame->findChild<QGridLayout*>("gridLayout")) {
         auto* sep = new QFrame;
-        sep->setObjectName("labelVaultPathSep");
+        sep->setObjectName("vaultAvailabilitySeparator");
         sep->setFrameShape(QFrame::HLine);
         sep->setVisible(false);
-        auto* rec_text = new QLabel(tr("Recovery path (same coins):"));
-        rec_text->setObjectName("labelVaultRecoverableText");
-        rec_text->setVisible(false);
-        auto* rec = new QLabel(QStringLiteral("0"));
-        rec->setObjectName("labelVaultRecoverable");
-        rec->setAlignment(Qt::AlignRight | Qt::AlignTrailing | Qt::AlignVCenter);
-        rec->setVisible(false);
-        auto* wait_text = new QLabel(tr("Not yet mature (per coin):"));
-        wait_text->setObjectName("labelVaultAwaitingText");
-        wait_text->setToolTip(tr("Each coin has its own recovery maturity. The block count is an estimate for the earliest coin."));
-        wait_text->setVisible(false);
-        auto* wait = new QLabel(QStringLiteral("0"));
-        wait->setObjectName("labelVaultAwaiting");
-        wait->setAlignment(Qt::AlignRight | Qt::AlignTrailing | Qt::AlignVCenter);
-        wait->setVisible(false);
-        auto* final_rec_text = new QLabel(tr("Final recovery path (same coins):"));
-        final_rec_text->setObjectName("labelVaultFinalRecoverableText");
-        final_rec_text->setVisible(false);
-        auto* final_rec = new QLabel(QStringLiteral("0"));
-        final_rec->setObjectName("labelVaultFinalRecoverable");
-        final_rec->setAlignment(Qt::AlignRight | Qt::AlignTrailing | Qt::AlignVCenter);
-        final_rec->setVisible(false);
-        auto* final_wait_text = new QLabel(tr("Final path not yet mature:"));
-        final_wait_text->setObjectName("labelVaultFinalAwaitingText");
-        final_wait_text->setVisible(false);
-        auto* final_wait = new QLabel(QStringLiteral("0"));
-        final_wait->setObjectName("labelVaultFinalAwaiting");
-        final_wait->setAlignment(Qt::AlignRight | Qt::AlignTrailing | Qt::AlignVCenter);
-        final_wait->setVisible(false);
-        auto* note = new QLabel(tr("Recovery is another way to spend the same bitcoin, not extra funds."));
-        note->setObjectName("labelVaultPathNote");
-        note->setWordWrap(true);
-        note->setStyleSheet(QStringLiteral("QLabel { color: palette(window-text); }"));
-        note->setVisible(false);
+        auto* immediate_option = new QLabel(tr("Available now:"));
+        immediate_option->setObjectName("vaultImmediateOptionLabel");
+        immediate_option->setVisible(false);
+        auto* immediate_status = new QLabel;
+        immediate_status->setObjectName("vaultImmediateStatusLabel");
+        immediate_status->setAlignment(Qt::AlignRight | Qt::AlignTrailing | Qt::AlignVCenter);
+        immediate_status->setVisible(false);
+        auto* recovery_option = new QLabel;
+        recovery_option->setObjectName("vaultRecoveryOptionLabel");
+        recovery_option->setVisible(false);
+        auto* recovery_status = new QLabel;
+        recovery_status->setObjectName("vaultRecoveryStatusLabel");
+        recovery_status->setAlignment(Qt::AlignRight | Qt::AlignTrailing | Qt::AlignVCenter);
+        recovery_status->setVisible(false);
+        auto* final_option = new QLabel;
+        final_option->setObjectName("vaultFinalOptionLabel");
+        final_option->setVisible(false);
+        auto* final_status = new QLabel;
+        final_status->setObjectName("vaultFinalStatusLabel");
+        final_status->setAlignment(Qt::AlignRight | Qt::AlignTrailing | Qt::AlignVCenter);
+        final_status->setVisible(false);
         grid->addWidget(sep, 5, 0, 1, 2);
-        grid->addWidget(rec_text, 6, 0);
-        grid->addWidget(rec, 6, 1);
-        grid->addWidget(wait_text, 7, 0);
-        grid->addWidget(wait, 7, 1);
-        grid->addWidget(final_rec_text, 8, 0);
-        grid->addWidget(final_rec, 8, 1);
-        grid->addWidget(final_wait_text, 9, 0);
-        grid->addWidget(final_wait, 9, 1);
-        grid->addWidget(note, 10, 0, 1, 2);
+        grid->addWidget(immediate_option, 6, 0);
+        grid->addWidget(immediate_status, 6, 1);
+        grid->addWidget(recovery_option, 7, 0);
+        grid->addWidget(recovery_status, 7, 1);
+        grid->addWidget(final_option, 8, 0);
+        grid->addWidget(final_status, 8, 1);
     }
 }
 
@@ -241,7 +224,7 @@ OverviewPage::~OverviewPage()
 void OverviewPage::setBalance(const interfaces::WalletBalances& balances)
 {
     BitcoinUnit unit = walletModel->getOptionsModel()->getDisplayUnit();
-    ui->labelBalance->setText(BitcoinUnits::formatWithPrivacy(unit, balances.is_vault ? balances.vault_immediate : balances.balance, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
+    ui->labelBalance->setText(BitcoinUnits::formatWithPrivacy(unit, balances.balance, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
     ui->labelUnconfirmed->setText(BitcoinUnits::formatWithPrivacy(unit, balances.unconfirmed_balance, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
     ui->labelImmature->setText(BitcoinUnits::formatWithPrivacy(unit, balances.immature_balance, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
     ui->labelTotal->setText(BitcoinUnits::formatWithPrivacy(unit, balances.balance + balances.unconfirmed_balance + balances.immature_balance, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
@@ -249,83 +232,106 @@ void OverviewPage::setBalance(const interfaces::WalletBalances& balances)
     // for the non-mining users
     bool showImmature = balances.immature_balance != 0;
 
-    ui->labelImmature->setVisible(showImmature);
-    ui->labelImmatureText->setVisible(showImmature);
+    ui->labelBalance->setVisible(!balances.is_vault);
+    ui->labelBalanceText->setVisible(!balances.is_vault);
+    ui->labelUnconfirmed->setVisible(!balances.is_vault);
+    ui->labelPendingText->setVisible(!balances.is_vault);
+    ui->labelImmature->setVisible(!balances.is_vault && showImmature);
+    ui->labelImmatureText->setVisible(!balances.is_vault && showImmature);
+    ui->line->setVisible(!balances.is_vault);
 
     if (balances.is_vault) {
-        ui->labelBalanceText->setText(tr("Spendable now (immediate path):"));
-        ui->labelBalance->setToolTip(tr("Spendable with every active key. Zero if a signer is marked lost. Does not use the delayed recovery path."));
-        ui->labelTotal->setToolTip(tr("Confirmed + pending + immature. Vault recovery amounts below are the same coins, not added to this total."));
+        ui->labelTotalText->setText(tr("Total balance:"));
+        ui->labelTotal->setToolTip(tr("Confirmed, pending, and immature bitcoin in this vault."));
     } else {
         ui->labelBalanceText->setText(tr("Available:"));
         ui->labelBalance->setToolTip(tr("Your current spendable balance"));
+        ui->labelTotalText->setText(tr("Total:"));
+        ui->labelTotal->setToolTip(QString());
     }
 
-    if (auto* rec = findChild<QLabel*>("labelVaultRecoverable")) {
-        auto* rec_text = findChild<QLabel*>("labelVaultRecoverableText");
-        auto* wait = findChild<QLabel*>("labelVaultAwaiting");
-        auto* wait_text = findChild<QLabel*>("labelVaultAwaitingText");
-        auto* note = findChild<QLabel*>("labelVaultPathNote");
-        auto* sep = findChild<QFrame*>("labelVaultPathSep");
-        auto* final_rec = findChild<QLabel*>("labelVaultFinalRecoverable");
-        auto* final_rec_text = findChild<QLabel*>("labelVaultFinalRecoverableText");
-        auto* final_wait = findChild<QLabel*>("labelVaultFinalAwaiting");
-        auto* final_wait_text = findChild<QLabel*>("labelVaultFinalAwaitingText");
+    if (auto* immediate_status = findChild<QLabel*>("vaultImmediateStatusLabel")) {
+        auto* immediate_option = findChild<QLabel*>("vaultImmediateOptionLabel");
+        auto* recovery_option = findChild<QLabel*>("vaultRecoveryOptionLabel");
+        auto* recovery_status = findChild<QLabel*>("vaultRecoveryStatusLabel");
+        auto* final_option = findChild<QLabel*>("vaultFinalOptionLabel");
+        auto* final_status = findChild<QLabel*>("vaultFinalStatusLabel");
+        auto* sep = findChild<QFrame*>("vaultAvailabilitySeparator");
         const bool show_vault = balances.is_vault;
-        rec->setVisible(show_vault);
-        if (rec_text) rec_text->setVisible(show_vault);
+        immediate_status->setVisible(show_vault);
+        if (immediate_option) immediate_option->setVisible(show_vault);
+        if (recovery_option) recovery_option->setVisible(show_vault);
+        if (recovery_status) recovery_status->setVisible(show_vault);
         if (sep) sep->setVisible(show_vault);
-        if (note) note->setVisible(show_vault);
-        const bool show_wait = show_vault && balances.vault_awaiting != 0;
-        wait->setVisible(show_wait);
-        if (wait_text) wait_text->setVisible(show_wait);
+        const auto status = show_vault ? walletModel->reconcileVaultHardwareSigners() : interfaces::Wallet::VaultStatus{};
         if (show_vault) {
-            if (rec_text) rec_text->setText(tr("Recovery path (same coins):"));
-            rec->setText(BitcoinUnits::formatWithPrivacy(unit, balances.vault_recoverable, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
-            rec->setToolTip(tr("Mature coins that can be spent on the delayed path if you check recovery. Same UTXOs as spendable now, not extra bitcoin."));
-            if (show_wait) {
-                if (wait_text) wait_text->setText(tr("Not yet mature (per coin):"));
-                QString awaiting = BitcoinUnits::formatWithPrivacy(unit, balances.vault_awaiting, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy);
-                if (balances.vault_blocks_remaining) {
-                    if (*balances.vault_blocks_remaining == 1) {
-                        awaiting += tr(" (earliest: ~1 block)");
-                    } else {
-                        awaiting += tr(" (earliest: ~%1 blocks)").arg(*balances.vault_blocks_remaining);
-                    }
+            immediate_status->setText(!status.lost_signers.empty()
+                ? tr("All keys · Reconnect a signer")
+                : balances.vault_immediate > 0 ? tr("All keys · Ready") : tr("All keys · No confirmed funds"));
+            const auto stage_label = [](const interfaces::Wallet::VaultStatus::VaultRecoveryStage& stage) -> QString {
+                const QString quorum = stage.nrequired == 1 ? tr("Any 1 key") : tr("Any %1 keys").arg(stage.nrequired);
+                if (stage.older) {
+                    const QString delay = *stage.older == 1
+                        ? tr("After ~1 block:")
+                        : *stage.older < 144
+                            ? tr("After ~%1 blocks:").arg(*stage.older)
+                            : tr("After ~%1 days:").arg((*stage.older + 72) / 144);
+                    return delay + QStringLiteral(" ") + quorum;
                 }
-                wait->setText(awaiting);
+                if (stage.after) return tr("At block %1:").arg(*stage.after) + QStringLiteral(" ") + quorum;
+                return tr("Recovery:") + QStringLiteral(" ") + quorum;
+            };
+            const auto stage_state = [](const interfaces::Wallet::VaultStatus::VaultRecoveryStage& stage) -> QString {
+                if (stage.recoverable_now > 0) {
+                    if (stage.awaiting_maturity > 0 && stage.earliest_blocks_remaining) {
+                        return tr("Ready · newer deposits in ~%1 blocks").arg(*stage.earliest_blocks_remaining);
+                    }
+                    return tr("Ready");
+                }
+                if (stage.earliest_blocks_remaining) {
+                    return *stage.earliest_blocks_remaining == 1
+                        ? tr("Available in ~1 block")
+                        : tr("Available in ~%1 blocks").arg(*stage.earliest_blocks_remaining);
+                }
+                return stage.awaiting_maturity > 0 ? tr("Waiting for maturity") : tr("No confirmed funds");
+            };
+            if (!status.recovery_stages.empty()) {
+                if (recovery_option) recovery_option->setText(stage_label(status.recovery_stages[0]));
+                if (recovery_status) recovery_status->setText(stage_state(status.recovery_stages[0]));
+            } else {
+                if (recovery_option) recovery_option->setText(tr("Recovery:"));
+                if (recovery_status) recovery_status->setText(tr("Unavailable"));
             }
         }
-        const auto status = show_vault ? walletModel->wallet().getVaultStatus() : interfaces::Wallet::VaultStatus{};
         const bool show_final = show_vault && status.recovery_stages.size() > 1;
-        if (final_rec) final_rec->setVisible(show_final);
-        if (final_rec_text) final_rec_text->setVisible(show_final);
+        if (final_option) final_option->setVisible(show_final);
+        if (final_status) final_status->setVisible(show_final);
         if (show_final) {
             const auto& stage = status.recovery_stages[1];
-            const uint32_t blocks = stage.older.value_or(0);
-            const uint32_t days = std::max<uint32_t>(1, (blocks + 72) / 144);
-            if (final_rec_text) {
-                final_rec_text->setText(stage.nrequired == 1
-                    ? tr("Any 1 recovery key after ~%1 days:").arg(days)
-                    : tr("Any %1 recovery keys after ~%2 days:").arg(stage.nrequired).arg(days));
+            const QString quorum = stage.nrequired == 1 ? tr("Any 1 key") : tr("Any %1 keys").arg(stage.nrequired);
+            if (stage.older) {
+                const QString delay = *stage.older == 1
+                    ? tr("After ~1 block:")
+                    : *stage.older < 144
+                        ? tr("After ~%1 blocks:").arg(*stage.older)
+                        : tr("After ~%1 days:").arg((*stage.older + 72) / 144);
+                if (final_option) final_option->setText(delay + QStringLiteral(" ") + quorum);
+            } else if (stage.after) {
+                if (final_option) final_option->setText(tr("At block %1:").arg(*stage.after) + QStringLiteral(" ") + quorum);
             }
-            final_rec->setText(BitcoinUnits::formatWithPrivacy(unit, stage.recoverable_now, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
-            final_rec->setToolTip(tr("The same vault coins under the later, weaker recovery branch. This amount is not additional bitcoin."));
-            const bool show_final_wait = stage.awaiting_maturity != 0;
-            if (final_wait) final_wait->setVisible(show_final_wait);
-            if (final_wait_text) final_wait_text->setVisible(show_final_wait);
-            if (show_final_wait && final_wait) {
-                QString awaiting = BitcoinUnits::formatWithPrivacy(unit, stage.awaiting_maturity, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy);
-                if (stage.earliest_blocks_remaining) {
-                    awaiting += *stage.earliest_blocks_remaining == 1
-                        ? tr(" (earliest: ~1 block)")
-                        : tr(" (earliest: ~%1 blocks)").arg(*stage.earliest_blocks_remaining);
+            if (final_status) {
+                if (stage.recoverable_now > 0) {
+                    final_status->setText(stage.awaiting_maturity > 0 && stage.earliest_blocks_remaining
+                        ? tr("Ready · newer deposits in ~%1 blocks").arg(*stage.earliest_blocks_remaining)
+                        : tr("Ready"));
+                } else if (stage.earliest_blocks_remaining) {
+                    final_status->setText(*stage.earliest_blocks_remaining == 1
+                        ? tr("Available in ~1 block")
+                        : tr("Available in ~%1 blocks").arg(*stage.earliest_blocks_remaining));
+                } else {
+                    final_status->setText(stage.awaiting_maturity > 0 ? tr("Waiting for maturity") : tr("No confirmed funds"));
                 }
-                final_wait->setText(awaiting);
             }
-        } else {
-            if (final_wait) final_wait->setVisible(false);
-            if (final_wait_text) final_wait_text->setVisible(false);
         }
     }
 }
@@ -428,8 +434,4 @@ void OverviewPage::setMonospacedFont(const QFont& f)
     ui->labelUnconfirmed->setFont(f);
     ui->labelImmature->setFont(f);
     ui->labelTotal->setFont(f);
-    if (auto* rec = findChild<QLabel*>("labelVaultRecoverable")) rec->setFont(f);
-    if (auto* wait = findChild<QLabel*>("labelVaultAwaiting")) wait->setFont(f);
-    if (auto* rec = findChild<QLabel*>("labelVaultFinalRecoverable")) rec->setFont(f);
-    if (auto* wait = findChild<QLabel*>("labelVaultFinalAwaiting")) wait->setFont(f);
 }

@@ -16,6 +16,12 @@
 #include <QString>
 #include <QWizard>
 
+#include <functional>
+#include <map>
+#include <functional>
+#include <set>
+#include <string>
+#include <utility>
 #include <vector>
 
 class WalletController;
@@ -25,6 +31,7 @@ class QCloseEvent;
 
 namespace interfaces {
 class Node;
+class Wallet;
 } // namespace interfaces
 
 /** Guided staged Scrooge-vault setup: three keys, backup, and verification.
@@ -104,9 +111,17 @@ public:
     QString transcript() const;
     bilingual_str policyError() const;
 
+    //! Prepare and validate the fixed-flow policy and recovery material in
+    //! memory. Advanced flows retain their established create-on-commit path.
     bool createWallet();
+    //! Persist the already prepared fixed-flow candidate. This is called only
+    //! after Secure Recovery has deleted its managed temporary PDF.
+    bool commitWalletCandidate();
     bool restoreFromRecoverySheets(const QString& wallet_name, const QString& policy_json,
                                    const std::vector<SecureString>& mnemonics, QString& error);
+    bool retryRecoveryRescan(WalletModel* wallet_model, QString& error);
+    //! Validate a proposed wallet name without creating or loading anything.
+    QString walletNameError(const QString& name) const;
     QString createError() const { return m_create_error; }
     util::Result<CTxDestination> firstReceiveAddress();
     util::Result<void> verifyOnDevice(const std::string& fingerprint);
@@ -115,6 +130,10 @@ public:
 
 Q_SIGNALS:
     void created(WalletModel* wallet_model);
+    void receiveRequested(WalletModel* wallet_model, const QString& address);
+    void restoreCompleted();
+    void restoreAttemptFailed(const QString& error);
+    void restoreRescanRetryRequired(WalletModel* wallet_model, const QString& error);
 
 public Q_SLOTS:
     void accept() override;
@@ -135,11 +154,13 @@ private:
     friend class MultisigWizardTests;
 
     void refreshSidebar();
+    void enableAdvancedFlow();
     void lockCommittedJourney();
     void publishCreatedWallet();
     void clearSoftwareRecovery();
+    void completeRecoveryRestore(WalletModel* wallet_model);
+    bool removePrivatePrintPath(const QString& path) const;
     QString privateRecoveryKitHtml() const;
-    QString walletNameError(const QString& name) const;
     QString suggestedWalletName(const QString& base) const;
 
     interfaces::Node& m_node;
@@ -152,6 +173,20 @@ private:
     bool m_prefer_n_minus_1{false};
     VaultTemplate m_template{VaultTemplate::StagedRecovery};
     std::vector<wallet::MultisigKeySpec> m_hardware;
+    //! Fixed-flow hardware identity binding: fingerprint -> {account path,
+    //! account xpub}. Hardware specs intentionally remain distinct from
+    //! advanced-flow air-gapped xpubs so address display is still required.
+    std::map<std::string, std::pair<std::string, std::string>> m_fixed_hardware_accounts;
+    //! Fixed-flow devices that explicitly support a physical multisig address
+    //! display. Other connected devices remain valid signing participants but
+    //! cannot turn Review into independent verification.
+    std::set<std::string> m_fixed_address_display_devices;
+    //! Focused-test seam for the asynchronous post-install rescan. Production
+    //! leaves this empty and always invokes interfaces::Wallet directly.
+    std::function<util::Result<void>(interfaces::Wallet&)> m_restore_rescan_override;
+    std::optional<wallet::VaultPolicyPackage> m_pending_restore_package;
+    QString m_pending_restore_name;
+    size_t m_pending_restore_recovered_count{0};
     std::vector<wallet::MultisigKeySpec> m_airgapped;
     std::vector<wallet::MultisigKeySpec> m_keys;
     int m_nrequired{2};
@@ -159,6 +194,10 @@ private:
     std::optional<uint32_t> m_fallback_older_one_key{kSixtyDayVaultDelay};
     std::optional<uint32_t> m_fallback_after;
     std::vector<std::string> m_public_descs;
+    //! Fully resolved public key sources for the fixed in-memory candidate.
+    //! Generated software slots remain marked generate_local until commit,
+    //! when their already printed mnemonics are supplied instead.
+    std::vector<wallet::MultisigKeySpec> m_candidate_keys;
     WalletModel* m_wallet_model{nullptr};
     QString m_create_error;
     QString m_receive_address;
@@ -169,7 +208,11 @@ private:
     std::vector<wallet::GeneratedMnemonic> m_software_recovery;
     bool m_setup_committed{false};
     bool m_created_emitted{false};
+    bool m_address_independently_verified{false};
     bool m_advanced_flow{false};
+    //! Injectable filesystem boundary used by deterministic private-PDF
+    //! cleanup tests. Production removal uses QFile::remove().
+    std::function<bool(const QString&)> m_private_print_remover;
 };
 
 #endif // BITCOIN_QT_MULTISIGWIZARD_H

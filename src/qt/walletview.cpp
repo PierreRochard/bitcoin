@@ -158,6 +158,12 @@ void WalletView::gotoReceiveCoinsPage()
     setCurrentWidget(receiveCoinsPage);
 }
 
+void WalletView::showReceiveRequest(const QString& address)
+{
+    gotoReceiveCoinsPage();
+    receiveCoinsPage->showRequestForAddress(address);
+}
+
 void WalletView::gotoSendCoinsPage(QString addr)
 {
     setCurrentWidget(sendCoinsPage);

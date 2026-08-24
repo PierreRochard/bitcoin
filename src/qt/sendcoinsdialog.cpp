@@ -39,7 +39,9 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QFontMetrics>
+#include <QHBoxLayout>
 #include <QLabel>
+#include <QRadioButton>
 #include <QStringList>
 #include <QScrollBar>
 #include <QSettings>
@@ -74,6 +76,9 @@ SendCoinsDialog::SendCoinsDialog(const PlatformStyle *_platformStyle, QWidget *p
     platformStyle(_platformStyle)
 {
     ui->setupUi(this);
+    ui->sendButton->setText(tr("Review Transaction"));
+    ui->sendButton->setAccessibleName(tr("Review Transaction"));
+    ui->sendButton->setAccessibleDescription(tr("Review recipients, fees, and signing options before creating the transaction."));
 
     if (!_platformStyle->getImagesOnButtons()) {
         ui->addButton->setIcon(QIcon());
@@ -82,7 +87,7 @@ SendCoinsDialog::SendCoinsDialog(const PlatformStyle *_platformStyle, QWidget *p
     } else {
         ui->addButton->setIcon(_platformStyle->SingleColorIcon(":/icons/add"));
         ui->clearButton->setIcon(_platformStyle->SingleColorIcon(":/icons/remove"));
-        ui->sendButton->setIcon(_platformStyle->SingleColorIcon(":/icons/send"));
+        ui->sendButton->setIcon(QIcon());
     }
 
     GUIUtil::setupAddressWidget(ui->lineEditCoinControlChange, this);
@@ -140,12 +145,32 @@ SendCoinsDialog::SendCoinsDialog(const PlatformStyle *_platformStyle, QWidget *p
 
     GUIUtil::ExceptionSafeConnect(ui->sendButton, &QPushButton::clicked, this, &SendCoinsDialog::sendButtonClicked);
 
-    m_vault_recovery = new QCheckBox(tr("Spend the same coins using delayed recovery (not automatic)"));
-    m_vault_recovery->setObjectName("vaultRecoveryCheck");
-    m_vault_recovery->setToolTip(tr("Immediate spending requires every active key. Recovery is used only when you check this box; it is never automatic."));
-    m_vault_recovery->hide();
+    m_vault_mode_box = new QWidget;
+    m_vault_mode_box->setObjectName("vaultSpendModeBox");
+    auto* mode_layout = new QHBoxLayout(m_vault_mode_box);
+    mode_layout->setContentsMargins(0, 0, 0, 0);
+    auto* mode_label = new QLabel(tr("How do you want to spend?"));
+    mode_label->setObjectName("vaultSpendModeLabel");
+    m_vault_normal = new QRadioButton(tr("Send Normally"));
+    m_vault_normal->setObjectName("vaultNormalModeButton");
+    m_vault_normal->setAccessibleName(tr("Send Normally"));
+    m_vault_normal->setAccessibleDescription(tr("Use the immediate path, which requires every active key."));
+    m_vault_normal->setToolTip(tr("Use the immediate path, which requires every active key."));
+    m_vault_recovery = new QRadioButton(tr("Recover Funds"));
+    m_vault_recovery->setObjectName("vaultRecoveryModeButton");
+    m_vault_recovery->setAccessibleName(tr("Recover Funds"));
+    m_vault_recovery->setAccessibleDescription(tr("Use a delayed recovery path only after explicitly selecting it."));
+    m_vault_recovery->setToolTip(tr("Use a delayed recovery path. The wallet never selects recovery automatically."));
+    m_vault_normal->setChecked(true);
+    mode_layout->addWidget(mode_label);
+    mode_layout->addStretch();
+    mode_layout->addWidget(m_vault_normal);
+    mode_layout->addWidget(m_vault_recovery);
+    m_vault_mode_box->hide();
     m_vault_recovery_stage = new QComboBox;
     m_vault_recovery_stage->setObjectName("vaultRecoveryStageCombo");
+    m_vault_recovery_stage->setAccessibleName(tr("Recovery stage"));
+    m_vault_recovery_stage->setAccessibleDescription(tr("Choose the exact recovery threshold and delay. No stage is selected automatically."));
     m_vault_recovery_stage->setToolTip(tr("Choose the exact delayed recovery branch. The wallet never switches to a weaker threshold automatically."));
     m_vault_recovery_stage->hide();
     m_vault_recovery_stage->setEnabled(false);
@@ -153,13 +178,14 @@ SendCoinsDialog::SendCoinsDialog(const PlatformStyle *_platformStyle, QWidget *p
     m_vault_lost->setObjectName("vaultLostSignerLabel");
     m_vault_lost->setTextFormat(Qt::RichText);
     m_vault_lost->setWordWrap(true);
-    m_vault_lost->setStyleSheet(QStringLiteral("QLabel { background-color: #F8D488; color: #000000; padding: 8px; }"));
+    m_vault_lost->setAccessibleName(tr("Signer recovery status"));
+    m_vault_lost->setStyleSheet(QStringLiteral("QLabel { background: palette(alternate-base); color: palette(text); padding: 8px; border: 1px solid palette(mid); border-radius: 3px; }"));
     m_vault_lost->hide();
     const int fee_row = ui->verticalLayout->indexOf(ui->frameFee);
     ui->verticalLayout->insertWidget(fee_row, m_vault_lost);
-    ui->verticalLayout->insertWidget(fee_row + 1, m_vault_recovery);
+    ui->verticalLayout->insertWidget(fee_row + 1, m_vault_mode_box);
     ui->verticalLayout->insertWidget(fee_row + 2, m_vault_recovery_stage);
-    connect(m_vault_recovery, &QCheckBox::toggled, this, [this] {
+    connect(m_vault_recovery, &QRadioButton::toggled, this, [this] {
         coinControlUpdateLabels();
         updateVaultSendState();
         if (model) refreshBalance();
@@ -228,21 +254,6 @@ void SendCoinsDialog::setModel(WalletModel *_model)
         updateFeeSectionControls();
         updateSmartFeeLabel();
 
-        if (model->wallet().hasExternalSigner()) {
-            //: "device" usually means a hardware wallet.
-            ui->sendButton->setText(tr("Sign on device"));
-            if (model->getOptionsModel()->hasSigner()) {
-                ui->sendButton->setEnabled(true);
-                ui->sendButton->setToolTip(tr("Connect your hardware wallet first."));
-            } else {
-                ui->sendButton->setEnabled(false);
-                //: "External signer" means using devices such as hardware wallets.
-                ui->sendButton->setToolTip(tr("Set external signer script path in Options -> Wallet"));
-            }
-        } else if (model->wallet().privateKeysDisabled()) {
-            ui->sendButton->setText(tr("Cr&eate Unsigned"));
-            ui->sendButton->setToolTip(tr("Creates a Partially Signed Bitcoin Transaction (PSBT) for use with e.g. an offline %1 wallet, or a PSBT-compatible hardware wallet.").arg(CLIENT_NAME));
-        }
         updateVaultSendState();
         refreshBalance();
 
@@ -362,11 +373,12 @@ bool SendCoinsDialog::PrepareSendText(QString& question_string, QString& informa
     question_string.append(tr("Do you want to create this transaction?"));
     if (m_vault_recovery && m_vault_recovery->isChecked()) {
         question_string.append("<br /><span style='font-size:10pt;'>");
-        const auto st = model->wallet().getVaultStatus();
+        const auto st = model->reconcileVaultHardwareSigners();
         if (st.older) {
             uint32_t selected = *st.older;
             int required = st.recovery_m;
             if (m_vault_recovery_stage && !m_vault_recovery_stage->isHidden()) {
+                if (m_vault_recovery_stage->currentIndex() <= 0 || !m_vault_recovery_stage->currentData().isValid()) return false;
                 selected = m_vault_recovery_stage->currentData().toUInt();
                 for (const auto& stage : st.recovery_stages) {
                     if (stage.older && *stage.older == selected) required = stage.nrequired;
@@ -538,7 +550,7 @@ void SendCoinsDialog::sendButtonClicked([[maybe_unused]] bool checked)
     // start an immediate spend.
     if (updateVaultSendState()) {
         Q_EMIT message(tr("Send Coins"),
-                       tr("Immediate spending is frozen because a signer is marked lost. Reconnect or restore the signer, or explicitly select delayed recovery once the coins are mature."),
+                       m_vault_send_block_reason,
                        CClientUIInterface::MSG_WARNING);
         return;
     }
@@ -567,7 +579,7 @@ void SendCoinsDialog::sendButtonClicked([[maybe_unused]] bool checked)
     if (updateVaultSendState()) {
         fNewRecipientAllowed = true;
         Q_EMIT message(tr("Send Coins"),
-                       tr("Immediate spending is frozen because a signer is marked lost. Reconnect or restore the signer, or explicitly select delayed recovery once the coins are mature."),
+                       m_vault_send_block_reason,
                        CClientUIInterface::MSG_WARNING);
         return;
     }
@@ -637,7 +649,7 @@ void SendCoinsDialog::clear()
 
     // Clear coin control settings
     m_coin_control->UnSelectAll();
-    if (m_vault_recovery) m_vault_recovery->setChecked(false);
+    if (m_vault_normal) m_vault_normal->setChecked(true);
     if (m_vault_recovery_stage) m_vault_recovery_stage->setCurrentIndex(0);
     ui->checkBoxCoinControlChange->setChecked(false);
     ui->lineEditCoinControlChange->clear();
@@ -720,7 +732,10 @@ QWidget *SendCoinsDialog::setupTabChain(QWidget *prev)
             prev = entry->setupTabChain(prev);
         }
     }
-    QWidget::setTabOrder(prev, ui->sendButton);
+    QWidget::setTabOrder(prev, m_vault_normal);
+    QWidget::setTabOrder(m_vault_normal, m_vault_recovery);
+    QWidget::setTabOrder(m_vault_recovery, m_vault_recovery_stage);
+    QWidget::setTabOrder(m_vault_recovery_stage, ui->sendButton);
     QWidget::setTabOrder(ui->sendButton, ui->clearButton);
     QWidget::setTabOrder(ui->clearButton, ui->addButton);
     return ui->addButton;
@@ -790,12 +805,19 @@ void SendCoinsDialog::setBalance(const interfaces::WalletBalances& balances)
             const bool recovery = m_vault_recovery && m_vault_recovery->isChecked();
             balance = recovery ? balances.vault_recoverable : balances.vault_immediate;
             if (recovery && m_vault_recovery_stage && !m_vault_recovery_stage->isHidden()) {
-                const uint32_t selected = m_vault_recovery_stage->currentData().toUInt();
-                const auto status = model->wallet().getVaultStatus();
-                for (const auto& stage : status.recovery_stages) {
-                    if (stage.older && *stage.older == selected) {
-                        balance = stage.recoverable_now;
-                        break;
+                if (m_vault_recovery_stage->currentIndex() <= 0 || !m_vault_recovery_stage->currentData().isValid()) {
+                    ui->labelBalanceName->setText(tr("Choose a recovery stage:"));
+                    ui->labelBalance->setText(QStringLiteral("—"));
+                    updateVaultSendState();
+                    return;
+                } else {
+                    const uint32_t selected = m_vault_recovery_stage->currentData().toUInt();
+                    const auto status = model->reconcileVaultHardwareSigners();
+                    for (const auto& stage : status.recovery_stages) {
+                        if (stage.older && *stage.older == selected) {
+                            balance = stage.recoverable_now;
+                            break;
+                        }
                     }
                 }
             }
@@ -936,66 +958,66 @@ QString LostSignerLabel(WalletModel* model, const std::string& fingerprint)
     if (!name.isEmpty() && name.compare(hex, Qt::CaseInsensitive) != 0) {
         return QStringLiteral("%1 (%2)").arg(name, hex);
     }
-    return hex;
+    return QObject::tr("Hardware signer (%1)").arg(hex);
 }
 } // namespace
 
 bool SendCoinsDialog::updateVaultSendState()
 {
     if (!model || !model->getOptionsModel() || !m_vault_recovery) return false;
-    const auto st = model->wallet().getVaultStatus();
+    const auto st = model->reconcileVaultHardwareSigners();
+    m_vault_mode_box->setVisible(st.is_vault);
+    m_vault_normal->setVisible(st.is_vault);
     m_vault_recovery->setVisible(st.is_vault);
+    const bool recovery_mode = st.is_vault && m_vault_recovery->isChecked();
+    const interfaces::Wallet::VaultStatus::VaultRecoveryStage* selected_stage{nullptr};
     if (m_vault_recovery_stage) {
         const bool multi_stage = st.is_vault && st.recovery_stages.size() > 1;
-        const uint32_t prior = m_vault_recovery_stage->count() > 0
-            ? m_vault_recovery_stage->currentData().toUInt() : 0;
-        bool rebuild = m_vault_recovery_stage->count() != static_cast<int>(st.recovery_stages.size());
-        if (!rebuild) {
-            for (int i = 0; i < m_vault_recovery_stage->count(); ++i) {
-                if (!st.recovery_stages[static_cast<size_t>(i)].older ||
-                    m_vault_recovery_stage->itemData(i).toUInt() != *st.recovery_stages[static_cast<size_t>(i)].older) {
-                    rebuild = true;
+        const QVariant prior = m_vault_recovery_stage->currentIndex() > 0
+            ? m_vault_recovery_stage->currentData() : QVariant{};
+        m_vault_recovery_stage->blockSignals(true);
+        m_vault_recovery_stage->clear();
+        if (multi_stage) {
+            m_vault_recovery_stage->addItem(tr("Choose a recovery stage…"), QVariant{});
+            for (const auto& stage : st.recovery_stages) {
+                if (!stage.older) continue;
+                const QString quorum = stage.nrequired == 1
+                    ? tr("Any 1 key")
+                    : tr("Any %1 keys").arg(stage.nrequired);
+                QString availability;
+                if (stage.recoverable_now > 0) {
+                    availability = tr("available now");
+                } else if (stage.earliest_blocks_remaining) {
+                    availability = *stage.earliest_blocks_remaining == 1
+                        ? tr("available in ~1 block")
+                        : tr("available in ~%1 blocks").arg(*stage.earliest_blocks_remaining);
+                } else {
+                    availability = tr("not yet available");
+                }
+                const QString delay = *stage.older < 144
+                    ? (*stage.older == 1 ? tr("1 block") : tr("%1 blocks").arg(*stage.older))
+                    : tr("~%1 days (%2 blocks)").arg((*stage.older + 72) / 144).arg(*stage.older);
+                m_vault_recovery_stage->addItem(
+                    tr("%1 — %2 · %3").arg(quorum, availability, delay),
+                    QVariant::fromValue(*stage.older));
+            }
+            const int restore = prior.isValid() ? m_vault_recovery_stage->findData(prior) : -1;
+            m_vault_recovery_stage->setCurrentIndex(restore > 0 ? restore : 0);
+        }
+        m_vault_recovery_stage->blockSignals(false);
+        m_vault_recovery_stage->setVisible(multi_stage);
+        m_vault_recovery_stage->setEnabled(multi_stage && recovery_mode);
+        if (multi_stage && m_vault_recovery_stage->currentIndex() > 0 && m_vault_recovery_stage->currentData().isValid()) {
+            const uint32_t selected = m_vault_recovery_stage->currentData().toUInt();
+            for (const auto& stage : st.recovery_stages) {
+                if (stage.older && *stage.older == selected) {
+                    selected_stage = &stage;
                     break;
                 }
             }
+        } else if (!multi_stage && !st.recovery_stages.empty()) {
+            selected_stage = &st.recovery_stages.front();
         }
-        if (rebuild) {
-            m_vault_recovery_stage->blockSignals(true);
-            m_vault_recovery_stage->clear();
-            for (const auto& stage : st.recovery_stages) {
-                if (!stage.older) continue;
-                const uint32_t days = std::max<uint32_t>(1, (*stage.older + 72) / 144);
-                const QString quorum = stage.nrequired == 1
-                    ? tr("Any 1 recovery key")
-                    : tr("Any %1 recovery keys").arg(stage.nrequired);
-                m_vault_recovery_stage->addItem(
-                    tr("%1 after ~%2 days (%3 blocks)").arg(quorum).arg(days).arg(*stage.older),
-                    QVariant::fromValue(*stage.older));
-            }
-            const int restore = m_vault_recovery_stage->findData(QVariant::fromValue(prior));
-            m_vault_recovery_stage->setCurrentIndex(restore >= 0 ? restore : 0);
-            m_vault_recovery_stage->blockSignals(false);
-        }
-        m_vault_recovery_stage->setVisible(multi_stage);
-        m_vault_recovery_stage->setEnabled(multi_stage && m_vault_recovery->isChecked());
-    }
-    if (st.recovery_stages.size() > 1) {
-        m_vault_recovery->setText(tr("Spend using a delayed recovery stage (not automatic)"));
-        m_vault_recovery->setToolTip(tr("Immediate spending requires every active key. Check this box, then choose the exact recovery threshold and delay below. The wallet never switches to the one-key path automatically."));
-    } else if (st.older) {
-        if (*st.older == 1) {
-            m_vault_recovery->setText(tr("Spend the same coins using delayed recovery after 1 block (not automatic)"));
-            m_vault_recovery->setToolTip(tr("Immediate spending requires every active key. Recovery is used only when you check this box; it is never automatic. Each coin matures after 1 block, and change starts a new relative delay."));
-        } else {
-            m_vault_recovery->setText(tr("Spend the same coins using delayed recovery after %1 blocks (not automatic)").arg(*st.older));
-            m_vault_recovery->setToolTip(tr("Immediate spending requires every active key. Recovery is used only when you check this box; it is never automatic. Each coin matures after %1 blocks, and change starts a new relative delay.").arg(*st.older));
-        }
-    } else if (st.after) {
-        m_vault_recovery->setText(tr("Spend the same coins using delayed recovery after height %1 (not automatic)").arg(*st.after));
-        m_vault_recovery->setToolTip(tr("Immediate spending requires every active key. Recovery is used only when you check this box; it is never automatic. Recovery becomes available at block height %1. This is an absolute height; change does not restart it.").arg(*st.after));
-    } else if (st.is_vault) {
-        m_vault_recovery->setText(tr("Spend the same coins using delayed recovery (not automatic)"));
-        m_vault_recovery->setToolTip(tr("Immediate spending requires every active key. Recovery is used only when you check this box; it is never automatic."));
     }
 
     const bool lost = st.is_vault && !st.lost_signers.empty();
@@ -1008,38 +1030,83 @@ bool SendCoinsDialog::updateVaultSendState()
             }
             const bool one = names.size() == 1;
             const QString title = (one ? tr("Signer marked lost: %1") : tr("Signers marked lost: %1")).arg(names.join(QStringLiteral(", ")));
-            const QString action = one
-                ? tr("Immediate spending is frozen. Reconnect or restore this signer, or select delayed recovery below once mature. Recovery never starts automatically.")
-                : tr("Immediate spending is frozen. Reconnect or restore the missing signers, or select delayed recovery below once mature. Recovery never starts automatically.");
+            const auto recovery_now = std::find_if(st.recovery_stages.begin(), st.recovery_stages.end(), [](const auto& stage) {
+                return stage.recoverable_now > 0;
+            });
+            std::optional<int> remaining;
+            for (const auto& stage : st.recovery_stages) {
+                if (stage.earliest_blocks_remaining && (!remaining || *stage.earliest_blocks_remaining < *remaining)) {
+                    remaining = stage.earliest_blocks_remaining;
+                }
+            }
+            QString action;
+            if (recovery_now != st.recovery_stages.end()) {
+                action = one
+                    ? tr("Reconnect this signer, or choose Recover Funds now.")
+                    : tr("Reconnect the missing signers, or choose Recover Funds now.");
+            } else if (remaining) {
+                if (*remaining < 144) {
+                    if (*remaining == 1) {
+                        action = one
+                            ? tr("Reconnect this signer, or recover in ~1 block (less than a day).")
+                            : tr("Reconnect the missing signers, or recover in ~1 block (less than a day).");
+                    } else {
+                        action = one
+                            ? tr("Reconnect this signer, or recover in ~%1 blocks (less than a day).").arg(*remaining)
+                            : tr("Reconnect the missing signers, or recover in ~%1 blocks (less than a day).").arg(*remaining);
+                    }
+                } else {
+                    const int days = (*remaining + 72) / 144;
+                    action = one
+                        ? tr("Reconnect this signer, or recover in ~%1 blocks (~%2 days).").arg(*remaining).arg(days)
+                        : tr("Reconnect the missing signers, or recover in ~%1 blocks (~%2 days).").arg(*remaining).arg(days);
+                }
+            } else {
+                action = one
+                    ? tr("Reconnect this signer. Recover Funds is not available yet.")
+                    : tr("Reconnect the missing signers. Recover Funds is not available yet.");
+            }
             m_vault_lost->setText(QStringLiteral("<b>%1</b><br>%2").arg(GUIUtil::HtmlEscape(title), GUIUtil::HtmlEscape(action)));
+            m_vault_lost->setAccessibleDescription(title + QStringLiteral(". ") + action);
         }
     }
 
+    ui->sendButton->setText(tr("Review Transaction"));
+    bool base_enabled{true};
     if (model->wallet().hasExternalSigner()) {
-        ui->sendButton->setText(tr("Sign on device"));
-        if (model->getOptionsModel()->hasSigner()) {
-            ui->sendButton->setEnabled(true);
-            ui->sendButton->setToolTip(tr("Connect your hardware wallet first."));
+        if (model->getOptionsModel()->hasSigner(st.is_fixed_staged_vault)) {
+            ui->sendButton->setToolTip(tr("Review the transaction before signing on a hardware device."));
         } else {
-            ui->sendButton->setEnabled(false);
+            base_enabled = false;
             ui->sendButton->setToolTip(tr("Set external signer script path in Options -> Wallet"));
         }
     } else if (model->wallet().privateKeysDisabled()) {
-        ui->sendButton->setText(tr("Cr&eate Unsigned"));
-        ui->sendButton->setEnabled(true);
-        ui->sendButton->setToolTip(tr("Creates a Partially Signed Bitcoin Transaction (PSBT) for use with e.g. an offline %1 wallet, or a PSBT-compatible hardware wallet.").arg(CLIENT_NAME));
+        ui->sendButton->setToolTip(tr("Review the transaction before creating a Partially Signed Bitcoin Transaction (PSBT)."));
     } else {
-        ui->sendButton->setText(tr("S&end"));
-        ui->sendButton->setEnabled(true);
-        ui->sendButton->setToolTip(tr("Confirm the send action"));
+        ui->sendButton->setToolTip(tr("Review recipients, fees, and signing options."));
     }
 
+    m_vault_send_block_reason.clear();
     const bool immediate_frozen = lost && !m_vault_recovery->isChecked();
-    if (immediate_frozen) {
-        ui->sendButton->setEnabled(false);
-        ui->sendButton->setToolTip(tr("Immediate spend needs every active key. Check delayed recovery if the coins are mature, or reconnect the missing signer."));
+    if (st.genesis_rescan_required) {
+        m_vault_send_block_reason = tr("This restored vault must complete its blockchain rescan from genesis before funds can be sent.");
+    } else if (immediate_frozen) {
+        m_vault_send_block_reason = tr("Send Normally needs every active key. Reconnect the missing signer, or explicitly choose Recover Funds once a recovery stage is available.");
+    } else if (recovery_mode && st.recovery_stages.size() > 1 && !selected_stage) {
+        m_vault_send_block_reason = tr("Choose a recovery stage before reviewing the transaction. The wallet will not select a weaker threshold automatically.");
+    } else if (recovery_mode && selected_stage && selected_stage->recoverable_now == 0 && selected_stage->awaiting_maturity > 0) {
+        if (selected_stage->earliest_blocks_remaining) {
+            m_vault_send_block_reason = *selected_stage->earliest_blocks_remaining == 1
+                ? tr("This recovery stage will be available in ~1 block.")
+                : tr("This recovery stage will be available in ~%1 blocks.").arg(*selected_stage->earliest_blocks_remaining);
+        } else {
+            m_vault_send_block_reason = tr("This recovery stage is not available yet.");
+        }
     }
-    return immediate_frozen;
+    const bool blocked = !m_vault_send_block_reason.isEmpty();
+    ui->sendButton->setEnabled(base_enabled && !blocked);
+    if (blocked) ui->sendButton->setToolTip(m_vault_send_block_reason);
+    return blocked;
 }
 
 void SendCoinsDialog::updateCoinControlState()
@@ -1059,10 +1126,11 @@ void SendCoinsDialog::updateCoinControlState()
     m_coin_control->m_script_path = false;
     m_coin_control->m_min_depth = wallet::DEFAULT_MIN_DEPTH;
     if (m_vault_recovery && m_vault_recovery->isChecked() && model) {
-        const auto st = model->wallet().getVaultStatus();
+        const auto st = model->reconcileVaultHardwareSigners();
         if (st.older) {
             uint32_t selected = *st.older;
             if (m_vault_recovery_stage && !m_vault_recovery_stage->isHidden()) {
+                if (m_vault_recovery_stage->currentIndex() <= 0 || !m_vault_recovery_stage->currentData().isValid()) return;
                 selected = m_vault_recovery_stage->currentData().toUInt();
             }
             m_coin_control->m_nSequence = selected;

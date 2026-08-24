@@ -65,6 +65,7 @@ private:
 public:
     WalletView* currentWalletView() const;
     WalletModel* currentWalletModel() const;
+    void showReceiveRequest(const QString& address);
 
 public Q_SLOTS:
     /** Switch to overview (home) page */

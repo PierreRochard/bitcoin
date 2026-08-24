@@ -33,6 +33,7 @@ if(ENABLE_WALLET)
       addressbooktests.cpp
       wallettests.cpp
       multisigwizardtests.cpp
+      vaulthardwaretests.cpp
       ../../wallet/test/wallet_test_fixture.cpp
   )
 endif()

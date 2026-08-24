@@ -15,9 +15,11 @@
 #include <qt/transactiontablemodel.h>
 
 #include <common/args.h>
+#include <interfaces/external_signer.h>
 #include <interfaces/handler.h>
 #include <interfaces/node.h>
 #include <key_io.h>
+#include <node/context.h>
 #include <node/interface_ui.h>
 #include <node/types.h>
 #include <psbt.h>
@@ -26,7 +28,9 @@
 #include <wallet/types.h>
 #include <wallet/wallet.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -39,6 +43,50 @@
 using wallet::CCoinControl;
 using wallet::CRecipient;
 using wallet::DEFAULT_DISABLE_WALLET;
+
+interfaces::Wallet::VaultStatus WalletModel::reconcileVaultHardwareSigners()
+{
+    auto status{m_wallet->getVaultStatus()};
+    if (!status.is_vault || status.lost_signers.empty() || status.participants.empty()) return status;
+
+    const std::string account_path{status.participants.front().path};
+    if (account_path.empty() || std::any_of(status.participants.begin(), status.participants.end(), [&](const auto& participant) {
+            return participant.path != account_path;
+        })) {
+        return status;
+    }
+
+    interfaces::ExternalSignerDiscovery discovery;
+    try {
+        if (auto* ctx = m_node.context(); ctx && ctx->args) {
+            discovery = m_node.discoverExternalSigners(account_path);
+        } else {
+            return status;
+        }
+    } catch (const std::exception&) {
+        return status;
+    }
+    if (discovery.status != interfaces::ExternalSignerDiscoveryStatus::SUCCESS ||
+        std::any_of(discovery.devices.begin(), discovery.devices.end(), [](const auto& device) {
+            return !device.IsUsableForStagedVault();
+        })) {
+        return status;
+    }
+
+    bool changed{false};
+    for (const auto& device : discovery.devices) {
+        const auto participant = std::find_if(status.participants.begin(), status.participants.end(), [&](const auto& item) {
+            return item.fingerprint == device.fingerprint && item.path == account_path &&
+                   device.account_xpub && item.xpub == *device.account_xpub;
+        });
+        if (participant != status.participants.end() &&
+            std::ranges::find(status.lost_signers, device.fingerprint) != status.lost_signers.end()) {
+            m_wallet->setLostSigner(device.fingerprint, /*lost=*/false);
+            changed = true;
+        }
+    }
+    return changed ? m_wallet->getVaultStatus() : status;
+}
 
 WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel& client_model, const PlatformStyle *platformStyle, QObject *parent) :
     QObject(parent),

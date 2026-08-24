@@ -46,6 +46,7 @@ public:
     WalletModel* getWalletModel() const noexcept { return walletModel; }
 
     bool handlePaymentRequest(const SendCoinsRecipient& recipient);
+    void showReceiveRequest(const QString& address);
 
     void showOutOfSyncWarning(bool fShow);
 

@@ -714,9 +714,10 @@ bool OptionsModel::isRestartRequired() const
     return settings.value("fRestartRequired", false).toBool();
 }
 
-bool OptionsModel::hasSigner()
+bool OptionsModel::hasSigner(bool allow_native_default)
 {
-    return gArgs.GetArg("-signer", "") != "";
+    if (gArgs.IsArgSet("-signer")) return !gArgs.GetArg("-signer", "").empty();
+    return allow_native_default;
 }
 
 void OptionsModel::checkAndMigrate()

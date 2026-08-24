@@ -1299,6 +1299,11 @@ void BitcoinGUI::createMultisigWallet()
     wizard->setAttribute(Qt::WA_DeleteOnClose);
     connect(wizard, &MultisigWizard::created, this, &BitcoinGUI::setCurrentWallet);
     connect(wizard, &MultisigWizard::created, rpcConsole, &RPCConsole::setCurrentWallet);
+    connect(wizard, &MultisigWizard::receiveRequested, this, [this](WalletModel* wallet_model, const QString& address) {
+        setCurrentWallet(wallet_model);
+        gotoReceiveCoinsPage();
+        if (walletFrame) walletFrame->showReceiveRequest(address);
+    });
     wizard->open();
 #endif // ENABLE_WALLET
 }

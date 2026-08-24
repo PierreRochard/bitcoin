@@ -53,6 +53,7 @@
 #include <validationinterface.h>
 #include <wallet/coincontrol.h>
 #include <wallet/multisig.h>
+#include <wallet/vault_policy_qr.h>
 #include <wallet/walletutil.h>
 
 #include <QAbstractButton>
@@ -71,11 +72,13 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QLockFile>
 #include <QMessageBox>
 #include <QPalette>
 #include <QPixmap>
 #include <QPushButton>
 #include <QPlainTextEdit>
+#include <QRadioButton>
 #include <QSignalSpy>
 #include <QSpinBox>
 #include <QTableView>
@@ -95,32 +98,37 @@
 #include <set>
 
 namespace {
-const QStringList kShotNames{
-    QStringLiteral("00-intro"),
-    QStringLiteral("00b-template"),
-    QStringLiteral("01-setup-p2wsh"),
-    QStringLiteral("01b-setup-taproot"),
-    QStringLiteral("02-keys"),
-    QStringLiteral("02b-keys-recovery-only"),
-    QStringLiteral("02c-keys-staged-software"),
-    QStringLiteral("02d-keys-staged-hardware"),
-    QStringLiteral("03-policy-p2wsh"),
-    QStringLiteral("03b-policy-taproot"),
-    QStringLiteral("03c-policy-after"),
-    QStringLiteral("04-backup"),
-    QStringLiteral("04b-backup-taproot"),
-    QStringLiteral("04c-backup-staged"),
-    QStringLiteral("05-verify"),
-    QStringLiteral("05b-verify-hardware"),
-    QStringLiteral("05c-verify-staged"),
-    QStringLiteral("06-done"),
-    QStringLiteral("06b-done-taproot"),
-    QStringLiteral("06c-ready-staged"),
-    QStringLiteral("07-overview-vault"),
-    QStringLiteral("08-send-vault"),
-    QStringLiteral("08b-send-recovery"),
-    QStringLiteral("08c-send-lost-signer"),
-};
+const QStringList kShotNames = [] {
+    const QStringList states{
+        QStringLiteral("review-0"),
+        QStringLiteral("review-1"),
+        QStringLiteral("review-2"),
+        QStringLiteral("review-3"),
+        QStringLiteral("review-too-many-failure"),
+        QStringLiteral("secure-recovery-before-print"),
+        QStringLiteral("secure-recovery-after-print"),
+        QStringLiteral("confirm-review"),
+        QStringLiteral("confirm-verify"),
+        QStringLiteral("ready"),
+        QStringLiteral("overview"),
+        QStringLiteral("send-normal"),
+        QStringLiteral("send-first-recovery"),
+        QStringLiteral("send-final-recovery"),
+        QStringLiteral("send-lost-signer"),
+        QStringLiteral("restore-policy"),
+        QStringLiteral("restore-key-1"),
+        QStringLiteral("restore-key-2"),
+        QStringLiteral("restore-key-3"),
+        QStringLiteral("restore-rescan"),
+        QStringLiteral("restore-public-only"),
+        QStringLiteral("restore-error"),
+    };
+    QStringList names;
+    for (const QString& theme : {QStringLiteral("light"), QStringLiteral("dark")}) {
+        for (const QString& state : states) names << theme + QLatin1Char('-') + state;
+    }
+    return names;
+}();
 
 bool PublicOnlyDescriptors(const std::vector<std::string>& descriptors, QString& error)
 {
@@ -227,11 +235,11 @@ void AssertBackupPage(MultisigWizard& wizard, std::optional<uint32_t> older = {}
     QVERIFY(!mnemonic_ack);
     QVERIFY(!mnemonic_entry);
     QVERIFY(!verify_mnemonic);
-    QVERIFY(wizard.createdWallet());
     QVERIFY(!wizard.findChild<QPushButton*>("savePolicyButton"));
 
     const bool fixed_flow = !wizard.advancedFlow();
     if (fixed_flow) {
+        QVERIFY(!wizard.createdWallet());
         // The default staged-vault backup is intentionally a single-action
         // page: one Print PDF button, one final acknowledgment, and the
         // wizard's Continue button. The advanced policy tools still exist for
@@ -282,6 +290,7 @@ void AssertBackupPage(MultisigWizard& wizard, std::optional<uint32_t> older = {}
         QVERIFY(visible_buttons.contains(print_policy));
         QVERIFY(visible_buttons.contains(qobject_cast<QPushButton*>(wizard.button(QWizard::NextButton))));
     } else {
+        QVERIFY(wizard.createdWallet());
         QVERIFY(tabs->isVisible());
         QVERIFY(copy_policy->isVisible());
         QVERIFY(copy_policy->isEnabled());
@@ -351,9 +360,11 @@ void AssertBackupPage(MultisigWizard& wizard, std::optional<uint32_t> older = {}
         QCOMPARE(QApplication::clipboard()->text(), human);
     }
     QVERIFY(!ack->isChecked());
-    if (committed_journey) {
+    if (!fixed_flow && committed_journey) {
         QVERIFY(wizard.testOption(QWizard::NoCancelButton));
         QVERIFY(!wizard.button(QWizard::CancelButton)->isVisible());
+    } else if (fixed_flow) {
+        QVERIFY(!wizard.testOption(QWizard::NoCancelButton));
     }
     QApplication::processEvents();
     QVERIFY(!wizard.button(QWizard::NextButton)->isEnabled());
@@ -389,7 +400,20 @@ void CompleteBackupPage(MultisigWizard& wizard)
             ~UrlHandlerGuard() { QDesktopServices::unsetUrlHandler(QStringLiteral("file")); }
         } handler_guard;
         QDesktopServices::setUrlHandler(QStringLiteral("file"), &url_sink, "captureRecoveryUrl");
+        QString print_error;
+        QTimer print_error_closer;
+        QObject::connect(&print_error_closer, &QTimer::timeout, [&print_error] {
+            for (QWidget* widget : QApplication::topLevelWidgets()) {
+                if (auto* box = qobject_cast<QMessageBox*>(widget); box && box->isVisible()) {
+                    print_error = box->text();
+                    box->accept();
+                }
+            }
+        });
+        print_error_closer.start(10);
         print->click();
+        print_error_closer.stop();
+        QVERIFY2(print_error.isEmpty(), qPrintable(print_error));
         QTRY_COMPARE_WITH_TIMEOUT(url_sink.m_opened_recovery_count, 1, 5000);
         QVERIFY(url_sink.m_opened_recovery_url.isLocalFile());
         QVERIFY(QFileInfo::exists(url_sink.m_opened_recovery_url.toLocalFile()));
@@ -399,6 +423,8 @@ void CompleteBackupPage(MultisigWizard& wizard)
         policy_ack->setChecked(true);
         QApplication::processEvents();
         QVERIFY(wizard.button(QWizard::NextButton)->isEnabled());
+        QVERIFY(!wizard.button(QWizard::BackButton)->isVisible());
+        QVERIFY(!wizard.button(QWizard::CancelButton)->isVisible());
         return;
     }
 
@@ -439,16 +465,16 @@ void CompleteVerification(MultisigWizard& wizard)
         devices->setCurrentRow(row);
         show->click();
         QApplication::processEvents();
-        QVERIFY2(devices->item(row)->text().contains(QStringLiteral("verified"), Qt::CaseInsensitive),
+        QVERIFY2(devices->item(row)->text().startsWith(QStringLiteral("✓")),
                  qPrintable(status->text() + QStringLiteral(" | ") + devices->item(row)->text()));
-        QVERIFY(status->text().contains(QStringLiteral("matches this address"), Qt::CaseInsensitive));
+        QVERIFY(status->text().contains(QStringLiteral("physical device matches this wallet"), Qt::CaseInsensitive));
     }
     auto* air = wizard.findChild<QCheckBox*>("airgapVerifyCheck");
     auto* local = wizard.findChild<QCheckBox*>("localOnlyVerifyCheck");
     QVERIFY(air);
     QVERIFY(local);
     if (!air->isHidden()) air->setChecked(true);
-    if (!local->isHidden()) local->setChecked(true);
+    if (wizard.advancedFlow() && !local->isHidden()) local->setChecked(true);
     QApplication::processEvents();
     QVERIFY(wizard.button(QWizard::NextButton)->isEnabled());
 }
@@ -837,16 +863,28 @@ void MultisigWizardTests::wizardTests()
         ~ContextReset() { node.setContext(nullptr); }
     } context_reset{m_node};
     hwi::UsbEnumerateSuppress suppress_usb;
+    gArgs.ForceSetArg("-signer", "internal");
 
     MultisigWizard wizard(m_node, /*wallet_controller=*/nullptr);
-    QCOMPARE(wizard.startId(), static_cast<int>(MultisigWizard::Page_Intro));
+    QCOMPARE(wizard.startId(), static_cast<int>(MultisigWizard::Page_Keys));
     wizard.show();
     QApplication::processEvents();
-    QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Intro));
+    QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Keys));
+    QCOMPARE(wizard.currentPage()->title(), QStringLiteral("Create a Recovery Vault"));
+    QCOMPARE(wizard.nextId(), static_cast<int>(MultisigWizard::Page_Backup));
+    QVERIFY(!wizard.findChild<QCheckBox*>("localSoftwareKeysRiskCheck")->isVisible());
+    const auto restore_buttons = wizard.findChildren<QPushButton*>("restoreFromMnemonicButton");
+    QVERIFY(std::any_of(restore_buttons.begin(), restore_buttons.end(), [](const QPushButton* button) {
+        return button->isVisible();
+    }));
+    QVERIFY(wizard.findChild<QPushButton*>("advancedVaultButton")->isVisible());
 
     wizard.setWalletName(QStringLiteral("Family"));
     QCOMPARE(wizard.localKeyCount(), MultisigWizard::kStagedVaultKeyCount);
     wizard.setLocalKeyCount(-1);
+    QVERIFY(wizard.advancedFlow());
+    wizard.restart();
+    QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Intro));
     QCOMPARE(wizard.localKeyCount(), 0);
     QVERIFY(wizard.keys().empty());
     wizard.setLocalKeyCount(MultisigWizard::kMaxLocalSoftwareKeys + 1);
@@ -952,15 +990,15 @@ void MultisigWizardTests::grabPages()
     const QString dir = QString::fromLocal8Bit(dest);
     QVERIFY(QDir().mkpath(dir));
 
+    for (const QString& stale : QDir(dir).entryList({QStringLiteral("*.png")}, QDir::Files)) {
+        const QString path = QDir(dir).filePath(stale);
+        QVERIFY2(QFile::remove(path), qPrintable(QStringLiteral("failed to remove stale shot ") + path));
+    }
     QStringList expected_files;
     for (const QString& name : kShotNames) {
         const QString filename = name + QStringLiteral(".png");
         expected_files << filename;
-        const QString path = QDir(dir).filePath(filename);
-        if (QFileInfo::exists(path)) {
-            QVERIFY2(QFile::remove(path), qPrintable(QStringLiteral("failed to remove stale shot ") + path));
-        }
-        QVERIFY(!QFileInfo::exists(path));
+        QVERIFY(!QFileInfo::exists(QDir(dir).filePath(filename)));
     }
     expected_files.sort();
 
@@ -983,519 +1021,471 @@ void MultisigWizardTests::grabPages()
     WalletController controller(client, style.get(), nullptr);
     QApplication::processEvents();
 
-    const AirKey family_key = MakeAirKey();
-    const AirKey heir_key = MakeAirKey();
-
-    // Capture the real File -> Create Vault journey before enabling the mock
-    // signer used by the advanced-policy screenshots below.
-    {
-        MultisigWizard wizard(m_node, &controller);
-        ShowSized(wizard);
-        QVERIFY(!wizard.advancedFlow());
-        QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Intro));
-        auto* name = wizard.findChild<QLineEdit*>("stagedWalletNameEdit");
-        QVERIFY(name);
-        name->setText(QStringLiteral("ShotStagedVault"));
-        Grab(wizard, dir, QStringLiteral("00-intro"));
-
-        wizard.next();
-        QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Keys));
-        QCOMPARE(wizard.localKeyCount(), 3);
-        QCOMPARE(static_cast<int>(wizard.keys().size()), 3);
-        auto* plan = wizard.findChild<QLabel*>("automaticKeyPlanLabel");
-        auto* roster = wizard.findChild<QListWidget*>("hardwareList");
-        auto* authority = wizard.findChild<QLabel*>("localSoftwareKeysWarningLabel");
-        auto* key_count = wizard.findChild<QLabel*>("vaultKeyCount");
-        auto* local_count = wizard.findChild<QSpinBox*>("localSoftwareKeyCountSpin");
-        auto* risk = wizard.findChild<QCheckBox*>("localSoftwareKeysRiskCheck");
-        auto* sidebar = wizard.findChild<QLabel*>("vaultPolicySummary");
-        QVERIFY(plan);
-        QVERIFY(roster);
-        QVERIFY(authority);
-        QVERIFY(key_count);
-        QVERIFY(local_count);
-        QVERIFY(risk);
-        QVERIFY(sidebar);
-        QVERIFY(plan->text().contains(QStringLiteral("4,320")));
-        QVERIFY(authority->text().contains(QStringLiteral("all three software"), Qt::CaseInsensitive));
-        QVERIFY(key_count->text().contains(QStringLiteral("0 hardware, 3 software"), Qt::CaseInsensitive));
-        QCOMPARE(roster->count(), 3);
-        QVERIFY(!local_count->isVisible());
-        QVERIFY(risk->isVisible());
-        QVERIFY(!risk->isChecked());
-        QVERIFY(sidebar->text().contains(QStringLiteral("30")));
-        QVERIFY(sidebar->text().contains(QStringLiteral("60")));
-        QVERIFY(!wizard.button(QWizard::NextButton)->isEnabled());
-        Grab(wizard, dir, QStringLiteral("02c-keys-staged-software"));
-
-        risk->setChecked(true);
-        QApplication::processEvents();
-        wizard.next();
-        AssertBackupPage(wizard, MultisigWizard::kThirtyDayVaultDelay, {}, MultisigWizard::kSixtyDayVaultDelay);
-        Grab(wizard, dir, QStringLiteral("04c-backup-staged"));
-        CompleteBackupPage(wizard);
-        wizard.next();
-        QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Verify));
-        auto* local_verify = wizard.findChild<QCheckBox*>("localOnlyVerifyCheck");
-        QVERIFY(local_verify);
-        QVERIFY(!local_verify->isHidden());
-        QVERIFY(!local_verify->isChecked());
-        QVERIFY(!wizard.button(QWizard::NextButton)->isEnabled());
-        Grab(wizard, dir, QStringLiteral("05c-verify-staged"));
-        CompleteVerification(wizard);
-        wizard.next();
-        QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Done));
-        Grab(wizard, dir, QStringLiteral("06c-ready-staged"));
-        wizard.close();
-    }
-
-    {
-        MultisigWizard wizard(m_node, &controller);
-        wizard.setWalletName(QStringLiteral("ShotOrdinaryWallet"));
-        wizard.setLocalKeyCount(1);
-        wizard.addAirgappedKey(family_key.fpr, family_key.path, family_key.xpub, "Coldcard (vault)");
-        wizard.rebuildKeyList();
-        wizard.setNRequired(2);
-        wizard.setOutputType(OutputType::BECH32);
-        ShowSized(wizard);
-        QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Intro));
-
-        wizard.next();
-        QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Template));
-        Grab(wizard, dir, QStringLiteral("00b-template"));
-        wizard.setVaultTemplate(MultisigWizard::VaultTemplate::Custom);
-        wizard.applyTemplate();
-        wizard.next();
-        QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Setup));
-        auto* type = wizard.findChild<QComboBox*>("scriptTypeCombo");
-        QVERIFY(type);
-        const int vault_idx = OutputTypeIndex(*type, OutputType::BECH32M);
-        const int p2wsh_idx = OutputTypeIndex(*type, OutputType::BECH32);
-        QVERIFY(vault_idx >= 0);
-        QVERIFY(p2wsh_idx >= 0);
-        QCOMPARE(type->currentData().toInt(), static_cast<int>(OutputType::BECH32));
-        const QString p2wsh_setup = VisibleText(wizard);
-        QVERIFY(p2wsh_setup.contains(QStringLiteral("Ordinary multisig")));
-        QVERIFY(p2wsh_setup.contains(QStringLiteral("no delayed recovery"), Qt::CaseInsensitive));
-        Grab(wizard, dir, QStringLiteral("01-setup-p2wsh"));
-
-        type->setCurrentIndex(vault_idx);
-        QApplication::processEvents();
-        QCOMPARE(type->currentData().toInt(), static_cast<int>(OutputType::BECH32M));
-        Grab(wizard, dir, QStringLiteral("01b-setup-taproot"));
-        type->setCurrentIndex(p2wsh_idx);
-
-        wizard.next();
-        QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Keys));
-        QCOMPARE(static_cast<int>(wizard.keys().size()), 2);
-        QCOMPARE(wizard.nActiveKeys(), 2);
-        auto* key_count = wizard.findChild<QLabel*>("vaultKeyCount");
-        auto* air_keys = wizard.findChild<QListWidget*>("airgappedList");
-        QVERIFY(key_count);
-        QVERIFY(air_keys);
-        QCOMPARE(air_keys->count(), 1);
-        QVERIFY(!air_keys->item(0)->text().contains(QStringLiteral("Heir")));
-        auto* local_count = wizard.findChild<QSpinBox*>("localSoftwareKeyCountSpin");
-        auto* local_warning = wizard.findChild<QLabel*>("localSoftwareKeysWarningLabel");
-        auto* local_risk = wizard.findChild<QCheckBox*>("localSoftwareKeysRiskCheck");
-        QVERIFY(local_count);
-        QVERIFY(local_warning);
-        QVERIFY(local_risk);
-        local_count->setValue(3);
-        QApplication::processEvents();
-        QCOMPARE(wizard.localKeyCount(), 3);
-        QVERIFY(local_warning->isVisible());
-        QVERIFY(local_warning->text().contains(QStringLiteral("not independent"), Qt::CaseInsensitive));
-        QVERIFY(local_risk->isVisible());
-        QVERIFY(!local_risk->isChecked());
-        QVERIFY(!wizard.button(QWizard::NextButton)->isEnabled());
-        Grab(wizard, dir, QStringLiteral("02-keys"));
-        local_count->setValue(1);
-        QApplication::processEvents();
-        QCOMPARE(wizard.localKeyCount(), 1);
-        wizard.back();
-        QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Setup));
-        type->setCurrentIndex(vault_idx);
-        QApplication::processEvents();
-        wizard.next();
-        QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Keys));
-        wizard.addAirgappedKey(heir_key.fpr, heir_key.path, heir_key.xpub, "Heir", /*recovery_only=*/true);
-        wizard.back();
-        QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Setup));
-        wizard.next();
-        QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Keys));
-        QApplication::processEvents();
-        QCOMPARE(static_cast<int>(wizard.keys().size()), 3);
-        QCOMPARE(wizard.nActiveKeys(), 2);
-        QVERIFY(wizard.keys().back().recovery_only);
-        QVERIFY(key_count->text().contains(QStringLiteral("2 active")));
-        QVERIFY(key_count->text().contains(QStringLiteral("1 recovery-only")));
-        QCOMPARE(air_keys->count(), 2);
-        QVERIFY(air_keys->item(air_keys->count() - 1)->text().contains(QStringLiteral("Heir")));
-        QVERIFY(air_keys->item(air_keys->count() - 1)->text().contains(QStringLiteral("recovery-only")));
-        Grab(wizard, dir, QStringLiteral("02b-keys-recovery-only"));
-
-        wizard.back();
-        QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Setup));
-        type->setCurrentIndex(p2wsh_idx);
-        QApplication::processEvents();
-        wizard.next();
-        wizard.next();
-        QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Threshold));
-        QCOMPARE(wizard.nActiveKeys(), 3);
-        auto* delay_kind = wizard.findChild<QComboBox*>("delayKindCombo");
-        auto* older = wizard.findChild<QSpinBox*>("fallbackOlderSpin");
-        auto* after = wizard.findChild<QSpinBox*>("fallbackAfterSpin");
-        QVERIFY(delay_kind);
-        QVERIFY(older);
-        QVERIFY(after);
-        QVERIFY(!delay_kind->isVisible());
-        QVERIFY(!older->isVisible());
-        QVERIFY(!after->isVisible());
-        const QString p2wsh_policy = VisibleText(wizard);
-        QVERIFY(p2wsh_policy.contains(QStringLiteral("ordinary m-of-n"), Qt::CaseInsensitive));
-        QVERIFY(p2wsh_policy.contains(QStringLiteral("no delayed recovery"), Qt::CaseInsensitive));
-        Grab(wizard, dir, QStringLiteral("03-policy-p2wsh"));
-
-        WalkTo(wizard, MultisigWizard::Page_Backup);
-        AssertBackupPage(wizard);
-        auto* backup_tabs = wizard.findChild<QTabWidget*>("backupTabs");
-        QVERIFY(backup_tabs);
-        QCOMPARE(backup_tabs->currentIndex(), 0);
-        QVERIFY(backup_tabs->tabText(0).contains(QStringLiteral("JSON")));
-        Grab(wizard, dir, QStringLiteral("04-backup"));
-        CompleteBackupPage(wizard);
-        wizard.next();
-        QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Verify));
-        auto* address = wizard.findChild<QLineEdit*>("verifyAddressEdit");
-        auto* qr = wizard.findChild<QRImageWidget*>("verifyQr");
-        auto* devices = wizard.findChild<QListWidget*>("verifyDeviceList");
-        auto* air = wizard.findChild<QCheckBox*>("airgapVerifyCheck");
-        QVERIFY(address);
-        QVERIFY(qr);
-        QVERIFY(devices);
-        QVERIFY(air);
-        QVERIFY(!address->text().isEmpty());
-        QVERIFY(qr->isVisible());
-        QVERIFY(GUIUtil::HasPixmap(qr));
-        QCOMPARE(devices->count(), 0);
-        QVERIFY(air->isVisible());
-        QVERIFY(!air->isChecked());
-        QVERIFY(!wizard.button(QWizard::NextButton)->isEnabled());
-        Grab(wizard, dir, QStringLiteral("05-verify"));
-        air->setChecked(true);
-        QApplication::processEvents();
-        QVERIFY(wizard.button(QWizard::NextButton)->isEnabled());
-        wizard.next();
-        QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Done));
-        const QString ordinary_done = VisibleText(*wizard.currentPage());
-        QVERIFY(ordinary_done.contains(QStringLiteral("ordinary"), Qt::CaseInsensitive));
-        QVERIFY(ordinary_done.contains(QStringLiteral("2 of 3")));
-        QVERIFY(ordinary_done.contains(QStringLiteral("no delayed recovery"), Qt::CaseInsensitive));
-        Grab(wizard, dir, QStringLiteral("06-done"));
-        wizard.close();
-    }
-
-    {
-        MultisigWizard wizard(m_node, &controller);
-        wizard.setWalletName(QStringLiteral("ShotAbsolutePreview"));
-        wizard.setLocalKeyCount(1);
-        wizard.addAirgappedKey(family_key.fpr, family_key.path, family_key.xpub, "Coldcard");
-        wizard.addAirgappedKey(heir_key.fpr, heir_key.path, heir_key.xpub, "Heir");
-        wizard.rebuildKeyList();
-        wizard.setNRequired(1);
-        wizard.setOutputType(OutputType::BECH32M);
-        wizard.setFallbackOlder(std::nullopt);
-        wizard.setFallbackAfter(840000);
-        ShowSized(wizard);
-        WalkTo(wizard, MultisigWizard::Page_Template);
-        wizard.setVaultTemplate(MultisigWizard::VaultTemplate::Custom);
-        wizard.applyTemplate();
-        WalkTo(wizard, MultisigWizard::Page_Threshold);
-        auto* delay_kind = wizard.findChild<QComboBox*>("delayKindCombo");
-        auto* older = wizard.findChild<QSpinBox*>("fallbackOlderSpin");
-        auto* after = wizard.findChild<QSpinBox*>("fallbackAfterSpin");
-        auto* req = wizard.findChild<QSpinBox*>("nrequiredSpin");
-        QVERIFY(delay_kind);
-        QVERIFY(older);
-        QVERIFY(after);
-        QVERIFY(req);
-        QCOMPARE(delay_kind->currentData().toInt(), 1);
-        QVERIFY(!older->isVisible());
-        QVERIFY(after->isVisible());
-        QCOMPARE(after->value(), 840000);
-        QCOMPARE(req->value(), 1);
-        QVERIFY(!wizard.fallbackOlder());
-        QVERIFY(wizard.fallbackAfter());
-        QCOMPARE(*wizard.fallbackAfter(), 840000u);
-        Grab(wizard, dir, QStringLiteral("03c-policy-after"));
-        wizard.close();
-    }
-
-    hwi::MockRegistration mock{hwi::MakeMockMasterFromHex(), ChainType::REGTEST};
-
-    {
-        MultisigWizard wizard(m_node, &controller);
-        ShowSized(wizard);
-        auto* name = wizard.findChild<QLineEdit*>("stagedWalletNameEdit");
-        QVERIFY(name);
-        name->setText(QStringLiteral("ShotStagedMixedVault"));
-        wizard.next();
-        QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Keys));
-        QCOMPARE(wizard.localKeyCount(), 2);
-        QCOMPARE(static_cast<int>(wizard.keys().size()), 3);
-        auto* plan = wizard.findChild<QLabel*>("automaticKeyPlanLabel");
-        auto* roster = wizard.findChild<QListWidget*>("hardwareList");
-        auto* authority = wizard.findChild<QLabel*>("localSoftwareKeysWarningLabel");
-        auto* key_count = wizard.findChild<QLabel*>("vaultKeyCount");
-        auto* risk = wizard.findChild<QCheckBox*>("localSoftwareKeysRiskCheck");
-        QVERIFY(plan);
-        QVERIFY(roster);
-        QVERIFY(authority);
-        QVERIFY(key_count);
-        QVERIFY(risk);
-        QVERIFY(plan->text().contains(QStringLiteral("4,320")));
-        QVERIFY(authority->text().contains(QStringLiteral("other two software"), Qt::CaseInsensitive));
-        QVERIFY(key_count->text().contains(QStringLiteral("1 hardware, 2 software"), Qt::CaseInsensitive));
-        QCOMPARE(roster->count(), 3);
-        int hardware_rows{0};
-        for (int row = 0; row < roster->count(); ++row) {
-            if (roster->item(row)->text().contains(QString::fromStdString(mock.Fingerprint()), Qt::CaseInsensitive)) ++hardware_rows;
-            QVERIFY(!(roster->item(row)->flags() & Qt::ItemIsUserCheckable));
+    struct PaletteGuard {
+        QPalette original{QApplication::palette()};
+        ~PaletteGuard() { QApplication::setPalette(original); }
+    } palette_guard;
+    const auto explicit_palette = [](bool dark) {
+        QPalette palette;
+        if (dark) {
+            palette.setColor(QPalette::Window, QColor{QStringLiteral("#202124")});
+            palette.setColor(QPalette::WindowText, QColor{QStringLiteral("#E8EAED")});
+            palette.setColor(QPalette::Base, QColor{QStringLiteral("#292A2D")});
+            palette.setColor(QPalette::AlternateBase, QColor{QStringLiteral("#35363A")});
+            palette.setColor(QPalette::ToolTipBase, QColor{QStringLiteral("#4A3A12")});
+            palette.setColor(QPalette::ToolTipText, QColor{QStringLiteral("#FFE8A3")});
+            palette.setColor(QPalette::Text, QColor{QStringLiteral("#E8EAED")});
+            palette.setColor(QPalette::Button, QColor{QStringLiteral("#35363A")});
+            palette.setColor(QPalette::ButtonText, QColor{QStringLiteral("#E8EAED")});
+            palette.setColor(QPalette::BrightText, QColor{QStringLiteral("#F28B82")});
+            palette.setColor(QPalette::Highlight, QColor{QStringLiteral("#8AB4F8")});
+            palette.setColor(QPalette::HighlightedText, QColor{QStringLiteral("#202124")});
+            palette.setColor(QPalette::PlaceholderText, QColor{QStringLiteral("#9AA0A6")});
+            palette.setColor(QPalette::Link, QColor{QStringLiteral("#8AB4F8")});
+            palette.setColor(QPalette::Mid, QColor{QStringLiteral("#5F6368")});
+            palette.setColor(QPalette::Dark, QColor{QStringLiteral("#171717")});
+            palette.setColor(QPalette::Light, QColor{QStringLiteral("#4A4D51")});
+            palette.setColor(QPalette::Shadow, QColor{QStringLiteral("#000000")});
+        } else {
+            palette.setColor(QPalette::Window, QColor{QStringLiteral("#F6F8FA")});
+            palette.setColor(QPalette::WindowText, QColor{QStringLiteral("#202124")});
+            palette.setColor(QPalette::Base, QColor{QStringLiteral("#FFFFFF")});
+            palette.setColor(QPalette::AlternateBase, QColor{QStringLiteral("#EDF1F5")});
+            palette.setColor(QPalette::ToolTipBase, QColor{QStringLiteral("#FFF1C2")});
+            palette.setColor(QPalette::ToolTipText, QColor{QStringLiteral("#3D2B00")});
+            palette.setColor(QPalette::Text, QColor{QStringLiteral("#202124")});
+            palette.setColor(QPalette::Button, QColor{QStringLiteral("#E8EAED")});
+            palette.setColor(QPalette::ButtonText, QColor{QStringLiteral("#202124")});
+            palette.setColor(QPalette::BrightText, QColor{QStringLiteral("#B3261E")});
+            palette.setColor(QPalette::Highlight, QColor{QStringLiteral("#0B57D0")});
+            palette.setColor(QPalette::HighlightedText, QColor{QStringLiteral("#FFFFFF")});
+            palette.setColor(QPalette::PlaceholderText, QColor{QStringLiteral("#6B7280")});
+            palette.setColor(QPalette::Link, QColor{QStringLiteral("#0B57D0")});
+            palette.setColor(QPalette::Mid, QColor{QStringLiteral("#9AA0A6")});
+            palette.setColor(QPalette::Dark, QColor{QStringLiteral("#BDC1C6")});
+            palette.setColor(QPalette::Light, QColor{QStringLiteral("#FFFFFF")});
+            palette.setColor(QPalette::Shadow, QColor{QStringLiteral("#5F6368")});
         }
-        QCOMPARE(hardware_rows, 1);
-        QVERIFY(!risk->isChecked());
-        Grab(wizard, dir, QStringLiteral("02d-keys-staged-hardware"));
-        wizard.close();
-    }
+        palette.setColor(QPalette::Disabled, QPalette::WindowText, palette.color(QPalette::PlaceholderText));
+        palette.setColor(QPalette::Disabled, QPalette::Text, palette.color(QPalette::PlaceholderText));
+        palette.setColor(QPalette::Disabled, QPalette::ButtonText, palette.color(QPalette::PlaceholderText));
+        return palette;
+    };
 
-    const AirKey mixed_air = MakeAirKey();
+    for (int theme_index = 0; theme_index < 2; ++theme_index) {
+        const bool dark = theme_index == 1;
+        const QString theme = dark ? QStringLiteral("dark") : QStringLiteral("light");
+        const QPalette palette = explicit_palette(dark);
+        QApplication::setPalette(palette);
+        QApplication::processEvents();
+        QCOMPARE(QApplication::palette().color(QPalette::Window), palette.color(QPalette::Window));
 
-    {
-        MultisigWizard wizard(m_node, &controller);
-        wizard.setWalletName(QStringLiteral("ShotMixedVault"));
-        wizard.setLocalKeyCount(1);
-        wizard.addAirgappedKey(mixed_air.fpr, mixed_air.path, mixed_air.xpub, "Coldcard");
-        wizard.addHardwareKey(mock.Fingerprint(), "Mock Trezor");
-        wizard.rebuildKeyList();
-        wizard.setNRequired(2);
-        wizard.setOutputType(OutputType::BECH32M);
-        wizard.setFallbackOlder(144);
-        wizard.setFallbackOlderOneKey(std::nullopt);
-        ShowSized(wizard);
-        WalkTo(wizard, MultisigWizard::Page_Template);
-        wizard.setVaultTemplate(MultisigWizard::VaultTemplate::Custom);
-        wizard.applyTemplate();
-        WalkTo(wizard, MultisigWizard::Page_Setup);
-        auto* type = wizard.findChild<QComboBox*>("scriptTypeCombo");
-        QVERIFY(type);
-        const int vault_idx = OutputTypeIndex(*type, OutputType::BECH32M);
-        QVERIFY(vault_idx >= 0);
-        type->setCurrentIndex(vault_idx);
-        wizard.next();
-        WalkTo(wizard, MultisigWizard::Page_Threshold);
-        auto* delay = wizard.findChild<QSpinBox*>("fallbackOlderSpin");
-        auto* delay_kind = wizard.findChild<QComboBox*>("delayKindCombo");
-        auto* after = wizard.findChild<QSpinBox*>("fallbackAfterSpin");
-        QVERIFY(delay);
-        QVERIFY(delay_kind);
-        QVERIFY(after);
-        delay->setValue(144);
-        QApplication::processEvents();
-        QCOMPARE(delay_kind->currentData().toInt(), 0);
-        QVERIFY(delay->isVisible());
-        QVERIFY(!after->isVisible());
-        QVERIFY(wizard.fallbackOlder());
-        QCOMPARE(*wizard.fallbackOlder(), 144u);
-        Grab(wizard, dir, QStringLiteral("03b-policy-taproot"));
-        WalkTo(wizard, MultisigWizard::Page_Backup);
-        AssertBackupPage(wizard, 144u);
-        auto* backup_tabs = wizard.findChild<QTabWidget*>("backupTabs");
-        auto* human_transcript = wizard.findChild<QPlainTextEdit*>("humanTranscriptEdit");
-        QVERIFY(backup_tabs);
-        QVERIFY(human_transcript);
-        backup_tabs->setCurrentIndex(1);
-        QApplication::processEvents();
-        QCOMPARE(backup_tabs->currentIndex(), 1);
-        QVERIFY(backup_tabs->tabText(1).contains(QStringLiteral("transcript"), Qt::CaseInsensitive));
-        QVERIFY(human_transcript->toPlainText().contains(QStringLiteral("Scrooge vault")));
-        Grab(wizard, dir, QStringLiteral("04b-backup-taproot"));
-        CompleteBackupPage(wizard);
-        wizard.next();
-        QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Verify));
-        auto* devices = wizard.findChild<QListWidget*>("verifyDeviceList");
-        auto* qr = wizard.findChild<QRImageWidget*>("verifyQr");
-        auto* show = wizard.findChild<QPushButton*>("showOnDeviceButton");
-        auto* status = wizard.findChild<QLabel*>("verifyStatusLabel");
-        auto* air = wizard.findChild<QCheckBox*>("airgapVerifyCheck");
-        QVERIFY(devices);
-        QVERIFY(qr);
-        QVERIFY(show);
-        QVERIFY(status);
-        QVERIFY(air);
-        QCOMPARE(devices->count(), 1);
-        QVERIFY(qr->isVisible());
-        QVERIFY(GUIUtil::HasPixmap(qr));
-        QVERIFY(!(devices->item(0)->flags() & Qt::ItemIsUserCheckable));
-        QVERIFY(!devices->item(0)->text().contains(QStringLiteral("verified"), Qt::CaseInsensitive));
-        QVERIFY(air->isVisible());
-        QVERIFY(!air->isChecked());
-        QVERIFY(!wizard.button(QWizard::NextButton)->isEnabled());
-        air->setChecked(true);
-        QApplication::processEvents();
-        QVERIFY(!wizard.button(QWizard::NextButton)->isEnabled());
-        air->setChecked(false);
-        devices->setCurrentRow(0);
-        show->click();
-        QApplication::processEvents();
-        QVERIFY(devices->item(0)->text().contains(QStringLiteral("verified"), Qt::CaseInsensitive));
-        QVERIFY(status->text().contains(QStringLiteral("matches this address"), Qt::CaseInsensitive));
-        QVERIFY(!air->isChecked());
-        QVERIFY(!wizard.button(QWizard::NextButton)->isEnabled());
-        Grab(wizard, dir, QStringLiteral("05b-verify-hardware"));
-        air->setChecked(true);
-        QApplication::processEvents();
-        QVERIFY(wizard.button(QWizard::NextButton)->isEnabled());
-        wizard.next();
-        QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Done));
-        const QString vault_done = VisibleText(*wizard.currentPage());
-        QVERIFY(vault_done.contains(QStringLiteral("all 3 active keys"), Qt::CaseInsensitive));
-        QVERIFY(vault_done.contains(QStringLiteral("2 of 3")));
-        Grab(wizard, dir, QStringLiteral("06b-done-taproot"));
-        wizard.close();
-    }
+        const auto capture = [&](QWidget& widget, const QString& state) {
+            QCOMPARE(widget.size(), QSize(900, 620));
+            QCOMPARE(widget.palette().color(QPalette::Window), palette.color(QPalette::Window));
+            Grab(widget, dir, theme + QLatin1Char('-') + state);
+        };
+        const auto capture_review = [&](int hardware_count, bool failure) {
+            MultisigWizard wizard(m_node, &controller);
+            ShowSized(wizard);
+            QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Keys));
+            QVERIFY(!wizard.advancedFlow());
+            auto* name = wizard.findChild<QLineEdit*>("stagedWalletNameEdit");
+            auto* authority = wizard.findChild<QLabel*>("fixedAuthorityLabel");
+            auto* discovery = wizard.findChild<QLabel*>("hardwareDiscoveryStatus");
+            auto* restore = wizard.findChild<QPushButton*>("restoreFromMnemonicButton");
+            auto* nav = wizard.findChild<QWidget*>("vaultStepNav");
+            QVERIFY(name);
+            QVERIFY(authority);
+            QVERIFY(discovery);
+            QVERIFY(restore);
+            QVERIFY(nav);
+            name->setText(QStringLiteral("Shot%1Review%2").arg(dark ? QStringLiteral("Dark") : QStringLiteral("Light")).arg(hardware_count));
+            QApplication::processEvents();
+            QVERIFY(!name->accessibleName().isEmpty());
+            QCOMPARE(nav->width(), 188);
+            QVERIFY(nav->isVisible());
+            QVERIFY(name->mapTo(wizard.currentPage(), QPoint{}).y() < authority->mapTo(wizard.currentPage(), QPoint{}).y());
+            QVERIFY(restore->mapTo(wizard.currentPage(), QPoint{0, restore->height()}).y() <= wizard.currentPage()->height());
+            if (failure) {
+                QCOMPARE(wizard.localKeyCount(), 0);
+                QVERIFY(discovery->text().contains(QStringLiteral("4 hardware wallets"), Qt::CaseInsensitive));
+                QVERIFY(discovery->text().contains(QStringLiteral("Disconnect extras"), Qt::CaseInsensitive));
+                QVERIFY(!wizard.button(QWizard::NextButton)->isEnabled());
+            } else {
+                QCOMPARE(wizard.localKeyCount(), MultisigWizard::kStagedVaultKeyCount - hardware_count);
+                QCOMPARE(static_cast<int>(wizard.keys().size()), MultisigWizard::kStagedVaultKeyCount);
+                QCOMPARE(VisibleText(wizard).count(QStringLiteral("Stored in this wallet on this computer")),
+                         MultisigWizard::kStagedVaultKeyCount - hardware_count);
+                QVERIFY(wizard.button(QWizard::NextButton)->isEnabled());
+            }
+            capture(wizard, failure ? QStringLiteral("review-too-many-failure")
+                                    : QStringLiteral("review-%1").arg(hardware_count));
+            wizard.close();
+        };
 
-    {
-        MultisigWizard wizard(m_node, &controller);
-        wizard.setWalletName(QStringLiteral("ShotOperationalVault"));
-        wizard.setLocalKeyCount(1);
-        wizard.addHardwareKey(mock.Fingerprint(), "Mock Trezor");
-        wizard.rebuildKeyList();
-        wizard.setNRequired(2);
-        wizard.setOutputType(OutputType::BECH32M);
-        wizard.setFallbackOlder(1);
-        wizard.show();
-        QApplication::processEvents();
-        WalkScroogeToDone(wizard, /*nrequired=*/2, /*delay_blocks=*/1);
-        QVERIFY2(wizard.createdWallet(), qPrintable(wizard.createError()));
-        WalletModel* model = wizard.createdWallet();
-        const auto dest = wizard.firstReceiveAddress();
-        QVERIFY(!!dest);
-        const CScript spk = GetScriptForDestination(*dest);
+        capture_review(/*hardware_count=*/0, /*failure=*/false);
+
+        QString restore_policy;
+        std::vector<SecureString> restore_phrases;
+        {
+            MultisigWizard wizard(m_node, &controller);
+            ShowSized(wizard);
+            auto* name = wizard.findChild<QLineEdit*>("stagedWalletNameEdit");
+            QVERIFY(name);
+            name->setText(QStringLiteral("Shot%1SoftwareVault").arg(dark ? QStringLiteral("Dark") : QStringLiteral("Light")));
+            QApplication::processEvents();
+            QVERIFY(wizard.button(QWizard::NextButton)->isEnabled());
+            wizard.next();
+            QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Backup));
+            QCOMPARE(wizard.currentPage()->title(), QStringLiteral("Secure Recovery"));
+            restore_policy = wizard.m_policy_package;
+            QCOMPARE(wizard.m_software_recovery.size(), size_t{3});
+            for (const auto& recovery : wizard.m_software_recovery) {
+                restore_phrases.emplace_back(recovery.mnemonic.begin(), recovery.mnemonic.end());
+            }
+            auto* print = wizard.findChild<QPushButton*>("printPolicyButton");
+            auto* ack = wizard.findChild<QCheckBox*>("backupAckCheck");
+            auto* print_status = wizard.findChild<QLabel*>("printPolicyStatus");
+            QVERIFY(print);
+            QVERIFY(ack);
+            QVERIFY(print_status);
+            QVERIFY(print->isVisible());
+            QVERIFY(print->isEnabled());
+            QTRY_VERIFY(print->isDefault());
+            QVERIFY(ack->isVisible());
+            QVERIFY(!ack->isEnabled());
+            QVERIFY(print->mapTo(wizard.currentPage(), QPoint{}).y() < ack->mapTo(wizard.currentPage(), QPoint{}).y());
+            QVERIFY(ack->mapTo(wizard.currentPage(), QPoint{0, ack->height()}).y() <= wizard.currentPage()->height());
+            capture(wizard, QStringLiteral("secure-recovery-before-print"));
+
+            CompleteBackupPage(wizard);
+            QVERIFY(ack->isChecked());
+            QVERIFY(ack->isEnabled());
+            QVERIFY(print_status->text().contains(QStringLiteral("validated"), Qt::CaseInsensitive));
+            QVERIFY(wizard.button(QWizard::NextButton)->isEnabled());
+            QVERIFY(qobject_cast<QPushButton*>(wizard.button(QWizard::NextButton))->isDefault());
+            QVERIFY(!print->isDefault());
+            QVERIFY(!wizard.button(QWizard::BackButton)->isVisible());
+            QVERIFY(!wizard.button(QWizard::CancelButton)->isVisible());
+            capture(wizard, QStringLiteral("secure-recovery-after-print"));
+
+            wizard.next();
+            QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Verify));
+            QVERIFY(wizard.createdWallet());
+            QCOMPARE(wizard.currentPage()->title(), QStringLiteral("Review Your First Address"));
+            auto* qr = wizard.findChild<QRImageWidget*>("verifyQr");
+            auto* address = wizard.findChild<QLineEdit*>("verifyAddressEdit");
+            auto* independent = wizard.findChild<QLabel*>("independentVerificationState");
+            auto* import_policy = wizard.findChild<QPushButton*>("verifyImportedPolicyButton");
+            QVERIFY(qr);
+            QVERIFY(address);
+            QVERIFY(independent);
+            QVERIFY(import_policy);
+            QVERIFY(qr->isVisible());
+            QCOMPARE(qr->size(), QSize(220, 220));
+            QVERIFY(!address->text().isEmpty());
+            QVERIFY(independent->text().contains(QStringLiteral("Not independently verified"), Qt::CaseInsensitive));
+            QCOMPARE(independent->backgroundRole(), QPalette::ToolTipBase);
+            QCOMPARE(independent->foregroundRole(), QPalette::ToolTipText);
+            QCOMPARE(independent->palette().color(independent->backgroundRole()), palette.color(QPalette::ToolTipBase));
+            QCOMPARE(independent->palette().color(independent->foregroundRole()), palette.color(QPalette::ToolTipText));
+            QVERIFY(import_policy->isVisible());
+            QVERIFY(qr->mapTo(wizard.currentPage(), QPoint{qr->width(), qr->height()}).y() <= wizard.currentPage()->height());
+            capture(wizard, QStringLiteral("confirm-review"));
+
+            wizard.next();
+            QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Done));
+            auto* summary = wizard.findChild<QLabel*>("doneSummaryLabel");
+            auto* policy_id = wizard.findChild<QLineEdit*>("readyPolicyId");
+            auto* receive = wizard.findChild<QPushButton*>("receiveTestPaymentButton");
+            auto* done = qobject_cast<QPushButton*>(wizard.button(QWizard::FinishButton));
+            QVERIFY(summary);
+            QVERIFY(policy_id);
+            QVERIFY(receive);
+            QVERIFY(done);
+            QVERIFY(summary->text().contains(QStringLiteral("Vault created"), Qt::CaseInsensitive));
+            QVERIFY(!policy_id->text().isEmpty());
+            QVERIFY(!policy_id->accessibleName().isEmpty());
+            QVERIFY(!receive->accessibleName().isEmpty());
+            QTRY_VERIFY(receive->isDefault());
+            QVERIFY(!done->isDefault());
+            QVERIFY(!wizard.button(QWizard::BackButton)->isVisible());
+            QVERIFY(!wizard.button(QWizard::CancelButton)->isVisible());
+            QVERIFY(receive->mapTo(wizard.currentPage(), QPoint{0, receive->height()}).y() <= wizard.currentPage()->height());
+            capture(wizard, QStringLiteral("ready"));
+            wizard.close();
+        }
+
+        auto mock_a = std::make_unique<hwi::MockRegistration>(
+            hwi::MakeMockMasterFromHex(), ChainType::REGTEST);
+        capture_review(/*hardware_count=*/1, /*failure=*/false);
+        auto mock_b = std::make_unique<hwi::MockRegistration>(
+            hwi::MakeMockMasterFromHex("101112131415161718191a1b1c1d1e1f"), ChainType::REGTEST);
+        capture_review(/*hardware_count=*/2, /*failure=*/false);
+        auto mock_c = std::make_unique<hwi::MockRegistration>(
+            hwi::MakeMockMasterFromHex("202122232425262728292a2b2c2d2e2f"), ChainType::REGTEST);
+        capture_review(/*hardware_count=*/3, /*failure=*/false);
+        {
+            hwi::MockRegistration mock_d{
+                hwi::MakeMockMasterFromHex("303132333435363738393a3b3c3d3e3f"), ChainType::REGTEST};
+            capture_review(/*hardware_count=*/4, /*failure=*/true);
+        }
+        mock_c.reset();
+        mock_b.reset();
+
+        WalletModel* operational_model{nullptr};
+        std::optional<CTxDestination> operational_dest;
+        {
+            MultisigWizard wizard(m_node, &controller);
+            ShowSized(wizard);
+            auto* name = wizard.findChild<QLineEdit*>("stagedWalletNameEdit");
+            QVERIFY(name);
+            name->setText(QStringLiteral("Shot%1HardwareVault").arg(dark ? QStringLiteral("Dark") : QStringLiteral("Light")));
+            QApplication::processEvents();
+            QCOMPARE(wizard.localKeyCount(), 2);
+            QVERIFY(wizard.button(QWizard::NextButton)->isEnabled());
+            wizard.next();
+            QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Backup));
+            CompleteBackupPage(wizard);
+            wizard.next();
+            QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Verify));
+            QCOMPARE(wizard.currentPage()->title(), QStringLiteral("Verify Your First Address"));
+            auto* devices = wizard.findChild<QListWidget*>("verifyDeviceList");
+            auto* show = wizard.findChild<QPushButton*>("showOnDeviceButton");
+            auto* independent = wizard.findChild<QLabel*>("independentVerificationState");
+            auto* qr = wizard.findChild<QRImageWidget*>("verifyQr");
+            QVERIFY(devices);
+            QVERIFY(show);
+            QVERIFY(independent);
+            QVERIFY(qr);
+            QCOMPARE(devices->count(), 1);
+            QVERIFY(show->isVisible());
+            QVERIFY(independent->text().contains(QStringLiteral("Waiting"), Qt::CaseInsensitive));
+            QVERIFY(!wizard.button(QWizard::NextButton)->isEnabled());
+            QVERIFY(devices->mapTo(wizard.currentPage(), QPoint{0, devices->height()}).y() <= wizard.currentPage()->height());
+            capture(wizard, QStringLiteral("confirm-verify"));
+            CompleteVerification(wizard);
+            wizard.next();
+            QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Done));
+            operational_model = wizard.createdWallet();
+            QVERIFY(operational_model);
+            const auto dest_result = wizard.firstReceiveAddress();
+            QVERIFY(dest_result);
+            operational_dest = *dest_result;
+            wizard.close();
+        }
+        QVERIFY(operational_model);
+        QVERIFY(operational_dest);
+
+        const int funding_index = theme_index;
         CMutableTransaction fund = test.CreateValidMempoolTransaction(
-            test.m_coinbase_txns.front(), 0, /*input_height=*/1, test.coinbaseKey, spk, 10 * COIN, /*submit=*/false);
+            test.m_coinbase_txns.at(funding_index), /*input_vout=*/0, /*input_height=*/funding_index + 1,
+            test.coinbaseKey, GetScriptForDestination(*operational_dest), 10 * COIN, /*submit=*/false);
         test.CreateAndProcessBlock({fund}, GetScriptForRawPubKey(test.coinbaseKey.GetPubKey()));
         test.m_node.validation_signals->SyncWithValidationInterfaceQueue();
-        model->pollBalanceChanged();
+        operational_model->pollBalanceChanged();
+        QApplication::processEvents();
 
-        OverviewPage overview(style.get());
-        overview.setClientModel(&client);
-        overview.setWalletModel(model);
-        const auto balances = model->wallet().getBalances();
-        QVERIFY(balances.is_vault);
-        QCOMPARE(balances.vault_awaiting, 0);
-        overview.setBalance(balances);
-        overview.resize(780, 560);
-        overview.show();
-        QApplication::processEvents();
-        auto* recoverable = overview.findChild<QLabel*>("labelVaultRecoverable");
-        auto* awaiting = overview.findChild<QLabel*>("labelVaultAwaiting");
-        auto* awaiting_text = overview.findChild<QLabel*>("labelVaultAwaitingText");
-        auto* note = overview.findChild<QLabel*>("labelVaultPathNote");
-        QVERIFY(recoverable);
-        QVERIFY(awaiting);
-        QVERIFY(awaiting_text);
-        QVERIFY(note);
-        QVERIFY(recoverable->isVisible());
-        QVERIFY(awaiting->isHidden());
-        QVERIFY(note->text().contains(QStringLiteral("same bitcoin"), Qt::CaseInsensitive));
-        QVERIFY(note->text().contains(QStringLiteral("not extra"), Qt::CaseInsensitive));
+        {
+            OverviewPage overview(style.get());
+            overview.setClientModel(&client);
+            overview.setWalletModel(operational_model);
+            overview.setBalance(operational_model->wallet().getBalances());
+            overview.resize(900, 620);
+            overview.show();
+            QApplication::processEvents();
+            auto* total = overview.findChild<QLabel*>("labelTotal");
+            auto* immediate = overview.findChild<QLabel*>("vaultImmediateStatusLabel");
+            auto* first = overview.findChild<QLabel*>("vaultRecoveryStatusLabel");
+            auto* final = overview.findChild<QLabel*>("vaultFinalStatusLabel");
+            auto* repeated_balance = overview.findChild<QLabel*>("labelBalance");
+            QVERIFY(total);
+            QVERIFY(immediate);
+            QVERIFY(first);
+            QVERIFY(final);
+            QVERIFY(repeated_balance);
+            QVERIFY(total->isVisible());
+            QVERIFY(repeated_balance->isHidden());
+            QVERIFY(immediate->isVisible());
+            QVERIFY(first->isVisible());
+            QVERIFY(final->isVisible());
+            QVERIFY(!overview.findChild<QLabel*>("labelVaultPathNote"));
+            QVERIFY(final->mapTo(&overview, QPoint{0, final->height()}).y() <= overview.height());
+            capture(overview, QStringLiteral("overview"));
+        }
 
-        auto earliest = balances;
-        earliest.vault_awaiting = COIN;
-        earliest.vault_blocks_remaining = 1;
-        overview.setBalance(earliest);
-        QApplication::processEvents();
-        QVERIFY(awaiting->isVisible());
-        QVERIFY(awaiting->text().contains(QStringLiteral("1 block")));
-        QVERIFY(!awaiting->text().contains(QStringLiteral("1 blocks")));
-        const QString maturity_copy = awaiting_text->text() + QLatin1Char(' ') + awaiting_text->toolTip() +
-                                      QLatin1Char(' ') + awaiting->text() + QLatin1Char(' ') + note->text();
-        QVERIFY(maturity_copy.contains(QStringLiteral("earliest"), Qt::CaseInsensitive));
-        QVERIFY(maturity_copy.contains(QStringLiteral("each coin"), Qt::CaseInsensitive) ||
-                maturity_copy.contains(QStringLiteral("per coin"), Qt::CaseInsensitive));
-        overview.setBalance(balances);
-        QApplication::processEvents();
-        Grab(overview, dir, QStringLiteral("07-overview-vault"));
+        {
+            SendCoinsDialog send(style.get());
+            send.setClientModel(&client);
+            send.setModel(operational_model);
+            send.resize(900, 620);
+            send.show();
+            QApplication::processEvents();
+            auto* normal = send.findChild<QRadioButton*>("vaultNormalModeButton");
+            auto* recovery = send.findChild<QRadioButton*>("vaultRecoveryModeButton");
+            auto* stages = send.findChild<QComboBox*>("vaultRecoveryStageCombo");
+            auto* fee = send.findChild<QWidget*>("frameFee");
+            auto* review = send.findChild<QPushButton*>("sendButton");
+            auto* lost = send.findChild<QLabel*>("vaultLostSignerLabel");
+            QVERIFY(normal);
+            QVERIFY(recovery);
+            QVERIFY(stages);
+            QVERIFY(fee);
+            QVERIFY(review);
+            QVERIFY(lost);
+            QVERIFY(normal->isChecked());
+            QVERIFY(!recovery->isChecked());
+            QCOMPARE(stages->count(), 3);
+            QCOMPARE(stages->currentIndex(), 0);
+            QVERIFY(!stages->isEnabled());
+            QCOMPARE(review->text(), QStringLiteral("Review Transaction"));
+            QVERIFY(!normal->accessibleName().isEmpty());
+            QVERIFY(!recovery->accessibleName().isEmpty());
+            QVERIFY(!review->accessibleName().isEmpty());
+            QVERIFY(recovery->mapTo(&send, QPoint{}).y() < fee->mapTo(&send, QPoint{}).y());
+            QVERIFY(review->mapTo(&send, QPoint{0, review->height()}).y() <= send.height());
+            capture(send, QStringLiteral("send-normal"));
 
-        SendCoinsDialog send(style.get());
-        send.setClientModel(&client);
-        send.setModel(model);
-        send.resize(780, 620);
-        send.show();
-        QApplication::processEvents();
-        auto* recovery = send.findChild<QCheckBox*>("vaultRecoveryCheck");
-        auto* fee = send.findChild<QWidget*>("frameFee");
-        auto* balance_name = send.findChild<QLabel*>("labelBalanceName");
-        QVERIFY(recovery);
-        QVERIFY(fee);
-        QVERIFY(balance_name);
-        QVERIFY(recovery->isVisible());
-        QVERIFY(!recovery->isChecked());
-        QVERIFY(recovery->text().contains(QStringLiteral("1 block")));
-        QVERIFY(!recovery->text().contains(QStringLiteral("1 blocks")));
-        QVERIFY(recovery->mapTo(&send, QPoint{}).y() < fee->mapTo(&send, QPoint{}).y());
-        QVERIFY(balance_name->text().contains(QStringLiteral("Spendable now")));
-        Grab(send, dir, QStringLiteral("08-send-vault"));
+            recovery->setChecked(true);
+            stages->setCurrentIndex(1);
+            QApplication::processEvents();
+            QVERIFY(recovery->isChecked());
+            QCOMPARE(stages->currentData().toUInt(), MultisigWizard::kThirtyDayVaultDelay);
+            QVERIFY(!review->isEnabled());
+            capture(send, QStringLiteral("send-first-recovery"));
 
-        recovery->setChecked(true);
-        QApplication::processEvents();
-        QVERIFY(recovery->isChecked());
-        QVERIFY(balance_name->text().contains(QStringLiteral("Recoverable now")));
-        const QString recovery_copy = VisibleText(send);
-        QVERIFY(recovery_copy.contains(QStringLiteral("same"), Qt::CaseInsensitive));
-        QVERIFY(recovery_copy.contains(QStringLiteral("coin"), Qt::CaseInsensitive) ||
-                recovery_copy.contains(QStringLiteral("bitcoin"), Qt::CaseInsensitive));
-        Grab(send, dir, QStringLiteral("08b-send-recovery"));
+            stages->setCurrentIndex(2);
+            QApplication::processEvents();
+            QCOMPARE(stages->currentData().toUInt(), MultisigWizard::kSixtyDayVaultDelay);
+            QVERIFY(!review->isEnabled());
+            capture(send, QStringLiteral("send-final-recovery"));
 
-        recovery->setChecked(false);
-        model->wallet().setLostSigner(mock.Fingerprint(), true);
-        model->updateTransaction();
-        model->pollBalanceChanged();
-        QApplication::processEvents();
-        auto* open_send_button = send.findChild<QPushButton*>("sendButton");
-        auto* open_lost = send.findChild<QLabel*>("vaultLostSignerLabel");
-        QVERIFY(open_send_button);
-        QVERIFY(open_lost);
-        QVERIFY(!open_send_button->isEnabled());
-        QVERIFY(open_lost->isVisible());
+            normal->setChecked(true);
+            const std::string lost_fingerprint{mock_a->Fingerprint()};
+            mock_a.reset();
+            operational_model->wallet().setLostSigner(lost_fingerprint, true);
+            operational_model->updateTransaction();
+            operational_model->pollBalanceChanged();
+            QApplication::processEvents();
+            QVERIFY(normal->isChecked());
+            QVERIFY(lost->isVisible());
+            QVERIFY(!lost->accessibleDescription().isEmpty());
+            QVERIFY(!review->isEnabled());
+            QVERIFY(lost->text().contains(QString::fromStdString(lost_fingerprint), Qt::CaseInsensitive));
+            QVERIFY(lost->mapTo(&send, QPoint{0, lost->height()}).y() <= send.height());
+            capture(send, QStringLiteral("send-lost-signer"));
+            operational_model->wallet().setLostSigner(lost_fingerprint, false);
+        }
 
-        SendCoinsDialog send_lost(style.get());
-        send_lost.setClientModel(&client);
-        send_lost.setModel(model);
-        send_lost.resize(780, 620);
-        send_lost.show();
-        QApplication::processEvents();
-        auto* lost_recovery = send_lost.findChild<QCheckBox*>("vaultRecoveryCheck");
-        auto* lost_name = send_lost.findChild<QLabel*>("labelBalanceName");
-        auto* lost_balance = send_lost.findChild<QLabel*>("labelBalance");
-        auto* lost_button = send_lost.findChild<QPushButton*>("sendButton");
-        auto* lost_banner = send_lost.findChild<QLabel*>("vaultLostSignerLabel");
-        QVERIFY(lost_recovery);
-        QVERIFY(lost_name);
-        QVERIFY(lost_balance);
-        QVERIFY(lost_button);
-        QVERIFY(lost_banner);
-        QVERIFY(!lost_recovery->isChecked());
-        QVERIFY(lost_name->text().contains(QStringLiteral("Spendable now")));
-        QVERIFY(lost_balance->text().startsWith(QStringLiteral("0.00000000")));
-        QVERIFY(lost_button->text().contains(QStringLiteral("Sign on device")));
-        QVERIFY(!lost_button->isEnabled());
-        QVERIFY(lost_banner->isVisible());
-        QVERIFY(lost_banner->text().contains(QStringLiteral("mock"), Qt::CaseInsensitive));
-        QVERIFY(lost_banner->text().contains(QString::fromStdString(mock.Fingerprint()), Qt::CaseInsensitive));
-        Grab(send_lost, dir, QStringLiteral("08c-send-lost-signer"));
-        wizard.close();
+        {
+            MultisigWizard restore_host(m_node, &controller);
+            ShowSized(restore_host);
+            auto* host_name = restore_host.findChild<QLineEdit*>("stagedWalletNameEdit");
+            auto* restore_button = restore_host.findChild<QPushButton*>("restoreFromMnemonicButton");
+            QVERIFY(host_name);
+            QVERIFY(restore_button);
+            host_name->setText(QStringLiteral("Shot%1RestoreHost").arg(dark ? QStringLiteral("Dark") : QStringLiteral("Light")));
+            bool restore_ok{true};
+            QStringList restore_errors;
+            QTimer::singleShot(0, this, [&] {
+                QWizard* dialog{nullptr};
+                for (QWidget* widget : QApplication::topLevelWidgets()) {
+                    auto* candidate = qobject_cast<QWizard*>(widget);
+                    if (candidate && candidate != &restore_host && candidate->isVisible()) {
+                        dialog = candidate;
+                        break;
+                    }
+                }
+                if (!dialog) {
+                    restore_ok = false;
+                    restore_errors << QStringLiteral("restore dialog did not open");
+                    return;
+                }
+                const auto check = [&](bool condition, const QString& message) {
+                    if (!condition) {
+                        restore_ok = false;
+                        restore_errors << message;
+                    }
+                };
+                dialog->resize(900, 620);
+                QApplication::processEvents();
+                auto* name = dialog->findChild<QLineEdit*>("restoreWalletNameEdit");
+                auto* policy = dialog->findChild<QPlainTextEdit*>("restorePolicyEdit");
+                auto* policy_summary = dialog->findChild<QLabel*>("restorePolicySummary");
+                auto* policy_status = dialog->findChild<QLabel*>("restorePolicyStatus");
+                auto* phrase = dialog->findChild<QWidget*>("restoreMnemonicEdit");
+                auto* add = dialog->findChild<QPushButton*>("restoreAddKeyButton");
+                auto* keys = dialog->findChild<QListWidget*>("restoreAcceptedKeys");
+                auto* key_status = dialog->findChild<QLabel*>("restoreKeyStatus");
+                auto* key_authority = dialog->findChild<QLabel*>("restoreIncrementalAuthority");
+                auto* authority = dialog->findChild<QLabel*>("restoreAuthoritySummary");
+                check(name && policy && policy_summary && policy_status && phrase && add && keys && key_status && key_authority && authority,
+                      QStringLiteral("restore controls missing"));
+                if (name && policy && policy_summary && policy_status && phrase && add && keys && key_status && key_authority && authority) {
+                    name->setText(QStringLiteral("Shot%1RestoredPreview").arg(dark ? QStringLiteral("Dark") : QStringLiteral("Light")));
+                    policy->setPlainText(restore_policy);
+                    dialog->next();
+                    check(dialog->currentId() == 1, QStringLiteral("policy preflight did not advance"));
+                    dialog->back();
+                    check(dialog->currentId() == 0, QStringLiteral("restore policy page unavailable"));
+                    check(!name->accessibleName().isEmpty(), QStringLiteral("restore name lacks accessibility name"));
+                    check(policy_summary->text().contains(QStringLiteral("Policy ID")), QStringLiteral("policy summary missing ID"));
+                    check(policy_status->text().contains(QStringLiteral("preflight"), Qt::CaseInsensitive), QStringLiteral("policy status missing preflight"));
+                    capture(*dialog, QStringLiteral("restore-policy"));
+
+                    dialog->next();
+                    check(dialog->currentId() == 1, QStringLiteral("recovery-key page unavailable"));
+                    dialog->next();
+                    check(dialog->currentId() == 2, QStringLiteral("public-only authority page unavailable"));
+                    check(authority->text().contains(QStringLiteral("Public policy only"), Qt::CaseInsensitive), QStringLiteral("public-only authority missing"));
+                    capture(*dialog, QStringLiteral("restore-public-only"));
+                    dialog->back();
+
+                    QTest::keyClicks(phrase, QStringLiteral("not a valid recovery phrase"));
+                    add->click();
+                    QTest::keyClick(phrase, Qt::Key_Delete);
+                    QApplication::processEvents();
+                    check(keys->count() == 0, QStringLiteral("invalid phrase was accepted"));
+                    check(!key_status->text().isEmpty(), QStringLiteral("invalid phrase has no error"));
+                    check(!phrase->accessibleName().isEmpty(), QStringLiteral("recovery phrase lacks accessibility name"));
+                    check(phrase->property("secureMnemonicBacking").toBool(), QStringLiteral("recovery phrase is not held in secure backing memory"));
+                    check(qobject_cast<QLineEdit*>(phrase) == nullptr, QStringLiteral("recovery phrase must not use QString/QLineEdit backing storage"));
+                    check(add->mapTo(dialog->currentPage(), QPoint{0, add->height()}).y() <= dialog->currentPage()->height(),
+                          QStringLiteral("restore key action is clipped"));
+                    capture(*dialog, QStringLiteral("restore-error"));
+
+                    for (size_t phrase_index = 0; phrase_index < restore_phrases.size(); ++phrase_index) {
+                        const SecureString& value = restore_phrases[phrase_index];
+                        QTest::keyClicks(phrase, QString::fromUtf8(value.data(), static_cast<qsizetype>(value.size())));
+                        add->click();
+                        QApplication::processEvents();
+                        check(keys->count() == static_cast<int>(phrase_index + 1),
+                              QStringLiteral("recovery key %1 did not match").arg(phrase_index + 1));
+                        check(!key_authority->text().isEmpty(), QStringLiteral("incremental authority missing"));
+                        capture(*dialog, QStringLiteral("restore-key-%1").arg(phrase_index + 1));
+                    }
+                    dialog->next();
+                    check(dialog->currentId() == 2, QStringLiteral("recovered-authority page unavailable"));
+                    dialog->next();
+                    check(dialog->currentId() == 3, QStringLiteral("rescan page unavailable"));
+                    auto* rescan_summary = dialog->findChild<QLabel*>("restoreRescanSummary");
+                    check(rescan_summary && rescan_summary->text().contains(QStringLiteral("policy ID")),
+                          QStringLiteral("rescan summary missing policy ID"));
+                    capture(*dialog, QStringLiteral("restore-rescan"));
+                }
+                dialog->reject();
+            });
+            restore_button->click();
+            QVERIFY2(restore_ok, qPrintable(restore_errors.join(QStringLiteral("; "))));
+            restore_host.close();
+        }
+
+        for (SecureString& phrase : restore_phrases) {
+            if (!phrase.empty()) memory_cleanse(phrase.data(), phrase.size());
+        }
+        std::vector<SecureString>{}.swap(restore_phrases);
+        mock_a.reset();
     }
 
     const QStringList actual_files = QDir(dir).entryList(QStringList{QStringLiteral("*.png")}, QDir::Files, QDir::Name);
@@ -1628,58 +1618,90 @@ void MultisigWizardTests::createWalletWithController()
 
         staged.show();
         QApplication::processEvents();
+        QCOMPARE(staged.currentId(), static_cast<int>(MultisigWizard::Page_Keys));
         auto* name = staged.findChild<QLineEdit*>("stagedWalletNameEdit");
         QVERIFY(name);
         name->setText(QStringLiteral("DefaultStagedVault"));
-        staged.next();
-        QCOMPARE(staged.currentId(), static_cast<int>(MultisigWizard::Page_Keys));
         QVERIFY(!staged.advancedFlow());
         QCOMPARE(staged.localKeyCount(), 3);
         QCOMPARE(static_cast<int>(staged.keys().size()), 3);
         QCOMPARE(staged.nActiveKeys(), 3);
 
-        auto* plan = staged.findChild<QLabel*>("automaticKeyPlanLabel");
-        auto* roster = staged.findChild<QListWidget*>("hardwareList");
-        auto* authority = staged.findChild<QLabel*>("localSoftwareKeysWarningLabel");
-        auto* key_count = staged.findChild<QLabel*>("vaultKeyCount");
+        auto* authority = staged.findChild<QLabel*>("fixedAuthorityLabel");
+        auto* technical = staged.findChild<QLabel*>("fixedTechnicalDetails");
         auto* local_count = staged.findChild<QSpinBox*>("localSoftwareKeyCountSpin");
         auto* risk = staged.findChild<QCheckBox*>("localSoftwareKeysRiskCheck");
-        QVERIFY(plan);
-        QVERIFY(roster);
         QVERIFY(authority);
-        QVERIFY(key_count);
+        QVERIFY(technical);
         QVERIFY(local_count);
         QVERIFY(risk);
-        QVERIFY(plan->text().contains(QStringLiteral("4,320")));
-        QVERIFY(plan->text().contains(QStringLiteral("8,640")));
-        QVERIFY(authority->text().contains(QStringLiteral("all three software"), Qt::CaseInsensitive));
-        QVERIFY(authority->text().contains(QStringLiteral("spend immediately"), Qt::CaseInsensitive));
-        QVERIFY(key_count->text().contains(QStringLiteral("0 hardware, 3 software"), Qt::CaseInsensitive));
-        QCOMPARE(roster->count(), 3);
-        for (int row = 0; row < roster->count(); ++row) {
-            QVERIFY(roster->item(row)->text().contains(QStringLiteral("Software key"), Qt::CaseInsensitive));
-            QVERIFY(!(roster->item(row)->flags() & Qt::ItemIsUserCheckable));
-        }
+        QCOMPARE(authority->text(), QStringLiteral("This computer holds all three keys. This wallet or its recovery kit can spend immediately."));
+        QVERIFY(technical->text().contains(QStringLiteral("4,320")));
+        QVERIFY(technical->text().contains(QStringLiteral("8,640")));
+        const QString review_text = VisibleText(staged);
+        QCOMPARE(review_text.count(QStringLiteral("Software key")), 3);
+        QCOMPARE(review_text.count(QStringLiteral("Stored in this wallet on this computer")), 3);
         QVERIFY(!local_count->isVisible());
-        QVERIFY(risk->isVisible());
+        QVERIFY(!risk->isVisible());
         QVERIFY(!risk->isChecked());
-        QVERIFY(!staged.button(QWizard::NextButton)->isEnabled());
-
-        risk->setChecked(true);
-        QApplication::processEvents();
         QVERIFY(staged.button(QWizard::NextButton)->isEnabled());
         staged.next();
         QCOMPARE(staged.currentId(), static_cast<int>(MultisigWizard::Page_Backup));
         QCOMPARE(created_spy.count(), 0);
+        QVERIFY(!staged.createdWallet());
+        QVERIFY(controller.listWalletDir().count("DefaultStagedVault") == 0);
         AssertBackupPage(staged, MultisigWizard::kThirtyDayVaultDelay, {}, MultisigWizard::kSixtyDayVaultDelay);
         CompleteBackupPage(staged);
         staged.next();
         QCOMPARE(staged.currentId(), static_cast<int>(MultisigWizard::Page_Verify));
+        QVERIFY(staged.createdWallet());
+        QCOMPARE(QString::fromStdString(staged.createdWallet()->wallet().getWalletName()), QStringLiteral("DefaultStagedVault"));
+        QTRY_VERIFY_WITH_TIMEOUT(controller.listWalletDir().count("DefaultStagedVault") == 1, 5000);
         auto* local_verify = staged.findChild<QCheckBox*>("localOnlyVerifyCheck");
         QVERIFY(local_verify);
-        QVERIFY(!local_verify->isHidden());
+        QVERIFY(local_verify->isHidden());
         QVERIFY(!local_verify->isChecked());
-        QVERIFY(!staged.button(QWizard::NextButton)->isEnabled());
+        QVERIFY(staged.button(QWizard::NextButton)->isEnabled());
+        auto* verified_address = staged.findChild<QLineEdit*>("verifyAddressEdit");
+        auto* import_policy = staged.findChild<QPushButton*>("verifyImportedPolicyButton");
+        auto* verify_status = staged.findChild<QLabel*>("verifyStatusLabel");
+        auto* independent_state = staged.findChild<QLabel*>("independentVerificationState");
+        QVERIFY(verified_address);
+        QVERIFY(import_policy);
+        QVERIFY(verify_status);
+        QVERIFY(independent_state);
+
+        // The optional independent-policy action must derive index zero from
+        // the imported public descriptor and compare that result with the
+        // address on screen; matching policy metadata alone is insufficient.
+        QTemporaryDir independent_dir;
+        QVERIFY(independent_dir.isValid());
+        const QString independent_path = independent_dir.filePath(QStringLiteral("independent-policy.json"));
+        QFile independent_file{independent_path};
+        QVERIFY2(independent_file.open(QIODevice::WriteOnly), qPrintable(independent_file.errorString()));
+        const QByteArray independent_bytes{staged.m_policy_package.toUtf8()};
+        QCOMPARE(independent_file.write(independent_bytes), static_cast<qint64>(independent_bytes.size()));
+        independent_file.close();
+        const auto choose_independent_policy = [independent_path] {
+            QTimer::singleShot(0, [independent_path] {
+                for (QWidget* widget : QApplication::topLevelWidgets()) {
+                    if (auto* dialog = qobject_cast<QFileDialog*>(widget)) {
+                        dialog->selectFile(independent_path);
+                        QMetaObject::invokeMethod(dialog, "accept", Qt::DirectConnection);
+                    }
+                }
+            });
+        };
+        const QString first_address = verified_address->text();
+        verified_address->setText(QStringLiteral("different-address"));
+        choose_independent_policy();
+        import_policy->click();
+        QVERIFY(verify_status->text().contains(QStringLiteral("does not derive"), Qt::CaseInsensitive));
+        QVERIFY(independent_state->text().contains(QStringLiteral("Not independently verified"), Qt::CaseInsensitive));
+        verified_address->setText(first_address);
+        choose_independent_policy();
+        import_policy->click();
+        QVERIFY(independent_state->text().contains(QStringLiteral("Independently verified"), Qt::CaseInsensitive));
         CompleteVerification(staged);
         staged.next();
         QCOMPARE(staged.currentId(), static_cast<int>(MultisigWizard::Page_Done));
@@ -1692,11 +1714,17 @@ void MultisigWizardTests::createWalletWithController()
         QCOMPARE(status.recovery_stages[0].older, std::optional<uint32_t>{MultisigWizard::kThirtyDayVaultDelay});
         QCOMPARE(status.recovery_stages[1].nrequired, 1);
         QCOMPARE(status.recovery_stages[1].older, std::optional<uint32_t>{MultisigWizard::kSixtyDayVaultDelay});
+        auto* receive_test = staged.findChild<QPushButton*>("receiveTestPaymentButton");
+        QVERIFY(receive_test);
+        QSignalSpy receive_spy(&staged, &MultisigWizard::receiveRequested);
+        receive_test->click();
+        QCOMPARE(receive_spy.count(), 1);
+        QCOMPARE(receive_spy.first().at(1).toString(), verified_address->text());
         staged.close();
     }
 
     // The default suggestion must not collide with any loaded wallet. An
-    // explicitly entered loaded-wallet name is rejected on the Intro page,
+    // explicitly entered loaded-wallet name is rejected on Review Vault,
     // before key generation or any persistent create attempt. Correcting the
     // name lets the user continue normally.
     {
@@ -1717,10 +1745,11 @@ void MultisigWizardTests::createWalletWithController()
 
         name->setText(QString::fromStdString(loaded_name));
         QApplication::processEvents();
-        QVERIFY(name_error->text().contains(QStringLiteral("already exists"), Qt::CaseInsensitive));
+        QTRY_VERIFY_WITH_TIMEOUT(
+            name_error->text().contains(QStringLiteral("already exists"), Qt::CaseInsensitive), 5000);
         QVERIFY(!collision.button(QWizard::NextButton)->isEnabled());
         collision.next();
-        QCOMPARE(collision.currentId(), static_cast<int>(MultisigWizard::Page_Intro));
+        QCOMPARE(collision.currentId(), static_cast<int>(MultisigWizard::Page_Keys));
         QCOMPARE(created_spy.count(), 0);
         QVERIFY(!collision.createdWallet());
         QCOMPARE(controller.listWalletDir().size(), wallets_before.size());
@@ -1730,7 +1759,7 @@ void MultisigWizardTests::createWalletWithController()
         QVERIFY(name_error->text().isEmpty());
         QVERIFY(collision.button(QWizard::NextButton)->isEnabled());
         collision.next();
-        QCOMPARE(collision.currentId(), static_cast<int>(MultisigWizard::Page_Keys));
+        QCOMPARE(collision.currentId(), static_cast<int>(MultisigWizard::Page_Backup));
         QCOMPARE(created_spy.count(), 0);
         QVERIFY(!collision.createdWallet());
         collision.close();
@@ -1770,7 +1799,7 @@ void MultisigWizardTests::createWalletWithController()
         QVERIFY(name_error->text().contains(QStringLiteral("already exists"), Qt::CaseInsensitive));
         QVERIFY(!collision.button(QWizard::NextButton)->isEnabled());
         collision.next();
-        QCOMPARE(collision.currentId(), static_cast<int>(MultisigWizard::Page_Intro));
+        QCOMPARE(collision.currentId(), static_cast<int>(MultisigWizard::Page_Keys));
         QCOMPARE(created_spy.count(), 0);
         QVERIFY(!collision.createdWallet());
         const auto wallets_after = controller.listWalletDir();
@@ -1785,13 +1814,13 @@ void MultisigWizardTests::createWalletWithController()
         QVERIFY(name_error->text().isEmpty());
         QVERIFY(collision.button(QWizard::NextButton)->isEnabled());
         collision.next();
-        QCOMPARE(collision.currentId(), static_cast<int>(MultisigWizard::Page_Keys));
+        QCOMPARE(collision.currentId(), static_cast<int>(MultisigWizard::Page_Backup));
         QCOMPARE(created_spy.count(), 0);
         QVERIFY(!collision.createdWallet());
         collision.close();
     }
 
-    // Recheck the name at the commit boundary as well as on Intro. Another
+    // Recheck the name at the commit boundary as well as on Review Vault. Another
     // process may create the wallet after the user entered an available name
     // but before Create wallet is clicked.
     {
@@ -1807,16 +1836,8 @@ void MultisigWizardTests::createWalletWithController()
         QApplication::processEvents();
         QVERIFY(name_error->text().isEmpty());
         collision.next();
-        QCOMPARE(collision.currentId(), static_cast<int>(MultisigWizard::Page_Keys));
-
-        auto* risk = collision.findChild<QCheckBox*>("localSoftwareKeysRiskCheck");
-        QVERIFY(risk);
-        risk->setChecked(true);
-        QApplication::processEvents();
-        auto* create = collision.button(QWizard::CommitButton);
-        QVERIFY(create);
-        QVERIFY(create->isVisible());
-        QVERIFY(create->isEnabled());
+        QCOMPARE(collision.currentId(), static_cast<int>(MultisigWizard::Page_Backup));
+        QVERIFY(!collision.createdWallet());
 
         std::vector<bilingual_str> warnings;
         auto reserved = m_node.walletLoader().createWallet(
@@ -1833,6 +1854,7 @@ void MultisigWizardTests::createWalletWithController()
         QVERIFY(wallets_before.count(race_name.toStdString()) == 1);
         QVERIFY(wallets_before.at(race_name.toStdString()).first);
 
+        CompleteBackupPage(collision);
         QString warning_text;
         QTimer::singleShot(0, [&warning_text] {
             for (QWidget* widget : QApplication::topLevelWidgets()) {
@@ -1842,14 +1864,15 @@ void MultisigWizardTests::createWalletWithController()
                 }
             }
         });
-        create->click();
+        collision.next();
         QTRY_VERIFY_WITH_TIMEOUT(
-            collision.currentId() == static_cast<int>(MultisigWizard::Page_Intro), 5000);
+            collision.currentId() == static_cast<int>(MultisigWizard::Page_Keys), 5000);
         QVERIFY(warning_text.contains(QStringLiteral("already exists"), Qt::CaseInsensitive));
         QCOMPARE(created_spy.count(), 0);
         QVERIFY(!collision.createdWallet());
         QCOMPARE(name->text(), race_name);
-        QVERIFY(name_error->text().contains(QStringLiteral("already exists"), Qt::CaseInsensitive));
+        QTRY_VERIFY_WITH_TIMEOUT(
+            name_error->text().contains(QStringLiteral("already exists"), Qt::CaseInsensitive), 5000);
         QVERIFY(!collision.button(QWizard::NextButton)->isEnabled());
 
         const auto wallets_after = controller.listWalletDir();
@@ -1874,30 +1897,17 @@ void MultisigWizardTests::createWalletWithController()
         auto* name = staged.findChild<QLineEdit*>("stagedWalletNameEdit");
         QVERIFY(name);
         name->setText(QStringLiteral("DefaultMixedPreview"));
-        staged.next();
         QCOMPARE(staged.currentId(), static_cast<int>(MultisigWizard::Page_Keys));
         QCOMPARE(staged.localKeyCount(), 2);
         QCOMPARE(static_cast<int>(staged.keys().size()), 3);
         QCOMPARE(staged.nActiveKeys(), 3);
-        auto* plan = staged.findChild<QLabel*>("automaticKeyPlanLabel");
-        auto* roster = staged.findChild<QListWidget*>("hardwareList");
-        auto* authority = staged.findChild<QLabel*>("localSoftwareKeysWarningLabel");
-        auto* key_count = staged.findChild<QLabel*>("vaultKeyCount");
-        QVERIFY(plan);
-        QVERIFY(roster);
+        auto* authority = staged.findChild<QLabel*>("fixedAuthorityLabel");
         QVERIFY(authority);
-        QVERIFY(key_count);
-        QVERIFY(plan->text().contains(QStringLiteral("4,320")));
-        QVERIFY(authority->text().contains(QStringLiteral("other two software"), Qt::CaseInsensitive));
-        QVERIFY(authority->text().contains(QStringLiteral("30 days"), Qt::CaseInsensitive));
-        QVERIFY(key_count->text().contains(QStringLiteral("1 hardware, 2 software"), Qt::CaseInsensitive));
-        QCOMPARE(roster->count(), 3);
-        int hardware_rows{0};
-        for (int row = 0; row < roster->count(); ++row) {
-            if (roster->item(row)->text().contains(QString::fromStdString(mock.Fingerprint()), Qt::CaseInsensitive)) ++hardware_rows;
-            QVERIFY(!(roster->item(row)->flags() & Qt::ItemIsUserCheckable));
-        }
-        QCOMPARE(hardware_rows, 1);
+        QCOMPARE(authority->text(), QStringLiteral("This computer holds two keys. Together they can recover after about 30 days; the hardware wallet is also required to spend immediately."));
+        const QString one_hardware_text{VisibleText(staged)};
+        QVERIFY(one_hardware_text.contains(QString::fromStdString(mock.Fingerprint()), Qt::CaseInsensitive));
+        QCOMPARE(one_hardware_text.count(QStringLiteral("Stored in this wallet on this computer")), 2);
+        QVERIFY(staged.button(QWizard::NextButton)->isEnabled());
         staged.close();
     }
 
@@ -1910,28 +1920,18 @@ void MultisigWizardTests::createWalletWithController()
         auto* name = staged.findChild<QLineEdit*>("stagedWalletNameEdit");
         QVERIFY(name);
         name->setText(QStringLiteral("DefaultTwoHardwarePreview"));
-        staged.next();
         QCOMPARE(staged.currentId(), static_cast<int>(MultisigWizard::Page_Keys));
         QCOMPARE(staged.localKeyCount(), 1);
         QCOMPARE(static_cast<int>(staged.keys().size()), 3);
-        auto* authority = staged.findChild<QLabel*>("localSoftwareKeysWarningLabel");
-        auto* key_count = staged.findChild<QLabel*>("vaultKeyCount");
-        auto* roster = staged.findChild<QListWidget*>("hardwareList");
+        auto* authority = staged.findChild<QLabel*>("fixedAuthorityLabel");
         auto* risk = staged.findChild<QCheckBox*>("localSoftwareKeysRiskCheck");
         QVERIFY(authority);
-        QVERIFY(key_count);
-        QVERIFY(roster);
         QVERIFY(risk);
-        QVERIFY(authority->text().contains(QStringLiteral("one software key"), Qt::CaseInsensitive));
-        QVERIFY(authority->text().contains(QStringLiteral("60 days"), Qt::CaseInsensitive));
-        QVERIFY(key_count->text().contains(QStringLiteral("2 hardware, 1 software"), Qt::CaseInsensitive));
-        QCOMPARE(roster->count(), 3);
-        for (int row = 0; row < roster->count(); ++row) {
-            QVERIFY(!(roster->item(row)->flags() & Qt::ItemIsUserCheckable));
-        }
-        QVERIFY(risk->isEnabled());
+        QCOMPARE(authority->text(), QStringLiteral("This computer holds one key. It can recover alone after about 60 days."));
+        QCOMPARE(VisibleText(staged).count(QStringLiteral("Stored in this wallet on this computer")), 1);
+        QVERIFY(!risk->isVisible());
         QVERIFY(!risk->isChecked());
-        QVERIFY(!staged.button(QWizard::NextButton)->isEnabled());
+        QVERIFY(staged.button(QWizard::NextButton)->isEnabled());
         staged.close();
     }
 
@@ -1944,29 +1944,17 @@ void MultisigWizardTests::createWalletWithController()
         auto* name = staged.findChild<QLineEdit*>("stagedWalletNameEdit");
         QVERIFY(name);
         name->setText(QStringLiteral("DefaultHardwareOnlyPreview"));
-        staged.next();
         QCOMPARE(staged.currentId(), static_cast<int>(MultisigWizard::Page_Keys));
         QCOMPARE(staged.localKeyCount(), 0);
         QCOMPARE(static_cast<int>(staged.keys().size()), 3);
-        auto* authority = staged.findChild<QLabel*>("localSoftwareKeysWarningLabel");
-        auto* key_count = staged.findChild<QLabel*>("vaultKeyCount");
-        auto* roster = staged.findChild<QListWidget*>("hardwareList");
+        auto* authority = staged.findChild<QLabel*>("fixedAuthorityLabel");
         auto* risk = staged.findChild<QCheckBox*>("localSoftwareKeysRiskCheck");
         QVERIFY(authority);
-        QVERIFY(key_count);
-        QVERIFY(roster);
         QVERIFY(risk);
-        QVERIFY(authority->text().contains(QStringLiteral("All three slots use hardware"), Qt::CaseInsensitive));
-        QVERIFY(authority->text().contains(QStringLiteral("any one device"), Qt::CaseInsensitive));
-        QVERIFY(key_count->text().contains(QStringLiteral("3 hardware, 0 software"), Qt::CaseInsensitive));
-        QCOMPARE(roster->count(), 3);
-        for (int row = 0; row < roster->count(); ++row) {
-            QVERIFY(!(roster->item(row)->flags() & Qt::ItemIsUserCheckable));
-        }
-        QVERIFY(risk->isEnabled());
-        QVERIFY(risk->text().contains(QStringLiteral("any one device"), Qt::CaseInsensitive));
+        QCOMPARE(authority->text(), QStringLiteral("No private keys are stored on this computer. Any two devices can recover after about 30 days; any one can recover after about 60 days."));
+        QVERIFY(!risk->isVisible());
         QVERIFY(!risk->isChecked());
-        QVERIFY(!staged.button(QWizard::NextButton)->isEnabled());
+        QVERIFY(staged.button(QWizard::NextButton)->isEnabled());
         staged.close();
     }
 
@@ -1983,16 +1971,14 @@ void MultisigWizardTests::createWalletWithController()
         {
             hwi::MockRegistration mock_d{
                 hwi::MakeMockMasterFromHex("303132333435363738393a3b3c3d3e3f"), ChainType::REGTEST};
-            staged.next();
+            staged.findChild<QPushButton*>("refreshDevicesButton")->click();
+            QApplication::processEvents();
             QCOMPARE(staged.currentId(), static_cast<int>(MultisigWizard::Page_Keys));
             QCOMPARE(staged.localKeyCount(), 0);
-            auto* authority = staged.findChild<QLabel*>("localSoftwareKeysWarningLabel");
-            auto* risk = staged.findChild<QCheckBox*>("localSoftwareKeysRiskCheck");
-            QVERIFY(authority);
-            QVERIFY(risk);
-            QVERIFY(authority->text().contains(QStringLiteral("4 hardware wallets"), Qt::CaseInsensitive));
-            QVERIFY(authority->text().contains(QStringLiteral("Disconnect extras"), Qt::CaseInsensitive));
-            QVERIFY(!risk->isEnabled());
+            auto* discovery = staged.findChild<QLabel*>("hardwareDiscoveryStatus");
+            QVERIFY(discovery);
+            QVERIFY(discovery->text().contains(QStringLiteral("4 hardware wallets"), Qt::CaseInsensitive));
+            QVERIFY(discovery->text().contains(QStringLiteral("Disconnect extras"), Qt::CaseInsensitive));
             QVERIFY(!staged.button(QWizard::NextButton)->isEnabled());
             QVERIFY(!staged.createdWallet());
             staged.next();
@@ -2001,22 +1987,15 @@ void MultisigWizardTests::createWalletWithController()
         }
 
         auto* refresh = staged.findChild<QPushButton*>("refreshDevicesButton");
-        auto* authority = staged.findChild<QLabel*>("localSoftwareKeysWarningLabel");
-        auto* roster = staged.findChild<QListWidget*>("hardwareList");
-        auto* risk = staged.findChild<QCheckBox*>("localSoftwareKeysRiskCheck");
+        auto* authority = staged.findChild<QLabel*>("fixedAuthorityLabel");
         QVERIFY(refresh);
         QVERIFY(authority);
-        QVERIFY(roster);
-        QVERIFY(risk);
         refresh->click();
         QApplication::processEvents();
         QCOMPARE(staged.localKeyCount(), 0);
         QCOMPARE(static_cast<int>(staged.keys().size()), 3);
-        QCOMPARE(roster->count(), 3);
-        QVERIFY(authority->text().contains(QStringLiteral("All three slots use hardware"), Qt::CaseInsensitive));
-        QVERIFY(risk->isEnabled());
-        QVERIFY(!risk->isChecked());
-        QVERIFY(!staged.button(QWizard::NextButton)->isEnabled());
+        QCOMPARE(authority->text(), QStringLiteral("No private keys are stored on this computer. Any two devices can recover after about 30 days; any one can recover after about 60 days."));
+        QVERIFY(staged.button(QWizard::NextButton)->isEnabled());
         QVERIFY(!staged.createdWallet());
         staged.close();
     }
@@ -2049,11 +2028,10 @@ void MultisigWizardTests::createWalletWithController()
     SendCoinsDialog send(style.get());
     send.setClientModel(&client);
     send.setModel(wizard.createdWallet());
-    auto* recovery = send.findChild<QCheckBox*>("vaultRecoveryCheck");
+    auto* recovery = send.findChild<QRadioButton*>("vaultRecoveryModeButton");
     QVERIFY(recovery);
     QVERIFY(!recovery->isHidden());
-    QVERIFY(recovery->text().contains(QStringLiteral("1 block")));
-    QVERIFY(!recovery->text().contains(QStringLiteral("1 blocks")));
+    QCOMPARE(recovery->text(), QStringLiteral("Recover Funds"));
     QVERIFY(!recovery->isChecked());
     recovery->setChecked(true);
     QApplication::processEvents();
@@ -2228,7 +2206,13 @@ void MultisigWizardTests::mnemonicPrintBackup()
         const QString kit_html = wizard.privateRecoveryKitHtml();
         QVERIFY(!kit_html.isEmpty());
         QVERIFY(kit_html.contains(policy_json.toHtmlEscaped()));
-        QCOMPARE(static_cast<int>(kit_html.count(QStringLiteral("<div class=\"page"))), 6);
+        const auto qr_parts = wallet::EncodeVaultPolicyQrParts(policy_json.toStdString());
+        QVERIFY(qr_parts);
+        const int qr_pages = (static_cast<int>(qr_parts->size()) + 1) / 2;
+        QCOMPARE(static_cast<int>(kit_html.count(QStringLiteral("<div class=\"page"))), 6 + qr_pages);
+        for (const std::string& part : *qr_parts) {
+            QVERIFY(kit_html.contains(QString::fromStdString(part).toHtmlEscaped()));
+        }
         QTextDocument kit_document;
         kit_document.setHtml(kit_html);
         const QString kit_text = kit_document.toPlainText().simplified();
@@ -2283,7 +2267,78 @@ void MultisigWizardTests::mnemonicPrintBackup()
         hardware_only.m_wallet_name = wizard.m_wallet_name;
         hardware_only.m_policy_package = wizard.m_policy_package;
         hardware_only.m_local_key_count = 0;
-        QVERIFY(hardware_only.privateRecoveryKitHtml().isEmpty());
+        const QString hardware_only_html = hardware_only.privateRecoveryKitHtml();
+        QVERIFY(!hardware_only_html.isEmpty());
+        QCOMPARE(static_cast<int>(hardware_only_html.count(QStringLiteral("<div class=\"page"))), 3 + qr_pages);
+        QTextDocument hardware_only_document;
+        hardware_only_document.setHtml(hardware_only_html);
+        const QString hardware_only_text = hardware_only_document.toPlainText().simplified();
+        QVERIFY(hardware_only_text.contains(QStringLiteral("complete public policy but no private keys"), Qt::CaseInsensitive));
+        QVERIFY(hardware_only_text.contains(QStringLiteral("Reconnect the exact hardware wallets"), Qt::CaseInsensitive));
+        QVERIFY(!hardware_only_text.contains(QStringLiteral("24-word mnemonic"), Qt::CaseInsensitive));
+
+        // A failure before a secure temporary file can be created must leave
+        // the candidate uncommitted and the acknowledgment unusable. Point
+        // Qt's temp root at an isolated directory whose managed subpath is a
+        // regular file, so no global/user temp state is disturbed.
+        {
+            QTemporaryDir isolated_temp;
+            QVERIFY(isolated_temp.isValid());
+            struct TempEnvironmentGuard {
+                bool existed{qEnvironmentVariableIsSet("TMPDIR")};
+                QByteArray value{qgetenv("TMPDIR")};
+                ~TempEnvironmentGuard()
+                {
+                    if (existed) {
+                        qputenv("TMPDIR", value);
+                    } else {
+                        qunsetenv("TMPDIR");
+                    }
+                }
+            } temp_environment_guard;
+            QVERIFY(qputenv("TMPDIR", isolated_temp.path().toUtf8()));
+            QCOMPARE(QDir::cleanPath(QDir::tempPath()), QDir::cleanPath(isolated_temp.path()));
+            QFile blocker{isolated_temp.filePath(QStringLiteral("bitcoin-core-vault-recovery"))};
+            QVERIFY2(blocker.open(QIODevice::WriteOnly), qPrintable(blocker.errorString()));
+            blocker.close();
+            QString disk_warning;
+            QTimer::singleShot(0, [&disk_warning] {
+                for (QWidget* widget : QApplication::topLevelWidgets()) {
+                    if (auto* box = qobject_cast<QMessageBox*>(widget); box && box->isVisible()) {
+                        disk_warning = box->text();
+                        box->accept();
+                    }
+                }
+            });
+            print->click();
+            QVERIFY(disk_warning.contains(QStringLiteral("owner-only recovery-print directory"), Qt::CaseInsensitive));
+            QVERIFY(!ack->isEnabled());
+            QVERIFY(!ack->isChecked());
+            QVERIFY(!wizard.button(QWizard::NextButton)->isEnabled());
+            QVERIFY(!wizard.createdWallet());
+        }
+
+        // Corrupting the in-memory public identity after candidate creation
+        // exercises the private-kit rendering/re-derivation refusal. The
+        // failed output is synchronously removed and cannot unlock Continue.
+        const std::string valid_xpub{wizard.m_software_recovery.front().xpub};
+        wizard.m_software_recovery.front().xpub += "-corrupt";
+        QString render_warning;
+        QTimer::singleShot(0, [&render_warning] {
+            for (QWidget* widget : QApplication::topLevelWidgets()) {
+                if (auto* box = qobject_cast<QMessageBox*>(widget); box && box->isVisible()) {
+                    render_warning = box->text();
+                    box->accept();
+                }
+            }
+        });
+        print->click();
+        wizard.m_software_recovery.front().xpub = valid_xpub;
+        QVERIFY(render_warning.contains(QStringLiteral("could not be validated"), Qt::CaseInsensitive));
+        QVERIFY(!ack->isEnabled());
+        QVERIFY(!ack->isChecked());
+        QVERIFY(!wizard.button(QWizard::NextButton)->isEnabled());
+        QVERIFY(!wizard.createdWallet());
 
         struct UrlHandlerGuard {
             ~UrlHandlerGuard() { QDesktopServices::unsetUrlHandler(QStringLiteral("file")); }
@@ -2393,9 +2448,8 @@ void MultisigWizardTests::mnemonicPrintBackup()
         for (const auto& recovery : wizard.m_software_recovery) {
             QVERIFY(!public_text.contains(QString::fromUtf8(recovery.mnemonic.data(), static_cast<qsizetype>(recovery.mnemonic.size()))));
         }
-        const auto first_address = wizard.firstReceiveAddress();
-        QVERIFY(first_address);
-        source_address = QString::fromStdString(EncodeDestination(*first_address));
+        QVERIFY(!wizard.createdWallet());
+        QVERIFY(!wizard.firstReceiveAddress());
 
         // Continue owns checked cleanup. Replacing the active PDF with a
         // directory makes deletion fail deterministically; the wizard must
@@ -2424,19 +2478,207 @@ void MultisigWizardTests::mnemonicPrintBackup()
         QCOMPARE(wizard.currentId(), static_cast<int>(MultisigWizard::Page_Verify));
         QCOMPARE(m_opened_recovery_count, 4);
         QVERIFY(!QFileInfo::exists(private_pdf));
+        const auto first_address = wizard.firstReceiveAddress();
+        QVERIFY(first_address);
+        source_address = QString::fromStdString(EncodeDestination(*first_address));
         wizard.hide();
     }
     QVERIFY2(!QFileInfo::exists(private_pdf), qPrintable(QStringLiteral("temporary private PDF survived wizard destruction: ") + private_pdf));
+
+    // Closing/destroying a pre-commit wizard is a cancellation boundary: its
+    // sole private PDF disappears, its candidate secrets are cleansed by the
+    // owner, and the selected wallet name remains immediately reusable.
+    QString cancelled_pdf;
+    const QString cancelled_name{QStringLiteral("CancelledRecoveryCandidate")};
+    {
+        MultisigWizard cancelled(m_node, &controller);
+        cancelled.setWalletName(cancelled_name);
+        QVERIFY2(cancelled.createWallet(), qPrintable(cancelled.createError()));
+        cancelled.setStartId(MultisigWizard::Page_Backup);
+        ShowSized(cancelled);
+        AssertBackupPage(cancelled, MultisigWizard::kThirtyDayVaultDelay, {},
+                         MultisigWizard::kSixtyDayVaultDelay, false);
+        struct UrlHandlerGuard {
+            ~UrlHandlerGuard() { QDesktopServices::unsetUrlHandler(QStringLiteral("file")); }
+        } handler_guard;
+        QDesktopServices::setUrlHandler(QStringLiteral("file"), this, "captureRecoveryUrl");
+        m_opened_recovery_url.clear();
+        m_opened_recovery_count = 0;
+        auto* cancelled_print = cancelled.findChild<QPushButton*>("printPolicyButton");
+        QVERIFY(cancelled_print);
+        cancelled_print->click();
+        QTRY_COMPARE_WITH_TIMEOUT(m_opened_recovery_count, 1, 5000);
+        cancelled_pdf = m_opened_recovery_url.toLocalFile();
+        QVERIFY(QFileInfo::exists(cancelled_pdf));
+        QVERIFY(!cancelled.createdWallet());
+        QVERIFY(controller.listWalletDir().count(cancelled_name.toStdString()) == 0);
+        cancelled.close();
+    }
+    QTRY_VERIFY_WITH_TIMEOUT(!QFileInfo::exists(cancelled_pdf), 5000);
+    QVERIFY(controller.listWalletDir().count(cancelled_name.toStdString()) == 0);
+    {
+        MultisigWizard reused(m_node, &controller);
+        reused.setWalletName(cancelled_name);
+        QVERIFY2(reused.createWallet(), qPrintable(reused.createError()));
+        QVERIFY(!reused.createdWallet());
+        QVERIFY(controller.listWalletDir().count(cancelled_name.toStdString()) == 0);
+    }
+
+    // A PDF whose owner crashed is eligible for stale cleanup, but cleanup is
+    // a fail-closed boundary: neither a failed removal nor a remover that lies
+    // about success may permit a second managed private copy. Once the same
+    // crashed-owner artifact is actually removed, one fresh kit may be made.
+    {
+        QTemporaryDir isolated_temp;
+        QVERIFY(isolated_temp.isValid());
+        struct TempEnvironmentGuard {
+            bool existed{qEnvironmentVariableIsSet("TMPDIR")};
+            QByteArray value{qgetenv("TMPDIR")};
+            ~TempEnvironmentGuard()
+            {
+                if (existed) {
+                    qputenv("TMPDIR", value);
+                } else {
+                    qunsetenv("TMPDIR");
+                }
+            }
+        } temp_environment_guard;
+        QVERIFY(qputenv("TMPDIR", isolated_temp.path().toUtf8()));
+        QCOMPARE(QDir::cleanPath(QDir::tempPath()), QDir::cleanPath(isolated_temp.path()));
+
+        const QString private_dir_path{isolated_temp.filePath(QStringLiteral("bitcoin-core-vault-recovery"))};
+        QVERIFY(QDir{}.mkpath(private_dir_path));
+        QVERIFY(QFile::setPermissions(private_dir_path, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner));
+        const QString stale_pdf{QDir{private_dir_path}.filePath(QStringLiteral("complete-recovery-crashed.pdf"))};
+        const QString stale_lock_path{stale_pdf + QStringLiteral(".lock")};
+        QFile stale_file{stale_pdf};
+        QVERIFY2(stale_file.open(QIODevice::WriteOnly), qPrintable(stale_file.errorString()));
+        QCOMPARE(stale_file.write("%PDF-crashed-owner\n"), qint64{19});
+        stale_file.close();
+
+        const auto write_crashed_owner_lock = [&] {
+            QLockFile live_owner{stale_lock_path};
+            live_owner.setStaleLockTime(0);
+            if (!live_owner.tryLock()) return false;
+            QFile live_lock{stale_lock_path};
+            if (!live_lock.open(QIODevice::ReadOnly)) {
+                live_owner.unlock();
+                return false;
+            }
+            QByteArray contents{live_lock.readAll()};
+            live_lock.close();
+            live_owner.unlock();
+            const qsizetype first_newline{contents.indexOf('\n')};
+            if (first_newline <= 0) return false;
+            contents.replace(0, first_newline, QByteArrayLiteral("99999999"));
+            QFile crashed_lock{stale_lock_path};
+            if (!crashed_lock.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
+            const bool written{crashed_lock.write(contents) == contents.size()};
+            crashed_lock.close();
+            return written;
+        };
+        QVERIFY(write_crashed_owner_lock());
+
+        QString minted_pdf;
+        {
+            MultisigWizard stale_cleanup(m_node, &controller);
+            stale_cleanup.setWalletName(QStringLiteral("CrashedOwnerRecoveryCandidate"));
+            QVERIFY2(stale_cleanup.createWallet(), qPrintable(stale_cleanup.createError()));
+            stale_cleanup.setStartId(MultisigWizard::Page_Backup);
+            ShowSized(stale_cleanup);
+            AssertBackupPage(stale_cleanup, MultisigWizard::kThirtyDayVaultDelay, {},
+                             MultisigWizard::kSixtyDayVaultDelay, false);
+            auto* print = stale_cleanup.findChild<QPushButton*>("printPolicyButton");
+            auto* print_status = stale_cleanup.findChild<QLabel*>("printPolicyStatus");
+            auto* ack = stale_cleanup.findChild<QCheckBox*>("backupAckCheck");
+            QVERIFY(print);
+            QVERIFY(print_status);
+            QVERIFY(ack);
+
+            struct UrlHandlerGuard {
+                ~UrlHandlerGuard() { QDesktopServices::unsetUrlHandler(QStringLiteral("file")); }
+            } handler_guard;
+            QDesktopServices::setUrlHandler(QStringLiteral("file"), this, "captureRecoveryUrl");
+            m_opened_recovery_url.clear();
+            m_opened_recovery_count = 0;
+
+            int removal_calls{0};
+            QString attempted_path;
+            stale_cleanup.m_private_print_remover = [&](const QString& path) {
+                attempted_path = path;
+                ++removal_calls;
+                return removal_calls != 1; // Second attempt reports success without removing.
+            };
+            const auto click_and_capture_warning = [&] {
+                QString warning;
+                QTimer::singleShot(0, [&warning] {
+                    for (QWidget* widget : QApplication::topLevelWidgets()) {
+                        if (auto* box = qobject_cast<QMessageBox*>(widget); box && box->isVisible()) {
+                            warning = box->text();
+                            box->accept();
+                        }
+                    }
+                });
+                print->click();
+                return warning;
+            };
+
+            const QString failed_warning{click_and_capture_warning()};
+            QCOMPARE(removal_calls, 1);
+            QCOMPARE(attempted_path, stale_pdf);
+            QVERIFY(failed_warning.contains(QStringLiteral("No new recovery PDF"), Qt::CaseInsensitive));
+            QVERIFY(QFileInfo::exists(stale_pdf));
+            QCOMPARE(QDir{private_dir_path}.entryList({QStringLiteral("*.pdf")}, QDir::Files), QStringList{QFileInfo{stale_pdf}.fileName()});
+            QCOMPARE(m_opened_recovery_count, 0);
+            QVERIFY(!ack->isEnabled());
+            QVERIFY(!stale_cleanup.button(QWizard::NextButton)->isEnabled());
+            QVERIFY(print_status->text().contains(QStringLiteral("No new PDF"), Qt::CaseInsensitive));
+
+            const QString still_exists_warning{click_and_capture_warning()};
+            QCOMPARE(removal_calls, 2);
+            QVERIFY(still_exists_warning.contains(QStringLiteral("No new recovery PDF"), Qt::CaseInsensitive));
+            QVERIFY(QFileInfo::exists(stale_pdf));
+            QCOMPARE(QDir{private_dir_path}.entryList({QStringLiteral("*.pdf")}, QDir::Files), QStringList{QFileInfo{stale_pdf}.fileName()});
+            QCOMPARE(m_opened_recovery_count, 0);
+            QVERIFY(!ack->isEnabled());
+
+            // Recreate the dead owner's adjacent lock: successful retry must
+            // reap both artifacts before minting exactly one replacement.
+            QVERIFY(write_crashed_owner_lock());
+            stale_cleanup.m_private_print_remover = {};
+            print->click();
+            QTRY_COMPARE_WITH_TIMEOUT(m_opened_recovery_count, 1, 5000);
+            minted_pdf = m_opened_recovery_url.toLocalFile();
+            QVERIFY(!minted_pdf.isEmpty());
+            QVERIFY(minted_pdf != stale_pdf);
+            QVERIFY(!QFileInfo::exists(stale_pdf));
+            QVERIFY(!QFileInfo::exists(stale_lock_path));
+            QCOMPARE(QDir{private_dir_path}.entryList({QStringLiteral("*.pdf")}, QDir::Files), QStringList{QFileInfo{minted_pdf}.fileName()});
+            QVERIFY(ack->isEnabled());
+            QVERIFY(!ack->isChecked());
+            QVERIFY(!stale_cleanup.createdWallet());
+        }
+        QVERIFY(!QFileInfo::exists(minted_pdf));
+    }
 
     // Exercise the actual user-facing restore journey with the kit phrases entered
     // in a different order. Matching is by full derived account xpub.
     {
         MultisigWizard restored(m_node, &controller);
+        int rescan_attempts{0};
+        restored.m_restore_rescan_override = [&](interfaces::Wallet& wallet) -> util::Result<void> {
+            if (++rescan_attempts == 1) {
+                return util::Error{Untranslated("Injected post-install genesis rescan failure")};
+            }
+            return wallet.rescanFromGenesis();
+        };
         ShowSized(restored);
         QSignalSpy created_spy(&restored, &MultisigWizard::created);
         auto* restore_button = restored.findChild<QPushButton*>("restoreFromMnemonicButton");
         QVERIFY(restore_button);
         bool populated{false};
+        bool retry_started{false};
+        size_t next_phrase{0};
         QTimer modal_driver;
         connect(&modal_driver, &QTimer::timeout, this, [&] {
             for (QWidget* widget : QApplication::topLevelWidgets()) {
@@ -2444,23 +2686,55 @@ void MultisigWizardTests::mnemonicPrintBackup()
                     box->accept();
                     continue;
                 }
-                auto* dialog = qobject_cast<QDialog*>(widget);
-                if (!dialog || dialog == &restored || !dialog->isVisible() || populated) continue;
-                auto* name = dialog->findChild<QLineEdit*>("restoreWalletNameEdit");
-                auto* policy = dialog->findChild<QPlainTextEdit*>("restorePolicyEdit");
-                auto* confirm = dialog->findChild<QPushButton*>("restoreMnemonicConfirmButton");
-                if (!name || !policy || !confirm) continue;
-                name->setText(QStringLiteral("MnemonicSheetRestored"));
-                policy->setPlainText(policy_json);
+                auto* dialog = qobject_cast<QWizard*>(widget);
+                if (!dialog || dialog == &restored || !dialog->isVisible()) continue;
                 const std::array<size_t, 3> order{2, 0, 1};
-                for (size_t row = 0; row < order.size(); ++row) {
-                    auto* phrase = dialog->findChild<QLineEdit*>(QStringLiteral("restoreMnemonic%1Edit").arg(row + 1));
+                if (dialog->currentId() == 0) {
+                    auto* name = dialog->findChild<QLineEdit*>("restoreWalletNameEdit");
+                    auto* policy = dialog->findChild<QPlainTextEdit*>("restorePolicyEdit");
+                    auto* phrase = dialog->findChild<QWidget*>("restoreMnemonicEdit");
+                    QVERIFY(name);
+                    QVERIFY(policy);
                     QVERIFY(phrase);
-                    const SecureString& value = printed_phrases.at(order[row]);
-                    phrase->setText(QString::fromUtf8(value.data(), static_cast<qsizetype>(value.size())));
+                    QVERIFY(phrase->property("secureMnemonicBacking").toBool());
+                    QVERIFY(qobject_cast<QLineEdit*>(phrase) == nullptr);
+                    QVERIFY(!phrase->isVisible());
+                    name->setText(QStringLiteral("MnemonicSheetRestored"));
+                    policy->setPlainText(policy_json);
+                    dialog->next();
+                    return;
                 }
-                populated = true;
-                confirm->click();
+                if (dialog->currentId() == 1 && next_phrase < order.size()) {
+                    auto* phrase = dialog->findChild<QWidget*>("restoreMnemonicEdit");
+                    auto* add = dialog->findChild<QPushButton*>("restoreAddKeyButton");
+                    QVERIFY(phrase);
+                    QVERIFY(add);
+                    const SecureString& value = printed_phrases.at(order[next_phrase++]);
+                    QTest::keyClicks(phrase, QString::fromUtf8(value.data(), static_cast<qsizetype>(value.size())));
+                    add->click();
+                    return;
+                }
+                if (dialog->currentId() == 1) {
+                    QCOMPARE(dialog->findChild<QListWidget*>("restoreAcceptedKeys")->count(), 3);
+                    dialog->next();
+                    return;
+                }
+                if (dialog->currentId() == 2) {
+                    QVERIFY(dialog->findChild<QLabel*>("restoreAuthoritySummary")->text().contains(QStringLiteral("All three")));
+                    dialog->next();
+                    return;
+                }
+                if (dialog->currentId() == 3 && !populated) {
+                    populated = true;
+                    dialog->button(QWizard::FinishButton)->click();
+                    return;
+                }
+                if (dialog->currentId() == 3 && populated && !retry_started &&
+                    dialog->button(QWizard::FinishButton)->isEnabled() &&
+                    dialog->button(QWizard::FinishButton)->text().contains(QStringLiteral("Retry Rescan"))) {
+                    retry_started = true;
+                    dialog->button(QWizard::FinishButton)->click();
+                }
             }
         });
         modal_driver.start(20);
@@ -2468,6 +2742,8 @@ void MultisigWizardTests::mnemonicPrintBackup()
         QTRY_COMPARE_WITH_TIMEOUT(created_spy.count(), 1, 30000);
         modal_driver.stop();
         QVERIFY(populated);
+        QVERIFY(retry_started);
+        QCOMPARE(rescan_attempts, 2);
         QVERIFY(restored.createdWallet());
         QCOMPARE(QString::fromStdString(restored.createdWallet()->wallet().exportVaultPolicy()), policy_json);
         const auto restored_address = restored.firstReceiveAddress();
@@ -2703,7 +2979,7 @@ void MultisigWizardTests::wizardEdges()
         SendCoinsDialog send(style.get());
         send.setClientModel(&client);
         send.setModel(model);
-        auto* recovery = send.findChild<QCheckBox*>("vaultRecoveryCheck");
+        auto* recovery = send.findChild<QRadioButton*>("vaultRecoveryModeButton");
         QVERIFY(recovery);
         QVERIFY(recovery->isHidden());
         const QString pay = QString::fromStdString(EncodeDestination(PKHash(test.coinbaseKey.GetPubKey())));
@@ -2872,7 +3148,7 @@ void MultisigWizardTests::wizardEdges()
         SendCoinsDialog send(style.get());
         send.setClientModel(&client);
         send.setModel(wizard.createdWallet());
-        auto* recovery = send.findChild<QCheckBox*>("vaultRecoveryCheck");
+        auto* recovery = send.findChild<QRadioButton*>("vaultRecoveryModeButton");
         QVERIFY(recovery);
         QVERIFY(recovery->isHidden());
         wizard.close();
@@ -2906,10 +3182,10 @@ void MultisigWizardTests::wizardEdges()
         SendCoinsDialog send(style.get());
         send.setClientModel(&client);
         send.setModel(wizard.createdWallet());
-        auto* recovery = send.findChild<QCheckBox*>("vaultRecoveryCheck");
+        auto* recovery = send.findChild<QRadioButton*>("vaultRecoveryModeButton");
         QVERIFY(recovery);
         QVERIFY(!recovery->isHidden());
-        QVERIFY(recovery->text().contains(QStringLiteral("144")));
+        QCOMPARE(recovery->text(), QStringLiteral("Recover Funds"));
         recovery->setChecked(true);
         QApplication::processEvents();
         QCOMPARE(*send.getCoinControl()->m_nSequence, 144u);
@@ -2957,11 +3233,10 @@ void MultisigWizardTests::wizardEdges()
         SendCoinsDialog send(style.get());
         send.setClientModel(&client);
         send.setModel(wizard.createdWallet());
-        auto* recovery = send.findChild<QCheckBox*>("vaultRecoveryCheck");
+        auto* recovery = send.findChild<QRadioButton*>("vaultRecoveryModeButton");
         QVERIFY(recovery);
         QVERIFY(!recovery->isHidden());
-        QVERIFY(recovery->text().contains(QStringLiteral("1 block")));
-        QVERIFY(!recovery->text().contains(QStringLiteral("1 blocks")));
+        QCOMPARE(recovery->text(), QStringLiteral("Recover Funds"));
         wizard.close();
     }
 
@@ -2987,11 +3262,10 @@ void MultisigWizardTests::wizardEdges()
         SendCoinsDialog send(style.get());
         send.setClientModel(&client);
         send.setModel(wizard.createdWallet());
-        auto* recovery = send.findChild<QCheckBox*>("vaultRecoveryCheck");
+        auto* recovery = send.findChild<QRadioButton*>("vaultRecoveryModeButton");
         QVERIFY(recovery);
         QVERIFY(!recovery->isHidden());
-        QVERIFY(recovery->text().contains(QStringLiteral("500")));
-        QVERIFY(recovery->text().contains(QStringLiteral("height")));
+        QCOMPARE(recovery->text(), QStringLiteral("Recover Funds"));
         const QString absolute_copy = recovery->text() + QLatin1Char(' ') + recovery->toolTip();
         QVERIFY(!absolute_copy.contains(QStringLiteral("relative delay"), Qt::CaseInsensitive));
         QVERIFY(!absolute_copy.contains(QStringLiteral("starts over"), Qt::CaseInsensitive));
@@ -3064,32 +3338,32 @@ void MultisigWizardTests::vaultGuiSend()
         QVERIFY(bals.is_vault);
         overview.setBalance(bals);
         QApplication::processEvents();
-        auto* rec = overview.findChild<QLabel*>("labelVaultRecoverable");
-        auto* wait = overview.findChild<QLabel*>("labelVaultAwaiting");
-        auto* note = overview.findChild<QLabel*>("labelVaultPathNote");
-        QVERIFY(rec);
-        QVERIFY(wait);
-        QVERIFY(note);
-        QVERIFY(!rec->isHidden());
-        QVERIFY(!note->isHidden());
-        QVERIFY(note->text().contains(QStringLiteral("same bitcoin"), Qt::CaseInsensitive));
-        QVERIFY(note->text().contains(QStringLiteral("not extra"), Qt::CaseInsensitive));
-        if (bals.vault_awaiting == 0) QVERIFY(wait->isHidden());
-        else QVERIFY(!wait->isHidden());
+        auto* immediate = overview.findChild<QLabel*>("vaultImmediateStatusLabel");
+        auto* recovery_status = overview.findChild<QLabel*>("vaultRecoveryStatusLabel");
+        QVERIFY(immediate);
+        QVERIFY(recovery_status);
+        QVERIFY(!immediate->isHidden());
+        QVERIFY(!recovery_status->isHidden());
+        QVERIFY(!overview.findChild<QLabel*>("labelVaultPathNote"));
         QVERIFY(bals.vault_immediate > 0 || bals.vault_recoverable > 0);
-        auto* bal_text = overview.findChild<QLabel*>("labelBalanceText");
-        QVERIFY(bal_text);
-        QVERIFY(bal_text->text().contains(QStringLiteral("Spendable")));
+        auto* balance_value = overview.findChild<QLabel*>("labelBalance");
+        auto* total_text = overview.findChild<QLabel*>("labelTotalText");
+        auto* total_value = overview.findChild<QLabel*>("labelTotal");
+        QVERIFY(balance_value);
+        QVERIFY(total_text);
+        QVERIFY(total_value);
+        QVERIFY(balance_value->isHidden());
+        QCOMPARE(total_text->text(), QStringLiteral("Total balance:"));
+        QVERIFY(!total_value->isHidden());
     }
 
     SendCoinsDialog send(style.get());
     send.setClientModel(&client);
     send.setModel(model);
-    auto* recovery = send.findChild<QCheckBox*>("vaultRecoveryCheck");
+    auto* recovery = send.findChild<QRadioButton*>("vaultRecoveryModeButton");
     QVERIFY(recovery);
     QVERIFY(!recovery->isHidden());
-    QVERIFY(recovery->text().contains(QStringLiteral("1 block")));
-    QVERIFY(!recovery->text().contains(QStringLiteral("1 blocks")));
+    QCOMPARE(recovery->text(), QStringLiteral("Recover Funds"));
     QVERIFY(!recovery->isChecked());
 
     recovery->setChecked(true);
@@ -3230,8 +3504,10 @@ void MultisigWizardTests::vaultGuiSend()
     auto* send_btn = send_lost.findChild<QPushButton*>("sendButton");
     QVERIFY(send_btn);
     QVERIFY(!send_btn->isEnabled());
-    auto* rec_lost = send_lost.findChild<QCheckBox*>("vaultRecoveryCheck");
+    auto* rec_lost = send_lost.findChild<QRadioButton*>("vaultRecoveryModeButton");
+    auto* normal_lost = send_lost.findChild<QRadioButton*>("vaultNormalModeButton");
     QVERIFY(rec_lost);
+    QVERIFY(normal_lost);
     QVERIFY(!rec_lost->isChecked());
     rec_lost->setChecked(true);
     QApplication::processEvents();
@@ -3239,7 +3515,7 @@ void MultisigWizardTests::vaultGuiSend()
 
     // Restoring the signer must return this already-open dialog to the
     // immediate path without silently retaining the recovery opt-in.
-    rec_lost->setChecked(false);
+    normal_lost->setChecked(true);
     model->wallet().setLostSigner(mock.Fingerprint(), false);
     QVERIFY(model->wallet().getVaultStatus().lost_signers.empty());
     model->updateTransaction();
@@ -3290,18 +3566,18 @@ void MultisigWizardTests::vaultGuiSend()
         relative_overview.setWalletModel(relative_model);
         relative_overview.setBalance(young);
         QApplication::processEvents();
-        auto* awaiting = relative_overview.findChild<QLabel*>("labelVaultAwaiting");
-        auto* recoverable = relative_overview.findChild<QLabel*>("labelVaultRecoverable");
-        QVERIFY(awaiting);
-        QVERIFY(recoverable);
-        QVERIFY(!awaiting->isHidden());
-        QVERIFY(awaiting->text().contains(QStringLiteral("1 block")));
-        QVERIFY(!recoverable->text().isEmpty());
+        auto* recovery_status = relative_overview.findChild<QLabel*>("vaultRecoveryStatusLabel");
+        auto* recovery_option = relative_overview.findChild<QLabel*>("vaultRecoveryOptionLabel");
+        QVERIFY(recovery_status);
+        QVERIFY(recovery_option);
+        QVERIFY(!recovery_status->isHidden());
+        QVERIFY(recovery_status->text().contains(QStringLiteral("1 block")));
+        QVERIFY(!recovery_option->text().isEmpty());
 
         SendCoinsDialog relative_send(style.get());
         relative_send.setClientModel(&client);
         relative_send.setModel(relative_model);
-        auto* relative_recovery = relative_send.findChild<QCheckBox*>("vaultRecoveryCheck");
+        auto* relative_recovery = relative_send.findChild<QRadioButton*>("vaultRecoveryModeButton");
         auto* relative_lost = relative_send.findChild<QLabel*>("vaultLostSignerLabel");
         auto* relative_balance = relative_send.findChild<QLabel*>("labelBalance");
         auto* relative_send_button = relative_send.findChild<QPushButton*>("sendButton");
@@ -3317,6 +3593,11 @@ void MultisigWizardTests::vaultGuiSend()
         relative_send.setBalance(relative_model->wallet().getBalances());
         QApplication::processEvents();
         QVERIFY(!relative_lost->isHidden());
+        // This advanced 2-of-2 policy has no reduced-quorum branch. Maturity
+        // cannot compensate for the marked-lost hardware key, so do not show
+        // a misleading one-block countdown.
+        QVERIFY(relative_lost->text().contains(QStringLiteral("Reconnect this signer")));
+        QVERIFY(relative_lost->text().contains(QStringLiteral("not available yet"), Qt::CaseInsensitive));
         QVERIFY(relative_balance->text().startsWith(QStringLiteral("0.00000000")));
         QVERIFY(!relative_send_button->isEnabled());
         QVERIFY(!relative_recovery->isChecked());
@@ -3373,8 +3654,8 @@ void MultisigWizardTests::vaultGuiSend()
         QCOMPARE(*fresh_change.vault_blocks_remaining, 1);
         relative_overview.setBalance(fresh_change);
         QApplication::processEvents();
-        QVERIFY(!awaiting->isHidden());
-        QVERIFY(awaiting->text().contains(QStringLiteral("1 block")));
+        QVERIFY(!recovery_status->isHidden());
+        QVERIFY(recovery_status->text().contains(QStringLiteral("1 block")));
 
         relative_recovery->setChecked(true);
         QApplication::processEvents();
@@ -3431,7 +3712,7 @@ void MultisigWizardTests::vaultGuiSend()
         SendCoinsDialog absolute_send(style.get());
         absolute_send.setClientModel(&client);
         absolute_send.setModel(absolute_model);
-        auto* absolute_recovery = absolute_send.findChild<QCheckBox*>("vaultRecoveryCheck");
+        auto* absolute_recovery = absolute_send.findChild<QRadioButton*>("vaultRecoveryModeButton");
         QVERIFY(absolute_recovery);
         absolute_recovery->setChecked(true);
         QApplication::processEvents();
@@ -3614,39 +3895,43 @@ void MultisigWizardTests::vaultGuiStagedRecovery()
     overview.setWalletModel(model);
     overview.setBalance(model->wallet().getBalances());
     QApplication::processEvents();
-    auto* final_rec = overview.findChild<QLabel*>("labelVaultFinalRecoverable");
-    auto* final_rec_text = overview.findChild<QLabel*>("labelVaultFinalRecoverableText");
-    auto* final_wait = overview.findChild<QLabel*>("labelVaultFinalAwaiting");
-    QVERIFY(final_rec);
-    QVERIFY(final_rec_text);
-    QVERIFY(final_wait);
-    QVERIFY(!final_rec->isHidden());
-    QVERIFY(!final_wait->isHidden());
-    QVERIFY(final_rec_text->text().contains(QStringLiteral("1 recovery key")));
+    auto* final_option = overview.findChild<QLabel*>("vaultFinalOptionLabel");
+    auto* final_status = overview.findChild<QLabel*>("vaultFinalStatusLabel");
+    QVERIFY(final_option);
+    QVERIFY(final_status);
+    QVERIFY(!final_option->isHidden());
+    QVERIFY(!final_status->isHidden());
+    QVERIFY(final_option->text().contains(QStringLiteral("Any 1 key")));
+    QVERIFY(final_status->text().contains(QStringLiteral("3 blocks")));
 
     SendCoinsDialog send(style.get());
     send.setClientModel(&client);
     send.setModel(model);
-    auto* recovery = send.findChild<QCheckBox*>("vaultRecoveryCheck");
+    auto* recovery = send.findChild<QRadioButton*>("vaultRecoveryModeButton");
     auto* stages = send.findChild<QComboBox*>("vaultRecoveryStageCombo");
     QVERIFY(recovery);
     QVERIFY(stages);
     QVERIFY(!recovery->isChecked());
     QVERIFY(!stages->isHidden());
-    QCOMPARE(stages->count(), 2);
-    QCOMPARE(stages->currentData().toUInt(), 2u);
+    QCOMPARE(stages->count(), 3);
+    QCOMPARE(stages->currentIndex(), 0);
+    QVERIFY(!stages->currentData().isValid());
     QVERIFY(!stages->isEnabled());
     recovery->setChecked(true);
     QApplication::processEvents();
     QVERIFY(stages->isEnabled());
-    QCOMPARE(*send.getCoinControl()->m_nSequence, 2u);
+    QVERIFY(!send.findChild<QPushButton*>("sendButton")->isEnabled());
+    QVERIFY(!send.getCoinControl()->m_nSequence);
     stages->setCurrentIndex(1);
+    QApplication::processEvents();
+    QCOMPARE(*send.getCoinControl()->m_nSequence, 2u);
+    stages->setCurrentIndex(2);
     QApplication::processEvents();
     QCOMPARE(*send.getCoinControl()->m_nSequence, 4u);
     QCOMPARE(send.getCoinControl()->m_min_depth, 4);
     QVERIFY(send.getCoinControl()->m_script_path);
 
-    stages->setCurrentIndex(0);
+    stages->setCurrentIndex(1);
     test.CreateAndProcessBlock({}, GetScriptForRawPubKey(test.coinbaseKey.GetPubKey()));
     test.m_node.validation_signals->SyncWithValidationInterfaceQueue();
     model->pollBalanceChanged();
@@ -3664,7 +3949,7 @@ void MultisigWizardTests::vaultGuiStagedRecovery()
     QVERIFY(status.recovery_stages[1].recoverable_now > 0);
     QCOMPARE(stages->currentData().toUInt(), 2u); // Never auto-escalate to one key.
 
-    stages->setCurrentIndex(1);
+    stages->setCurrentIndex(2);
     recovery->setChecked(true);
     QApplication::processEvents();
     QString confirmation;
@@ -3760,7 +4045,7 @@ void MultisigWizardTests::vaultGuiMissingKey()
     QVERIFY(QMetaObject::invokeMethod(&send, "sendButtonClicked", Q_ARG(bool, false)));
     QVERIFY(too_soon.IsNull());
 
-    auto* recovery = send.findChild<QCheckBox*>("vaultRecoveryCheck");
+    auto* recovery = send.findChild<QRadioButton*>("vaultRecoveryModeButton");
     QVERIFY(recovery);
     recovery->setChecked(true);
     QApplication::processEvents();
@@ -3821,7 +4106,7 @@ void MultisigWizardTests::vaultGuiAirgapPsbt()
     SendCoinsDialog send(style.get());
     send.setClientModel(&client);
     send.setModel(model);
-    auto* recovery = send.findChild<QCheckBox*>("vaultRecoveryCheck");
+    auto* recovery = send.findChild<QRadioButton*>("vaultRecoveryModeButton");
     QVERIFY(recovery);
     QVERIFY(!recovery->isHidden());
     recovery->setChecked(true);
@@ -3921,7 +4206,7 @@ void MultisigWizardTests::vaultGuiHardwareOnly()
     SendCoinsDialog send(style.get());
     send.setClientModel(&client);
     send.setModel(model);
-    auto* recovery = send.findChild<QCheckBox*>("vaultRecoveryCheck");
+    auto* recovery = send.findChild<QRadioButton*>("vaultRecoveryModeButton");
     QVERIFY(recovery);
     QVERIFY(!recovery->isHidden());
     const QString pay = QString::fromStdString(EncodeDestination(PKHash(test.coinbaseKey.GetPubKey())));

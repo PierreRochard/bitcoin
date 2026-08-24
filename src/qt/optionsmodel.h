@@ -109,8 +109,9 @@ public:
     bool getEnablePSBTControls() const { return m_enable_psbt_controls; }
     const QString& getOverriddenByCommandLine() { return strOverriddenByCommandLine; }
 
-    /** Whether -signer was set or not */
-    bool hasSigner();
+    /** Whether an operational signer command is available. Exact fixed-vault
+     * callers may opt into the built-in native default when -signer is absent. */
+    bool hasSigner(bool allow_native_default = false);
 
     /* Explicit setters */
     void SetPruneTargetGB(int prune_target_gb);

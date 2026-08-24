@@ -169,6 +169,11 @@ void WalletFrame::gotoReceiveCoinsPage()
         i.value()->gotoReceiveCoinsPage();
 }
 
+void WalletFrame::showReceiveRequest(const QString& address)
+{
+    if (WalletView* view = currentWalletView()) view->showReceiveRequest(address);
+}
+
 void WalletFrame::gotoSendCoinsPage(QString addr)
 {
     QMap<WalletModel*, WalletView*>::const_iterator i;
