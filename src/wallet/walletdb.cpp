@@ -17,6 +17,7 @@
 #include <util/bip32.h>
 #include <util/check.h>
 #include <util/fs.h>
+#include <util/strencodings.h>
 #include <util/time.h>
 #include <util/translation.h>
 #include <wallet/migrate.h>
@@ -43,6 +44,7 @@ const std::string HDCHAIN{"hdchain"};
 const std::string KEYMETA{"keymeta"};
 const std::string KEY{"key"};
 const std::string LOCKED_UTXO{"lockedutxo"};
+const std::string LOST_SIGNER{"lostsigner"};
 const std::string MASTER_KEY{"mkey"};
 const std::string MINVERSION{"minversion"};
 const std::string NAME{"name"};
@@ -292,6 +294,16 @@ bool WalletBatch::WriteLockedUTXO(const COutPoint& output)
 bool WalletBatch::EraseLockedUTXO(const COutPoint& output)
 {
     return EraseIC(std::make_pair(DBKeys::LOCKED_UTXO, std::make_pair(output.hash, output.n)));
+}
+
+bool WalletBatch::WriteLostSigner(const std::string& fingerprint)
+{
+    return WriteIC(std::make_pair(DBKeys::LOST_SIGNER, fingerprint), uint8_t{'1'});
+}
+
+bool WalletBatch::EraseLostSigner(const std::string& fingerprint)
+{
+    return EraseIC(std::make_pair(DBKeys::LOST_SIGNER, fingerprint));
 }
 
 bool LoadKey(CWallet* pwallet, DataStream& ssKey, DataStream& ssValue, std::string& strErr)
@@ -1087,6 +1099,30 @@ static DBErrors LoadTxRecords(CWallet* pwallet, DatabaseBatch& batch, bool& any_
     return result;
 }
 
+static DBErrors LoadLostSignerRecords(CWallet* pwallet, DatabaseBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
+{
+    AssertLockHeld(pwallet->cs_wallet);
+    const LoadResult result = LoadRecords(pwallet, batch, DBKeys::LOST_SIGNER,
+        [] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
+        try {
+            std::string fingerprint;
+            uint8_t marker;
+            key >> fingerprint;
+            value >> marker;
+            if (!key.empty() || !value.empty() || fingerprint.size() != 8 || !IsHex(fingerprint) || marker != uint8_t{'1'}) {
+                err = "Error reading wallet database: invalid lost signer record";
+                return DBErrors::CORRUPT;
+            }
+            pwallet->m_lost_signers.insert(ToLower(fingerprint));
+        } catch (const std::exception& e) {
+            err = strprintf("Error reading wallet database: invalid lost signer record: %s", e.what());
+            return DBErrors::CORRUPT;
+        }
+        return DBErrors::LOAD_OK;
+    });
+    return result.m_result;
+}
+
 static DBErrors LoadActiveSPKMs(CWallet* pwallet, DatabaseBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
 {
     AssertLockHeld(pwallet->cs_wallet);
@@ -1176,6 +1212,9 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
 
         // Load tx records
         result = std::max(LoadTxRecords(pwallet, *m_batch, any_unordered), result);
+
+        // Load persistent local metadata for unavailable vault signers.
+        result = std::max(LoadLostSignerRecords(pwallet, *m_batch), result);
     } catch (std::runtime_error& e) {
         // Exceptions that can be ignored or treated as non-critical are handled by the individual loading functions.
         // Any uncaught exceptions will be caught here and treated as critical.

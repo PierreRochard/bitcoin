@@ -7,10 +7,12 @@
 #include <chainparams.h>
 #include <external_signer.h>
 #include <hash.h>
+#include <key.h>
 #include <key_io.h>
 #include <outputtype.h>
 #include <primitives/transaction.h>
 #include <pubkey.h>
+#include <random.h>
 #include <script/descriptor.h>
 #include <script/script.h>
 #include <span.h>
@@ -20,6 +22,7 @@
 #include <util/check.h>
 #include <util/strencodings.h>
 #include <util/time.h>
+#include <wallet/bip39.h>
 #include <wallet/coincontrol.h>
 #include <wallet/external_signer_scriptpubkeyman.h>
 #include <wallet/spend.h>
@@ -28,8 +31,12 @@
 #include <algorithm>
 #include <cctype>
 #include <limits>
+#include <map>
+#include <memory>
+#include <set>
 #include <sstream>
 #include <string>
+#include <utility>
 
 namespace wallet {
 std::string DefaultMultisigPath(OutputType type, uint32_t account)
@@ -324,6 +331,9 @@ bilingual_str DuplicateSignerWarning(const std::vector<MultisigKeySpec>& keys)
             if (keys[i].xpub && keys[j].xpub && *keys[i].xpub == *keys[j].xpub) {
                 return Untranslated("Two keys use the same xpub. They are copies of one signer, not independent security domains.");
             }
+            if (keys[i].hdkey && keys[j].hdkey && *keys[i].hdkey == *keys[j].hdkey) {
+                return Untranslated("Two keys use the same HD key. They are copies of one signer, not independent security domains.");
+            }
         }
     }
     return {};
@@ -405,8 +415,16 @@ std::string FormatMultisigTranscript(const std::string& wallet_name,
         else out << "  role=active";
         if (k.xpub) out << "\n    xpub=" << *k.xpub;
         else if (k.hdkey) out << "\n    private key material omitted from transcript";
+        else if (k.generate_local) out << "  (software key stored in this wallet)";
         else if (k.fingerprint && !k.xpub) out << "  (hardware, xpub fetched at creation)";
         out << "\n";
+    }
+    const size_t generated_local = static_cast<size_t>(std::count_if(keys.begin(), keys.end(), [](const MultisigKeySpec& key) {
+        return key.generate_local;
+    }));
+    if (generated_local > 1) {
+        out << "\nThese " << generated_local << " software keys are cryptographically distinct, but they share one wallet file, backup, and computer.\n";
+        out << "They do not provide independent-device protection.\n";
     }
     if (!public_descs.empty()) {
         out << "\n## Descriptors\n";
@@ -429,7 +447,51 @@ std::string FormatMultisigTranscript(const std::string& wallet_name,
     return out.str();
 }
 
-static util::Result<std::string> KeyExprFromSpec(CWallet& wallet, const MultisigKeySpec& spec, const std::string& default_path)
+struct ResolvedMultisigKey {
+    std::string expression;
+    //! Canonical derived account xpub, used to reject duplicate participants
+    //! even when their private expressions or origin strings differ.
+    std::string account_xpub;
+    std::optional<GeneratedMnemonic> recovery;
+};
+
+static util::Result<ResolvedMultisigKey> ResolvePrivateMaster(const CExtKey& master,
+                                                              const std::vector<uint32_t>& parsed_path,
+                                                              size_t key_index,
+                                                              std::optional<SecureString> generated_mnemonic = {})
+{
+    auto child = DeriveExtKey(master, parsed_path);
+    if (!child) {
+        return util::Error{Untranslated("Unable to derive HD key at the requested path")};
+    }
+
+    const std::string fingerprint{HexStr(child->second.fingerprint)};
+    const std::string path{WriteHDKeypath(child->second.path)};
+    const std::string xpub{EncodeExtPubKey(child->first.Neuter())};
+    ResolvedMultisigKey out{
+        strprintf("[%s%s]%s/<0;1>/*",
+                  fingerprint,
+                  FormatHDKeypath(child->second.path),
+                  EncodeExtKey(child->first)),
+        xpub,
+        std::nullopt,
+    };
+    if (generated_mnemonic) {
+        out.recovery.emplace(GeneratedMnemonic{
+            key_index,
+            std::move(*generated_mnemonic),
+            fingerprint,
+            path,
+            xpub,
+        });
+    }
+    return out;
+}
+
+static util::Result<ResolvedMultisigKey> KeyExprFromSpec(CWallet& wallet,
+                                                         const MultisigKeySpec& spec,
+                                                         const std::string& default_path,
+                                                         size_t key_index)
 {
     AssertLockHeld(wallet.cs_wallet);
 
@@ -442,6 +504,33 @@ static util::Result<std::string> KeyExprFromSpec(CWallet& wallet, const Multisig
         return util::Error{Untranslated("Derivation path requires at least one hardened step")};
     }
 
+    if (spec.generate_local || spec.recovery_mnemonic) {
+        if ((spec.generate_local && spec.recovery_mnemonic) || spec.fingerprint || spec.hdkey || spec.xpub) {
+            return util::Error{Untranslated("A mnemonic local key cannot also specify another key source")};
+        }
+        if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+            return util::Error{Untranslated("Watch-only wallets cannot generate local keys")};
+        }
+
+        SecureString mnemonic;
+        if (spec.generate_local) {
+            BIP39SecureBytes entropy(BIP39_ENTROPY_SIZE);
+            GetStrongRandBytes(entropy);
+            mnemonic = EncodeBIP39Mnemonic(
+                std::span<const unsigned char, BIP39_ENTROPY_SIZE>{entropy.data(), entropy.size()});
+        } else {
+            mnemonic = *spec.recovery_mnemonic;
+        }
+        auto seed = BIP39MnemonicToSeed(std::string_view{mnemonic.data(), mnemonic.size()});
+        if (!seed || seed->size() != BIP39_SEED_SIZE) {
+            return util::Error{Untranslated("Invalid BIP39 English recovery mnemonic")};
+        }
+        CExtKey master;
+        master.SetSeed(std::as_bytes(std::span{*seed}));
+        return ResolvePrivateMaster(master, parsed_path, key_index,
+                                    spec.generate_local ? std::optional<SecureString>{std::move(mnemonic)} : std::nullopt);
+    }
+
     if (spec.xpub) {
         if (!spec.fingerprint || spec.fingerprint->size() != 8 || !IsHex(*spec.fingerprint)) {
             return util::Error{Untranslated("Air-gapped keys need an 8-character hex fingerprint plus xpub")};
@@ -450,10 +539,14 @@ static util::Result<std::string> KeyExprFromSpec(CWallet& wallet, const Multisig
         if (!xpub.pubkey.IsValid()) {
             return util::Error{Untranslated("Unable to parse xpub")};
         }
-        return strprintf("[%s%s]%s/<0;1>/*",
-                         *spec.fingerprint,
-                         FormatHDKeypath(parsed_path),
-                         *spec.xpub);
+        return ResolvedMultisigKey{
+            strprintf("[%s%s]%s/<0;1>/*",
+                      *spec.fingerprint,
+                      FormatHDKeypath(parsed_path),
+                      *spec.xpub),
+            EncodeExtPubKey(xpub),
+            std::nullopt,
+        };
     }
 
     if (spec.fingerprint) {
@@ -468,10 +561,19 @@ static util::Result<std::string> KeyExprFromSpec(CWallet& wallet, const Multisig
         if (!xpub_res.exists("xpub") || !xpub_res["xpub"].isStr()) {
             return util::Error{Untranslated("Signer getxpub did not return an xpub")};
         }
-        return strprintf("[%s%s]%s/<0;1>/*",
-                         *spec.fingerprint,
-                         FormatHDKeypath(parsed_path),
-                         xpub_res["xpub"].get_str());
+        const std::string signer_xpub{xpub_res["xpub"].get_str()};
+        const CExtPubKey xpub{DecodeExtPubKey(signer_xpub)};
+        if (!xpub.pubkey.IsValid()) {
+            return util::Error{Untranslated("Signer getxpub returned an invalid xpub")};
+        }
+        return ResolvedMultisigKey{
+            strprintf("[%s%s]%s/<0;1>/*",
+                      *spec.fingerprint,
+                      FormatHDKeypath(parsed_path),
+                      signer_xpub),
+            EncodeExtPubKey(xpub),
+            std::nullopt,
+        };
     }
 
     if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
@@ -484,14 +586,7 @@ static util::Result<std::string> KeyExprFromSpec(CWallet& wallet, const Multisig
             if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
                 return util::Error{Untranslated("Watch-only wallets cannot use local keys; specify a signer fingerprint or xpub")};
             }
-            auto child = DeriveExtKey(extkey, parsed_path);
-            if (!child) {
-                return util::Error{Untranslated("Unable to derive HD key at the requested path")};
-            }
-            return strprintf("[%s%s]%s/<0;1>/*",
-                             HexStr(child->second.fingerprint),
-                             FormatHDKeypath(child->second.path),
-                             EncodeExtKey(child->first));
+            return ResolvePrivateMaster(extkey, parsed_path, key_index);
         }
     }
 
@@ -516,14 +611,7 @@ static util::Result<std::string> KeyExprFromSpec(CWallet& wallet, const Multisig
     if (!xprv) {
         return util::Error{Untranslated(strprintf("Private key for %s is not known", EncodeExtPubKey(xpub)))};
     }
-    auto child = DeriveExtKey(*xprv, parsed_path);
-    if (!child) {
-        return util::Error{Untranslated("Unable to derive HD key at the requested path")};
-    }
-    return strprintf("[%s%s]%s/<0;1>/*",
-                     HexStr(child->second.fingerprint),
-                     FormatHDKeypath(child->second.path),
-                     EncodeExtKey(child->first));
+    return ResolvePrivateMaster(*xprv, parsed_path, key_index);
 }
 
 util::Result<MultisigDescriptorResult> CreateMultisigDescriptor(CWallet& wallet,
@@ -576,13 +664,23 @@ util::Result<MultisigDescriptorResult> CreateMultisigDescriptor(CWallet& wallet,
     const std::string default_path = DefaultMultisigPath(options.type, options.account);
     std::vector<std::string> active_exprs;
     std::vector<std::string> recovery_exprs;
+    std::set<std::string> resolved_exprs;
+    std::set<std::string> resolved_account_xpubs;
+    std::vector<GeneratedMnemonic> generated_recovery;
     active_exprs.reserve(n_active);
     recovery_exprs.reserve(keys.size());
-    for (const auto& spec : keys) {
-        auto expr = KeyExprFromSpec(wallet, spec, default_path);
-        if (!expr) return util::Error{util::ErrorString(expr)};
-        if (!spec.recovery_only) active_exprs.push_back(*expr);
-        recovery_exprs.push_back(*expr);
+    generated_recovery.reserve(keys.size());
+    for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
+        const auto& spec = keys[key_index];
+        auto resolved = KeyExprFromSpec(wallet, spec, default_path, key_index);
+        if (!resolved) return util::Error{util::ErrorString(resolved)};
+        if (!resolved_account_xpubs.insert(resolved->account_xpub).second ||
+            !resolved_exprs.insert(resolved->expression).second) {
+            return util::Error{Untranslated("Each multisig participant must use a distinct key")};
+        }
+        if (!spec.recovery_only) active_exprs.push_back(resolved->expression);
+        recovery_exprs.push_back(std::move(resolved->expression));
+        if (resolved->recovery) generated_recovery.push_back(std::move(*resolved->recovery));
     }
 
     const std::vector<std::string>& wrap_keys = (options.fallback_older || options.fallback_after || options.fallback_older_one_key) ? active_exprs : recovery_exprs;
@@ -602,7 +700,7 @@ util::Result<MultisigDescriptorResult> CreateMultisigDescriptor(CWallet& wallet,
 
     MultisigDescriptorResult out;
     out.nrequired = nrequired;
-    out.key_exprs = (options.fallback_older || options.fallback_after || options.fallback_older_one_key) ? active_exprs : recovery_exprs;
+    out.recovery = std::move(generated_recovery);
     out.fallback_older = options.fallback_older;
     out.fallback_after = options.fallback_after;
     out.fallback_older_one_key = options.fallback_older_one_key;
@@ -663,6 +761,99 @@ bool IsVaultUtxoMature(const InferredVaultPolicy& policy, int depth, int tip_hei
     return IsVaultRecoveryStageMature(policy.recovery_stages.front(), depth, tip_height);
 }
 
+namespace {
+
+struct VaultPolicySigners {
+    std::set<std::string> active;
+    std::set<std::string> recovery;
+};
+
+std::optional<VaultPolicySigners> ExtractVaultPolicySigners(
+    const std::string& descriptor,
+    const InferredVaultPolicy& policy)
+{
+    FlatSigningProvider provider;
+    std::string error;
+    auto parsed = Parse(descriptor, provider, error, /*require_checksum=*/true);
+    if (parsed.size() != 1 || !policy.is_vault || policy.recovery_stages.empty()) return std::nullopt;
+
+    const size_t musig_start = descriptor.find("tr(musig(");
+    if (musig_start == std::string::npos) return std::nullopt;
+    const size_t musig_open = descriptor.find('(', musig_start + 3);
+    if (musig_open == std::string::npos) return std::nullopt;
+    size_t musig_close{std::string::npos};
+    int nesting{0};
+    for (size_t pos = musig_open; pos < descriptor.size(); ++pos) {
+        if (descriptor[pos] == '(') {
+            ++nesting;
+        } else if (descriptor[pos] == ')' && --nesting == 0) {
+            musig_close = pos;
+            break;
+        }
+    }
+    if (musig_close == std::string::npos) return std::nullopt;
+
+    std::set<CPubKey> plain_pubkeys;
+    std::set<CExtPubKey> account_xpubs;
+    parsed.front()->GetPubKeys(plain_pubkeys, account_xpubs);
+    if (account_xpubs.empty() || !plain_pubkeys.empty()) return std::nullopt;
+
+    VaultPolicySigners signers;
+    for (const CExtPubKey& account_xpub : account_xpubs) {
+        const std::string xpub{EncodeExtPubKey(account_xpub)};
+        std::optional<std::string> fingerprint;
+        size_t active_occurrences{0};
+        size_t recovery_occurrences{0};
+        size_t search_pos{0};
+        while (true) {
+            const size_t xpub_pos = descriptor.find(xpub, search_pos);
+            if (xpub_pos == std::string::npos) break;
+            search_pos = xpub_pos + xpub.size();
+            if (xpub_pos == 0 || descriptor[xpub_pos - 1] != ']') return std::nullopt;
+            const size_t origin_begin = descriptor.rfind('[', xpub_pos - 1);
+            if (origin_begin == std::string::npos || xpub_pos - origin_begin < 10) return std::nullopt;
+            const std::string_view origin{descriptor.data() + origin_begin + 1,
+                                          xpub_pos - origin_begin - 2};
+            if (origin.size() < 8 || !IsHex(origin.substr(0, 8)) ||
+                (origin.size() > 8 && origin[8] != '/')) {
+                return std::nullopt;
+            }
+            const std::string current{ToLower(origin.substr(0, 8))};
+            if (fingerprint && *fingerprint != current) return std::nullopt;
+            fingerprint = current;
+            if (xpub_pos > musig_open && xpub_pos < musig_close) {
+                ++active_occurrences;
+            } else {
+                ++recovery_occurrences;
+            }
+        }
+        if (!fingerprint || active_occurrences > 1 ||
+            recovery_occurrences != policy.recovery_stages.size()) {
+            return std::nullopt;
+        }
+        if (!signers.recovery.insert(*fingerprint).second) return std::nullopt;
+        if (active_occurrences == 1) signers.active.insert(*fingerprint);
+    }
+    if (signers.active.empty()) return std::nullopt;
+    return signers;
+}
+
+std::optional<VaultPolicySigners> GetWalletVaultPolicySigners(const CWallet& wallet)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    for (auto* man : wallet.GetActiveScriptPubKeyMans()) {
+        auto* desc_man = dynamic_cast<DescriptorScriptPubKeyMan*>(man);
+        if (!desc_man) continue;
+        std::string descriptor;
+        if (!desc_man->GetDescriptorString(descriptor, /*priv=*/false)) continue;
+        const InferredVaultPolicy policy{InferVaultPolicy(descriptor)};
+        if (policy.is_vault) return ExtractVaultPolicySigners(descriptor, policy);
+    }
+    return std::nullopt;
+}
+
+} // namespace
+
 VaultBalanceBreakdown GetVaultBalanceBreakdown(const CWallet& wallet)
 {
     AssertLockHeld(wallet.cs_wallet);
@@ -674,14 +865,27 @@ VaultBalanceBreakdown GetVaultBalanceBreakdown(const CWallet& wallet)
         balance.stage = stage;
         out.recovery_stages.push_back(std::move(balance));
     }
+    const auto signers = GetWalletVaultPolicySigners(wallet);
+    const auto available_count = [&](const std::set<std::string>& participants) {
+        return static_cast<size_t>(std::count_if(participants.begin(), participants.end(), [&](const std::string& fingerprint) {
+            return !wallet.m_lost_signers.contains(fingerprint);
+        }));
+    };
+    const bool immediate_available = !out.is_vault ||
+        (signers && available_count(signers->active) == signers->active.size());
+    const size_t recovery_available = signers ? available_count(signers->recovery) : 0;
     const int tip = wallet.HaveChain() ? wallet.GetLastBlockHeight() : 0;
     const auto coins = AvailableCoins(wallet);
     for (const auto& coin : coins.All()) {
         if (coin.depth <= 0) continue;
-        if (wallet.m_lost_signers.empty()) {
+        if (immediate_available) {
             out.immediate += coin.txout.nValue;
         }
         for (auto& stage_balance : out.recovery_stages) {
+            if (stage_balance.stage.nrequired <= 0 ||
+                recovery_available < static_cast<size_t>(stage_balance.stage.nrequired)) {
+                continue;
+            }
             if (IsVaultRecoveryStageMature(stage_balance.stage, coin.depth, tip)) {
                 stage_balance.recoverable_now += coin.txout.nValue;
             } else {
@@ -887,6 +1091,382 @@ util::Result<VaultPolicyPackage> ParseVaultPolicyPackage(const std::string& json
     return pkg;
 }
 
+namespace {
+
+struct PreparedVaultDescriptor {
+    std::unique_ptr<Descriptor> descriptor;
+    FlatSigningProvider provider;
+    bool internal{false};
+};
+
+struct PreparedVaultMnemonicRestore {
+    std::vector<VaultMnemonicMatch> matches;
+    std::vector<PreparedVaultDescriptor> descriptors;
+    std::vector<std::string> participant_fingerprints;
+    std::vector<std::string> unavailable_fingerprints;
+};
+
+using ParticipantFingerprints = std::map<std::string, KeyFingerprint>;
+
+util::Result<std::pair<KeyFingerprint, size_t>> DescriptorAccountOrigin(
+    const std::string& descriptor,
+    const std::string& xpub,
+    const std::vector<uint32_t>& standard_path)
+{
+    std::optional<KeyFingerprint> fingerprint;
+    size_t occurrences{0};
+    size_t search_pos{0};
+    while (true) {
+        const size_t xpub_pos = descriptor.find(xpub, search_pos);
+        if (xpub_pos == std::string::npos) break;
+        search_pos = xpub_pos + xpub.size();
+
+        if (xpub_pos == 0 || descriptor[xpub_pos - 1] != ']') {
+            return util::Error{Untranslated("Vault participant xpub is missing its key origin")};
+        }
+        const size_t origin_begin = descriptor.rfind('[', xpub_pos - 1);
+        if (origin_begin == std::string::npos || origin_begin + 9 > xpub_pos) {
+            return util::Error{Untranslated("Vault participant has an invalid key origin")};
+        }
+        const std::string_view origin{descriptor.data() + origin_begin + 1,
+                                      xpub_pos - origin_begin - 2};
+        if (origin.size() < 8 || !IsHex(origin.substr(0, 8))) {
+            return util::Error{Untranslated("Vault participant has an invalid master fingerprint")};
+        }
+        std::vector<uint32_t> origin_path;
+        const std::string encoded_path{"m" + std::string{origin.substr(8)}};
+        if (!ParseHDKeypath(encoded_path, origin_path) || origin_path != standard_path) {
+            return util::Error{Untranslated("Vault participant does not use the standard account path")};
+        }
+        const auto decoded_fingerprint = TryParseHex<unsigned char>(origin.substr(0, 8));
+        if (!decoded_fingerprint || decoded_fingerprint->size() != 4) {
+            return util::Error{Untranslated("Vault participant has an invalid master fingerprint")};
+        }
+        KeyFingerprint current;
+        std::copy(decoded_fingerprint->begin(), decoded_fingerprint->end(), current.begin());
+        if (fingerprint && *fingerprint != current) {
+            return util::Error{Untranslated("Vault participant has inconsistent key origins")};
+        }
+        fingerprint = current;
+        ++occurrences;
+    }
+    if (!fingerprint || occurrences == 0) {
+        return util::Error{Untranslated("Vault participant xpub is missing from the descriptor")};
+    }
+    return std::pair<KeyFingerprint, size_t>{*fingerprint, occurrences};
+}
+
+util::Result<PreparedVaultMnemonicRestore> PrepareVaultMnemonicRestore(
+    const VaultPolicyPackage& package,
+    const std::span<const SecureString> mnemonics)
+{
+    if (mnemonics.empty() || mnemonics.size() > 3) {
+        return util::Error{Untranslated("Vault recovery requires between one and three BIP39 phrases")};
+    }
+
+    auto checked = ParseVaultPolicyPackage(FormatVaultPolicyPackage(package));
+    if (!checked) return util::Error{util::ErrorString(checked)};
+    if (checked->network.empty() || checked->network != Params().GetChainTypeString()) {
+        return util::Error{Untranslated(strprintf("Vault policy network %s does not match this node (%s)",
+                                                  checked->network.empty() ? "(missing)" : checked->network,
+                                                  Params().GetChainTypeString()))};
+    }
+    if (checked->descs.size() != 2) {
+        return util::Error{Untranslated("Vault mnemonic recovery requires matching receive and change descriptors")};
+    }
+    const InferredVaultPolicy policy = InferVaultPolicy(checked->descs.front());
+    if (!policy.is_vault || policy.recovery_stages.empty()) {
+        return util::Error{Untranslated("Policy package is not a staged Scrooge vault")};
+    }
+
+    const std::string standard_path_string = DefaultMultisigPath(OutputType::BECH32M, /*account=*/0);
+    std::vector<uint32_t> standard_path;
+    if (!ParseHDKeypath(standard_path_string, standard_path)) {
+        return util::Error{Untranslated("Unable to determine the standard vault account path")};
+    }
+
+    PreparedVaultMnemonicRestore prepared;
+    prepared.descriptors.reserve(checked->descs.size());
+    ParticipantFingerprints participants;
+    const size_t expected_occurrences = 1 + policy.recovery_stages.size();
+    for (size_t descriptor_index = 0; descriptor_index < checked->descs.size(); ++descriptor_index) {
+        FlatSigningProvider provider;
+        std::string parse_error;
+        auto parsed = Parse(checked->descs[descriptor_index], provider, parse_error, /*require_checksum=*/true);
+        if (parsed.size() != 1) {
+            return util::Error{Untranslated(parse_error.empty() ? "Vault policy descriptor did not parse uniquely" : parse_error)};
+        }
+        if (!provider.keys.empty()) {
+            return util::Error{Untranslated("Vault policy package must contain public descriptors only")};
+        }
+        const auto output_type = parsed.front()->GetOutputType();
+        if (!output_type || *output_type != OutputType::BECH32M) {
+            return util::Error{Untranslated("Vault policy descriptors must be Taproot (bech32m)")};
+        }
+
+        std::set<CPubKey> plain_pubkeys;
+        std::set<CExtPubKey> account_xpubs;
+        parsed.front()->GetPubKeys(plain_pubkeys, account_xpubs);
+        if (account_xpubs.size() != 3) {
+            return util::Error{Untranslated("Vault mnemonic recovery requires exactly three distinct account xpubs")};
+        }
+
+        std::vector<CScript> scripts;
+        FlatSigningProvider expanded;
+        if (!parsed.front()->Expand(/*pos=*/0, provider, scripts, expanded)) {
+            return util::Error{Untranslated("Unable to expand vault policy descriptor")};
+        }
+
+        ParticipantFingerprints branch_participants;
+        for (const CExtPubKey& account_xpub : account_xpubs) {
+            if (account_xpub.nDepth != standard_path.size() || account_xpub.nChild != standard_path.back()) {
+                return util::Error{Untranslated("Vault participant xpub is not at the standard account depth")};
+            }
+            const std::string encoded_xpub = EncodeExtPubKey(account_xpub);
+            auto origin = DescriptorAccountOrigin(checked->descs[descriptor_index], encoded_xpub, standard_path);
+            if (!origin) return util::Error{util::ErrorString(origin)};
+            if (origin->second != expected_occurrences) {
+                return util::Error{Untranslated("Vault participant does not appear exactly once in every recovery stage")};
+            }
+
+            CExtPubKey branch;
+            CExtPubKey address;
+            if (!account_xpub.Derive(branch, descriptor_index) || !branch.Derive(address, /*nChild=*/0)) {
+                return util::Error{Untranslated("Unable to derive a vault participant address key")};
+            }
+            const auto expanded_origin = expanded.origins.find(address.pubkey.GetID());
+            std::vector<uint32_t> expected_path{standard_path};
+            expected_path.push_back(descriptor_index);
+            expected_path.push_back(0);
+            if (expanded_origin == expanded.origins.end() ||
+                expanded_origin->second.second.fingerprint != origin->first ||
+                expanded_origin->second.second.path != expected_path) {
+                return util::Error{Untranslated("Vault participant origin does not match descriptor derivation")};
+            }
+            branch_participants.emplace(encoded_xpub, origin->first);
+        }
+        if (descriptor_index == 0) {
+            participants = branch_participants;
+            std::set<KeyFingerprint> unique_fingerprints;
+            for (const auto& [xpub, fingerprint] : participants) {
+                if (!unique_fingerprints.insert(fingerprint).second) {
+                    return util::Error{Untranslated("Vault participant master fingerprints are ambiguous")};
+                }
+                prepared.participant_fingerprints.push_back(HexStr(fingerprint));
+            }
+        } else if (branch_participants != participants) {
+            return util::Error{Untranslated("Receive and change descriptors do not contain the same vault participants")};
+        }
+        prepared.descriptors.push_back(PreparedVaultDescriptor{
+            std::move(parsed.front()), std::move(provider), descriptor_index == 1});
+    }
+
+    std::set<std::string> matched_xpubs;
+    std::vector<CExtKey> account_keys;
+    account_keys.reserve(mnemonics.size());
+    prepared.matches.reserve(mnemonics.size());
+    for (size_t mnemonic_index = 0; mnemonic_index < mnemonics.size(); ++mnemonic_index) {
+        const SecureString& mnemonic = mnemonics[mnemonic_index];
+        auto seed = BIP39MnemonicToSeed(std::string_view{mnemonic.data(), mnemonic.size()});
+        if (!seed || seed->size() != BIP39_SEED_SIZE) {
+            return util::Error{Untranslated(strprintf("Recovery phrase %u is not a valid 24-word BIP39 English mnemonic", mnemonic_index + 1))};
+        }
+        CExtKey master;
+        master.SetSeed(std::as_bytes(std::span{*seed}));
+        auto derived = DeriveExtKey(master, standard_path);
+        if (!derived) {
+            return util::Error{Untranslated(strprintf("Unable to derive recovery phrase %u at the standard account path", mnemonic_index + 1))};
+        }
+        const std::string xpub = EncodeExtPubKey(derived->first.Neuter());
+        const auto participant = participants.find(xpub);
+        if (participant == participants.end()) {
+            return util::Error{Untranslated(strprintf("Recovery phrase %u does not match any participant in this vault policy", mnemonic_index + 1))};
+        }
+        if (!matched_xpubs.insert(xpub).second) {
+            return util::Error{Untranslated("Each recovery phrase must match a different vault participant")};
+        }
+        if (derived->second.fingerprint != participant->second) {
+            return util::Error{Untranslated(strprintf("Recovery phrase %u matches an xpub but not its master fingerprint", mnemonic_index + 1))};
+        }
+        prepared.matches.push_back(VaultMnemonicMatch{
+            mnemonic_index,
+            HexStr(derived->second.fingerprint),
+            standard_path_string,
+            xpub,
+        });
+        account_keys.push_back(std::move(derived->first));
+    }
+    for (const auto& [xpub, fingerprint] : participants) {
+        if (!matched_xpubs.contains(xpub)) {
+            prepared.unavailable_fingerprints.push_back(HexStr(fingerprint));
+        }
+    }
+
+    for (size_t descriptor_index = 0; descriptor_index < prepared.descriptors.size(); ++descriptor_index) {
+        auto& item = prepared.descriptors[descriptor_index];
+        for (const CExtKey& account_key : account_keys) {
+            item.provider.keys.emplace(account_key.key.GetPubKey().GetID(), account_key.key);
+        }
+        FlatSigningProvider private_keys;
+        item.descriptor->ExpandPrivate(/*pos=*/0, item.provider, private_keys);
+        if (private_keys.keys.size() != account_keys.size()) {
+            return util::Error{Untranslated("Vault descriptor did not accept every matched private account key")};
+        }
+        for (const CExtKey& account_key : account_keys) {
+            CExtKey branch;
+            CExtKey address;
+            if (!account_key.Derive(branch, descriptor_index) || !branch.Derive(address, /*nChild=*/0) ||
+                !private_keys.keys.contains(address.key.GetPubKey().GetID())) {
+                return util::Error{Untranslated("Vault descriptor private-key derivation did not match its public branch")};
+            }
+        }
+    }
+    return prepared;
+}
+
+} // namespace
+
+util::Result<void> ValidateFixedStagedVaultPolicy(const VaultPolicyPackage& package)
+{
+    static constexpr uint32_t PRIMARY_DELAY{4320};
+    static constexpr uint32_t FINAL_DELAY{8640};
+
+    auto checked = ParseVaultPolicyPackage(FormatVaultPolicyPackage(package));
+    if (!checked) return util::Error{util::ErrorString(checked)};
+    if (checked->network.empty() || checked->network != Params().GetChainTypeString()) {
+        return util::Error{Untranslated(strprintf("Vault policy network %s does not match this node (%s)",
+                                                  checked->network.empty() ? "(missing)" : checked->network,
+                                                  Params().GetChainTypeString()))};
+    }
+    if (checked->descs.size() != 2) {
+        return util::Error{Untranslated("The fixed staged vault requires matching receive and change descriptors")};
+    }
+    if (checked->recovery_stages.size() != 2 ||
+        checked->recovery_stages[0].nrequired != 2 ||
+        checked->recovery_stages[0].older != PRIMARY_DELAY ||
+        checked->recovery_stages[0].after ||
+        checked->recovery_stages[1].nrequired != 1 ||
+        checked->recovery_stages[1].older != FINAL_DELAY ||
+        checked->recovery_stages[1].after) {
+        return util::Error{Untranslated("The policy is not the fixed 2-of-3 at 4,320 blocks, then 1-of-3 at 8,640 blocks staged vault")};
+    }
+
+    const std::string standard_path_string = DefaultMultisigPath(OutputType::BECH32M, /*account=*/0);
+    std::vector<uint32_t> standard_path;
+    if (!ParseHDKeypath(standard_path_string, standard_path)) {
+        return util::Error{Untranslated("Unable to determine the standard vault account path")};
+    }
+
+    std::optional<VaultPolicySigners> expected_signers;
+    ParticipantFingerprints expected_participants;
+    std::vector<std::pair<size_t, std::string>> ordered_key_expressions;
+    for (size_t descriptor_index = 0; descriptor_index < checked->descs.size(); ++descriptor_index) {
+        const std::string& descriptor = checked->descs[descriptor_index];
+        const InferredVaultPolicy policy{InferVaultPolicy(descriptor)};
+        const auto signers{ExtractVaultPolicySigners(descriptor, policy)};
+        if (!signers || signers->active.size() != 3 || signers->recovery.size() != 3 ||
+            signers->active != signers->recovery) {
+            return util::Error{Untranslated("The fixed staged vault requires the same three participants in its immediate and recovery paths")};
+        }
+        if (expected_signers &&
+            (signers->active != expected_signers->active || signers->recovery != expected_signers->recovery)) {
+            return util::Error{Untranslated("Vault receive and change descriptors contain different participants")};
+        }
+        expected_signers = signers;
+
+        FlatSigningProvider provider;
+        std::string parse_error;
+        auto parsed = Parse(descriptor, provider, parse_error, /*require_checksum=*/true);
+        if (parsed.size() != 1 || !provider.keys.empty()) {
+            return util::Error{Untranslated("The fixed staged vault package must contain public descriptors only")};
+        }
+        const auto output_type = parsed.front()->GetOutputType();
+        if (!output_type || *output_type != OutputType::BECH32M) {
+            return util::Error{Untranslated("The fixed staged vault descriptors must be Taproot (bech32m)")};
+        }
+
+        std::set<CPubKey> plain_pubkeys;
+        std::set<CExtPubKey> account_xpubs;
+        parsed.front()->GetPubKeys(plain_pubkeys, account_xpubs);
+        if (!plain_pubkeys.empty() || account_xpubs.size() != 3) {
+            return util::Error{Untranslated("The fixed staged vault requires exactly three account xpubs")};
+        }
+        ParticipantFingerprints participants;
+        for (const CExtPubKey& account_xpub : account_xpubs) {
+            if (account_xpub.nDepth != standard_path.size() || account_xpub.nChild != standard_path.back()) {
+                return util::Error{Untranslated("Vault participant xpub is not at the standard account depth")};
+            }
+            const std::string encoded_xpub{EncodeExtPubKey(account_xpub)};
+            auto origin = DescriptorAccountOrigin(descriptor, encoded_xpub, standard_path);
+            if (!origin) return util::Error{util::ErrorString(origin)};
+            if (origin->second != 3) {
+                return util::Error{Untranslated("Each fixed staged vault participant must appear once in the immediate path and both recovery stages")};
+            }
+            participants.emplace(encoded_xpub, origin->first);
+            if (descriptor_index == 0) {
+                ordered_key_expressions.emplace_back(
+                    descriptor.find(encoded_xpub),
+                    strprintf("[%s%s]%s/<0;1>/*",
+                              HexStr(origin->first),
+                              FormatHDKeypath(standard_path),
+                              encoded_xpub));
+            }
+        }
+        if (expected_participants.empty()) {
+            expected_participants = std::move(participants);
+        } else if (participants != expected_participants) {
+            return util::Error{Untranslated("Vault receive and change descriptors contain different account xpubs")};
+        }
+    }
+
+    // Participant occurrence counts alone cannot prove that each recovery
+    // stage contains each signer exactly once: an extra Taproot leaf can
+    // compensate for a signer omitted from another leaf. Reconstruct the only
+    // policy this GUI supports from the ordered internal-key participants and
+    // require both supplied descriptors to be byte-for-byte canonical output.
+    std::sort(ordered_key_expressions.begin(), ordered_key_expressions.end());
+    std::vector<std::string> key_expressions;
+    key_expressions.reserve(ordered_key_expressions.size());
+    for (auto& [position, expression] : ordered_key_expressions) {
+        if (position == std::string::npos) {
+            return util::Error{Untranslated("Vault participant is missing from the immediate signing path")};
+        }
+        key_expressions.push_back(std::move(expression));
+    }
+    std::string canonical = WrapSortedMulti(OutputType::BECH32M,
+                                            /*nrequired=*/2,
+                                            key_expressions,
+                                            PRIMARY_DELAY,
+                                            /*fallback_after=*/{},
+                                            key_expressions,
+                                            FINAL_DELAY);
+    const std::string checksum{GetDescriptorChecksum(canonical)};
+    if (canonical.empty() || checksum.empty()) {
+        return util::Error{Untranslated("Unable to reconstruct the canonical fixed staged vault")};
+    }
+    canonical += "#" + checksum;
+    FlatSigningProvider canonical_provider;
+    std::string canonical_error;
+    auto canonical_descriptors = Parse(canonical, canonical_provider, canonical_error, /*require_checksum=*/true);
+    if (canonical_descriptors.size() != checked->descs.size() ||
+        !std::equal(canonical_descriptors.begin(), canonical_descriptors.end(), checked->descs.begin(),
+                    [](const std::unique_ptr<Descriptor>& descriptor, const std::string& supplied) {
+                        return descriptor->ToString() == supplied;
+                    })) {
+        return util::Error{Untranslated("Vault descriptors do not match the canonical fixed staged vault construction")};
+    }
+    return {};
+}
+
+util::Result<std::vector<VaultMnemonicMatch>> ValidateVaultPolicyMnemonics(
+    const VaultPolicyPackage& package,
+    const std::span<const SecureString> mnemonics)
+{
+    auto prepared = PrepareVaultMnemonicRestore(package, mnemonics);
+    if (!prepared) return util::Error{util::ErrorString(prepared)};
+    return std::move(prepared->matches);
+}
+
 VaultPolicyPackage ExportWalletVaultPolicy(const CWallet& wallet)
 {
     AssertLockHeld(wallet.cs_wallet);
@@ -951,5 +1531,77 @@ util::Result<void> ImportWalletVaultPolicy(CWallet& wallet, const VaultPolicyPac
         }
     }
     return {};
+}
+
+util::Result<std::vector<VaultMnemonicMatch>> RestoreWalletVaultPolicy(
+    CWallet& wallet,
+    const VaultPolicyPackage& package,
+    const std::span<const SecureString> mnemonics)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    if (!wallet.IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
+        return util::Error{Untranslated("Vault mnemonic recovery requires a descriptor wallet")};
+    }
+    if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+        return util::Error{Untranslated("Vault mnemonic recovery requires a wallet that can store private keys")};
+    }
+    if (wallet.IsLocked()) {
+        return util::Error{Untranslated("Unlock the wallet before restoring vault recovery phrases")};
+    }
+    if (wallet.m_keypool_size < 1 || wallet.m_keypool_size > std::numeric_limits<int32_t>::max()) {
+        return util::Error{Untranslated("Wallet keypool size is outside the supported descriptor range")};
+    }
+
+    auto prepared = PrepareVaultMnemonicRestore(package, mnemonics);
+    if (!prepared) return util::Error{util::ErrorString(prepared)};
+
+    struct ImportItem {
+        WalletDescriptor descriptor;
+        FlatSigningProvider provider;
+        bool internal{false};
+    };
+    std::vector<ImportItem> imports;
+    imports.reserve(prepared->descriptors.size());
+    for (auto& item : prepared->descriptors) {
+        imports.push_back(ImportItem{
+            WalletDescriptor{std::move(item.descriptor), /*creation_time=*/0,
+                             /*range_start=*/0, static_cast<int32_t>(wallet.m_keypool_size), /*next_index=*/0},
+            std::move(item.provider),
+            item.internal,
+        });
+    }
+
+    // Preflight both updates and active-manager conflicts before either branch
+    // receives private material.
+    for (auto& item : imports) {
+        DescriptorScriptPubKeyMan* const matching = wallet.GetDescriptorScriptPubKeyMan(item.descriptor);
+        if (matching) {
+            std::string error;
+            if (!matching->CanUpdateToWalletDescriptor(item.descriptor, error)) {
+                return util::Error{Untranslated(error)};
+            }
+        }
+        ScriptPubKeyMan* const active = wallet.GetScriptPubKeyMan(OutputType::BECH32M, item.internal);
+        if (active && active != matching) {
+            return util::Error{Untranslated("Wallet already has a different active Taproot descriptor")};
+        }
+    }
+
+    std::vector<std::pair<DescriptorScriptPubKeyMan*, bool>> imported;
+    imported.reserve(imports.size());
+    for (auto& item : imports) {
+        auto added = wallet.AddWalletDescriptor(item.descriptor, item.provider, /*label=*/"", item.internal);
+        if (!added) return util::Error{util::ErrorString(added)};
+        imported.emplace_back(&added->get(), item.internal);
+    }
+    for (const auto& [manager, internal] : imported) {
+        wallet.AddActiveScriptPubKeyMan(manager->GetID(), OutputType::BECH32M, internal);
+    }
+    const std::set<std::string> lost_signers{prepared->unavailable_fingerprints.begin(),
+                                             prepared->unavailable_fingerprints.end()};
+    if (!wallet.SetLostSigners(lost_signers)) {
+        return util::Error{Untranslated("Vault keys were restored, but unavailable-signer metadata could not be saved")};
+    }
+    return std::move(prepared->matches);
 }
 } // namespace wallet

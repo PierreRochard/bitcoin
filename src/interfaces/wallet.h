@@ -18,6 +18,7 @@
 #include <util/result.h>
 #include <util/ui_change_type.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -138,10 +139,34 @@ public:
         std::optional<std::string> hdkey;
         std::optional<std::string> xpub;
         bool recovery_only{false};
+        bool generate_local{false};
+        //! Private in-process restore input. Never exposed by the wallet RPC.
+        std::optional<SecureString> recovery_mnemonic;
+    };
+
+    struct GeneratedMnemonic {
+        size_t key_index{0};
+        SecureString mnemonic;
+        std::string fingerprint;
+        std::string path;
+        std::string xpub;
+    };
+
+    struct CreateMultisigResult {
+        std::vector<std::string> descs;
+        std::vector<GeneratedMnemonic> recovery;
+    };
+
+    //! Public metadata for a software key matched while restoring a vault.
+    struct VaultMnemonicMatch {
+        size_t mnemonic_index{0};
+        std::string fingerprint;
+        std::string path;
+        std::string xpub;
     };
 
     //! Import an active sorted-multisig descriptor (see createmultisigdescriptor).
-    virtual util::Result<std::vector<std::string>> createMultisigDescriptor(int nrequired,
+    virtual util::Result<CreateMultisigResult> createMultisigDescriptor(int nrequired,
         const std::vector<MultisigKey>& keys,
         OutputType type,
         std::optional<uint32_t> fallback_older = {},
@@ -271,13 +296,16 @@ public:
     // Return whether HD enabled.
     virtual bool hdEnabled() = 0;
 
-    // Return whether the wallet is blank.
+    // Return whether the wallet can generate any receiving address.
     virtual bool canGetAddresses() = 0;
+
+    // Return whether the wallet can generate a receiving address of the given type.
+    virtual bool canGetAddresses(OutputType type) = 0;
 
     // Return whether private keys enabled.
     virtual bool privateKeysDisabled() = 0;
 
-    // Return whether the wallet contains a Taproot scriptPubKeyMan
+    // Return whether the wallet contains a Taproot scriptPubKeyMan.
     virtual bool taprootEnabled() = 0;
 
     //! BIP68 older(N) from an active Scrooge vault tr(musig,and_v(v:older(N),…)), if any.
@@ -306,6 +334,11 @@ public:
     virtual void setLostSigner(const std::string& fingerprint, bool lost) = 0;
     virtual std::string exportVaultPolicy() = 0;
     virtual util::Result<void> importVaultPolicy(const std::string& json) = 0;
+    //! Restore private vault participants from BIP39 phrases and a public
+    //! policy package, then synchronously rescan from genesis. Recovery
+    //! phrases are accepted only in-process.
+    virtual util::Result<std::vector<VaultMnemonicMatch>> restoreVaultPolicy(
+        const std::string& package_json, const std::vector<SecureString>& mnemonics) = 0;
 
     // Return whether wallet uses an external signer.
     virtual bool hasExternalSigner() = 0;
@@ -360,6 +393,11 @@ public:
 class WalletLoader : public ChainClient
 {
 public:
+    //! Check that the active chain is synchronized and retains every block
+    //! needed for a wallet rescan beginning at genesis. This is a read-only
+    //! preflight; callers must still handle the chain changing afterward.
+    virtual util::Result<void> checkRescanFromGenesis() = 0;
+
     //! Create new wallet.
     virtual util::Result<std::unique_ptr<Wallet>> createWallet(const std::string& name, const SecureString& passphrase, uint64_t wallet_creation_flags, std::vector<bilingual_str>& warnings) = 0;
 

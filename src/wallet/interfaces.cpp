@@ -241,7 +241,7 @@ public:
         LOCK(m_wallet->cs_wallet);
         return m_wallet->DisplayAddress(dest, fingerprint);
     }
-    util::Result<std::vector<std::string>> createMultisigDescriptor(int nrequired, const std::vector<MultisigKey>& keys, OutputType type, std::optional<uint32_t> fallback_older, std::optional<uint32_t> fallback_after, std::optional<uint32_t> fallback_older_one_key) override
+    util::Result<CreateMultisigResult> createMultisigDescriptor(int nrequired, const std::vector<MultisigKey>& keys, OutputType type, std::optional<uint32_t> fallback_older, std::optional<uint32_t> fallback_after, std::optional<uint32_t> fallback_older_one_key) override
     {
         std::vector<wallet::MultisigKeySpec> specs;
         specs.reserve(keys.size());
@@ -252,12 +252,26 @@ public:
             spec.hdkey = k.hdkey;
             spec.xpub = k.xpub;
             spec.recovery_only = k.recovery_only;
+            spec.generate_local = k.generate_local;
+            spec.recovery_mnemonic = k.recovery_mnemonic;
             specs.push_back(std::move(spec));
         }
         LOCK(m_wallet->cs_wallet);
         auto created = wallet::CreateMultisigDescriptor(*m_wallet, nrequired, specs, wallet::MultisigOptions{type, /*account=*/0, {}, fallback_older, fallback_after, fallback_older_one_key});
         if (!created) return util::Error{util::ErrorString(created)};
-        return created->descs;
+        CreateMultisigResult result;
+        result.descs = std::move(created->descs);
+        result.recovery.reserve(created->recovery.size());
+        for (auto& item : created->recovery) {
+            result.recovery.push_back(GeneratedMnemonic{
+                item.key_index,
+                std::move(item.mnemonic),
+                std::move(item.fingerprint),
+                std::move(item.path),
+                std::move(item.xpub),
+            });
+        }
+        return result;
     }
     bool lockCoin(const COutPoint& output, const bool write_to_db) override
     {
@@ -511,6 +525,12 @@ public:
     unsigned int getConfirmTarget() override { return m_wallet->m_confirm_target; }
     bool hdEnabled() override { return m_wallet->IsHDEnabled(); }
     bool canGetAddresses() override { return m_wallet->CanGetAddresses(); }
+    bool canGetAddresses(OutputType type) override
+    {
+        LOCK(m_wallet->cs_wallet);
+        auto* spk_man = m_wallet->GetScriptPubKeyMan(type, /*internal=*/false);
+        return spk_man && spk_man->CanGetAddresses();
+    }
     bool hasExternalSigner() override { return m_wallet->IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER); }
     bool privateKeysDisabled() override { return m_wallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS); }
     bool taprootEnabled() override {
@@ -548,7 +568,9 @@ public:
     }
     void setLostSigner(const std::string& fingerprint, bool lost) override {
         LOCK(m_wallet->cs_wallet);
-        m_wallet->SetLostSigner(fingerprint, lost);
+        if (!m_wallet->SetLostSigner(fingerprint, lost)) {
+            m_wallet->WalletLogPrintf("Unable to persist unavailable vault signer %s\n", fingerprint);
+        }
     }
     std::string exportVaultPolicy() override {
         LOCK(m_wallet->cs_wallet);
@@ -559,6 +581,60 @@ public:
         if (!pkg) return util::Error{util::ErrorString(pkg)};
         LOCK(m_wallet->cs_wallet);
         return ImportWalletVaultPolicy(*m_wallet, *pkg);
+    }
+    util::Result<std::vector<VaultMnemonicMatch>> restoreVaultPolicy(
+        const std::string& package_json, const std::vector<SecureString>& mnemonics) override
+    {
+        auto pkg = ParseVaultPolicyPackage(package_json);
+        if (!pkg) return util::Error{util::ErrorString(pkg)};
+        auto validated = ValidateVaultPolicyMnemonics(*pkg, mnemonics);
+        if (!validated) return util::Error{util::ErrorString(validated)};
+
+        m_wallet->BlockUntilSyncedToCurrentChain();
+        WalletRescanReserver reserver(*m_wallet);
+        if (!reserver.reserve(/*with_passphrase=*/true)) {
+            return util::Error{Untranslated("Wallet is currently rescanning. Abort it or wait before restoring the vault.")};
+        }
+
+        // Prevent an automatic timeout from relocking an encrypted wallet while
+        // private descriptors are imported and their history is rescanned.
+        LOCK(m_wallet->m_relock_mutex);
+        uint256 genesis;
+        auto restored = [&]() -> util::Result<std::vector<wallet::VaultMnemonicMatch>> {
+            LOCK(m_wallet->cs_wallet);
+            const int tip_height = m_wallet->GetLastBlockHeight();
+            if (tip_height < 0 ||
+                !m_wallet->chain().hasBlocks(m_wallet->GetLastBlockHash(), /*min_height=*/0, /*max_height=*/{})) {
+                return util::Error{Untranslated("A complete vault restore requires unpruned block data back to genesis")};
+            }
+            if (!m_wallet->chain().findAncestorByHeight(m_wallet->GetLastBlockHash(), /*ancestor_height=*/0,
+                                                        FoundBlock().hash(genesis))) {
+                return util::Error{Untranslated("Unable to locate the genesis block for the vault rescan")};
+            }
+            return RestoreWalletVaultPolicy(*m_wallet, *pkg, mnemonics);
+        }();
+        if (!restored) return util::Error{util::ErrorString(restored)};
+
+        const CWallet::ScanResult scan = m_wallet->ScanForWalletTransactions(
+            genesis, /*start_height=*/0, /*max_height=*/{}, reserver, /*save_progress=*/true);
+        if (scan.status == CWallet::ScanResult::FAILURE) {
+            return util::Error{Untranslated("Vault keys were restored, but the historical blockchain rescan failed. Run rescanblockchain from height 0.")};
+        }
+        if (scan.status == CWallet::ScanResult::USER_ABORT) {
+            return util::Error{Untranslated("Vault keys were restored, but the historical blockchain rescan was aborted. Run rescanblockchain from height 0.")};
+        }
+
+        std::vector<VaultMnemonicMatch> matches;
+        matches.reserve(restored->size());
+        for (auto& match : *restored) {
+            matches.push_back(VaultMnemonicMatch{
+                match.mnemonic_index,
+                std::move(match.fingerprint),
+                std::move(match.path),
+                std::move(match.xpub),
+            });
+        }
+        return matches;
     }
     OutputType getDefaultAddressType() override { return m_wallet->m_default_address_type; }
     CAmount getDefaultMaxTxFee() override { return m_wallet->m_default_max_tx_fee; }
@@ -640,6 +716,27 @@ public:
     void schedulerMockForward(std::chrono::seconds delta) override { Assert(m_context.scheduler)->MockForward(delta); }
 
     //! WalletLoader methods
+    util::Result<void> checkRescanFromGenesis() override
+    {
+        Chain& chain{*Assert(m_context.chain)};
+        if (chain.isInitialBlockDownload()) {
+            return util::Error{Untranslated("Wait for the node to finish synchronizing before restoring a vault")};
+        }
+        const std::optional<int> tip_height{chain.getHeight()};
+        if (!tip_height) {
+            return util::Error{Untranslated("A vault restore requires an active blockchain tip")};
+        }
+        const uint256 tip_hash{chain.getBlockHash(*tip_height)};
+        if (!chain.hasBlocks(tip_hash, /*min_height=*/0, /*max_height=*/{})) {
+            return util::Error{Untranslated("A complete vault restore requires unpruned block data back to genesis")};
+        }
+        uint256 genesis;
+        if (!chain.findAncestorByHeight(tip_hash, /*ancestor_height=*/0, FoundBlock().hash(genesis))) {
+            return util::Error{Untranslated("Unable to locate the genesis block for the vault rescan")};
+        }
+        return {};
+    }
+
     util::Result<std::unique_ptr<Wallet>> createWallet(const std::string& name, const SecureString& passphrase, uint64_t wallet_creation_flags, std::vector<bilingual_str>& warnings) override
     {
         DatabaseOptions options;

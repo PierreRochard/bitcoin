@@ -513,12 +513,8 @@ public:
 
     //! Local labels for vault signers believed permanently lost. Does not change on-chain policy.
     std::set<std::string> m_lost_signers GUARDED_BY(cs_wallet);
-    void SetLostSigner(const std::string& fingerprint, bool lost) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
-    {
-        AssertLockHeld(cs_wallet);
-        if (lost) m_lost_signers.insert(fingerprint);
-        else m_lost_signers.erase(fingerprint);
-    }
+    bool SetLostSigner(const std::string& fingerprint, bool lost) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool SetLostSigners(const std::set<std::string>& fingerprints) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     /** Set of Coins owned by this wallet that we won't try to spend from. A
      * Coin may be locked if it has already been used to fund a transaction

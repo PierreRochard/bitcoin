@@ -58,6 +58,7 @@
 #include <util/log.h>
 #include <util/moneystr.h>
 #include <util/result.h>
+#include <util/strencodings.h>
 #include <util/string.h>
 #include <util/time.h>
 #include <util/translation.h>
@@ -2818,6 +2819,45 @@ void CWallet::LoadLockedCoin(const COutPoint& coin, bool persistent)
 {
     AssertLockHeld(cs_wallet);
     m_locked_coins.emplace(coin, persistent);
+}
+
+bool CWallet::SetLostSigners(const std::set<std::string>& fingerprints)
+{
+    AssertLockHeld(cs_wallet);
+    std::set<std::string> normalized;
+    for (const std::string& fingerprint : fingerprints) {
+        if (fingerprint.size() != 8 || !IsHex(fingerprint)) return false;
+        normalized.insert(ToLower(fingerprint));
+    }
+    if (normalized == m_lost_signers) return true;
+
+    const bool written = RunWithinTxn(GetDatabase(), /*process_desc=*/"update lost vault signers",
+        [&](WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
+        for (const std::string& fingerprint : m_lost_signers) {
+            if (!normalized.contains(fingerprint) && !batch.EraseLostSigner(fingerprint)) return false;
+        }
+        for (const std::string& fingerprint : normalized) {
+            if (!m_lost_signers.contains(fingerprint) && !batch.WriteLostSigner(fingerprint)) return false;
+        }
+        return true;
+    });
+    if (!written) return false;
+    m_lost_signers = std::move(normalized);
+    return true;
+}
+
+bool CWallet::SetLostSigner(const std::string& fingerprint, bool lost)
+{
+    AssertLockHeld(cs_wallet);
+    if (fingerprint.size() != 8 || !IsHex(fingerprint)) return false;
+    std::set<std::string> updated{m_lost_signers};
+    const std::string normalized{ToLower(fingerprint)};
+    if (lost) {
+        updated.insert(normalized);
+    } else {
+        updated.erase(normalized);
+    }
+    return SetLostSigners(updated);
 }
 
 bool CWallet::LockCoin(const COutPoint& output, bool persist)

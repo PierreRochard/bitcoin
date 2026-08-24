@@ -71,6 +71,7 @@ extern const std::string HDCHAIN;
 extern const std::string KEY;
 extern const std::string KEYMETA;
 extern const std::string LOCKED_UTXO;
+extern const std::string LOST_SIGNER;
 extern const std::string MASTER_KEY;
 extern const std::string MINVERSION;
 extern const std::string NAME;
@@ -260,6 +261,8 @@ public:
 
     bool WriteLockedUTXO(const COutPoint& output);
     bool EraseLockedUTXO(const COutPoint& output);
+    bool WriteLostSigner(const std::string& fingerprint);
+    bool EraseLostSigner(const std::string& fingerprint);
 
     bool WriteAddressPreviouslySpent(const CTxDestination& dest, bool previously_spent);
     bool WriteAddressReceiveRequest(const CTxDestination& dest, const std::string& id, const std::string& receive_request);

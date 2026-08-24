@@ -45,11 +45,11 @@ using common::PSBTError;
 //! All-local Scrooge vault (bitcoin#24861) through CreateMultisigDescriptor:
 //! n computer HD seeds, n-of-n MuSig2 key-path now, m-of-n after older(N).
 
-static std::shared_ptr<CWallet> MakeWallet()
+static std::shared_ptr<CWallet> MakeWallet(uint64_t extra_flags = 0)
 {
     auto wallet = std::shared_ptr<CWallet>(new CWallet(/*chain=*/nullptr, "vault_local", CreateMockableWalletDatabase()));
     wallet->m_keypool_size = 8;
-    wallet->InitWalletFlags(WALLET_FLAG_DESCRIPTORS | WALLET_FLAG_LAST_HARDENED_XPUB_CACHED);
+    wallet->InitWalletFlags(WALLET_FLAG_DESCRIPTORS | WALLET_FLAG_LAST_HARDENED_XPUB_CACHED | extra_flags);
     return wallet;
 }
 
@@ -399,6 +399,94 @@ BOOST_AUTO_TEST_CASE(vault_infer_and_duplicate_edges)
     BOOST_CHECK(!InferWalletVaultPolicy(*plain).is_vault);
 }
 
+BOOST_AUTO_TEST_CASE(generated_local_keys_are_distinct_and_spend)
+{
+    auto wallet = MakeWallet(WALLET_FLAG_BLANK_WALLET);
+    LOCK(wallet->cs_wallet);
+    BOOST_REQUIRE(wallet->IsWalletFlagSet(WALLET_FLAG_BLANK_WALLET));
+
+    std::vector<MultisigKeySpec> specs(3);
+    for (size_t i = 0; i < specs.size(); ++i) {
+        specs[i].generate_local = true;
+        specs[i].label = strprintf("computer-%u", i + 1);
+    }
+    auto created = CreateMultisigDescriptor(*wallet, /*nrequired=*/2, specs,
+                                            MultisigOptions{OutputType::BECH32M, 0, {}, /*fallback_older=*/2, {}, {}});
+    BOOST_REQUIRE_MESSAGE(created, util::ErrorString(created).original);
+    BOOST_REQUIRE_EQUAL(created->recovery.size(), 3U);
+    std::set<std::string> unique_xpubs;
+    for (const GeneratedMnemonic& record : created->recovery) {
+        BOOST_CHECK(unique_xpubs.insert(record.xpub).second);
+    }
+
+    BOOST_REQUIRE_EQUAL(created->descs.size(), 2U);
+    BOOST_CHECK(created->descs[0] != created->descs[1]);
+    for (const std::string& desc : created->descs) {
+        BOOST_CHECK(desc.find("xprv") == std::string::npos);
+        BOOST_CHECK(desc.find("tprv") == std::string::npos);
+
+        FlatSigningProvider public_keys;
+        std::string error;
+        auto parsed = Parse(desc, public_keys, error, /*require_checksum=*/true);
+        BOOST_REQUIRE_MESSAGE(!parsed.empty(), error);
+        BOOST_CHECK(public_keys.keys.empty());
+        std::string private_desc;
+        BOOST_CHECK(!parsed.front()->ToPrivateString(public_keys, private_desc));
+    }
+
+    FlatSigningProvider parsed_keys;
+    std::string parse_error;
+    auto parsed = Parse(created->descs.front(), parsed_keys, parse_error, /*require_checksum=*/true);
+    BOOST_REQUIRE_MESSAGE(!parsed.empty(), parse_error);
+    std::vector<CScript> scripts;
+    FlatSigningProvider expanded_keys;
+    BOOST_REQUIRE(parsed.front()->Expand(/*pos=*/0, parsed_keys, scripts, expanded_keys));
+    BOOST_REQUIRE_EQUAL(expanded_keys.aggregate_pubkeys.size(), 1U);
+    const auto& participants = expanded_keys.aggregate_pubkeys.begin()->second;
+    BOOST_REQUIRE_EQUAL(participants.size(), 3U);
+    const std::set<CPubKey> unique_participants{participants.begin(), participants.end()};
+    BOOST_CHECK_EQUAL(unique_participants.size(), participants.size());
+
+    const CTxDestination dest = *Assert(wallet->GetNewDestination(OutputType::BECH32M, ""));
+    ExpectKeypath(SignSpk(*wallet, GetScriptForDestination(dest), CTxIn::SEQUENCE_FINAL),
+                  "three generated local keys");
+}
+
+BOOST_AUTO_TEST_CASE(generated_local_rejects_conflicts_and_duplicate_explicit_key)
+{
+    auto conflict_wallet = MakeWallet(WALLET_FLAG_BLANK_WALLET);
+    LOCK(conflict_wallet->cs_wallet);
+
+    std::vector<MultisigKeySpec> conflicts(3);
+    for (auto& spec : conflicts) spec.generate_local = true;
+    conflicts[0].fingerprint = "aabbccdd";
+    conflicts[1].hdkey = "not-an-hd-key";
+    conflicts[2].xpub = "not-an-xpub";
+    for (const auto& spec : conflicts) {
+        auto rejected = CreateMultisigDescriptor(*conflict_wallet, /*nrequired=*/1, {spec},
+                                                 MultisigOptions{OutputType::BECH32, 0, {}, {}, {}, {}});
+        BOOST_REQUIRE(!rejected);
+        BOOST_CHECK_EQUAL(util::ErrorString(rejected).original,
+                          "A mnemonic local key cannot also specify another key source");
+    }
+    BOOST_CHECK(conflict_wallet->IsWalletFlagSet(WALLET_FLAG_BLANK_WALLET));
+    BOOST_CHECK(conflict_wallet->GetActiveScriptPubKeyMans().empty());
+
+    auto duplicate_wallet = MakeWallet(WALLET_FLAG_BLANK_WALLET);
+    LOCK(duplicate_wallet->cs_wallet);
+    MultisigKeySpec duplicate;
+    duplicate.path = PathStr();
+    duplicate.hdkey = EncodeExtKey(RandomMaster());
+    auto rejected = CreateMultisigDescriptor(*duplicate_wallet, /*nrequired=*/2, {duplicate, duplicate},
+                                             MultisigOptions{OutputType::BECH32M, 0, {}, {}, {}, {}});
+    BOOST_REQUIRE(!rejected);
+    BOOST_CHECK_EQUAL(util::ErrorString(rejected).original,
+                      "Each multisig participant must use a distinct key");
+    BOOST_CHECK(!DuplicateSignerWarning({duplicate, duplicate}).empty());
+    BOOST_CHECK(duplicate_wallet->IsWalletFlagSet(WALLET_FLAG_BLANK_WALLET));
+    BOOST_CHECK(duplicate_wallet->GetActiveScriptPubKeyMans().empty());
+}
+
 BOOST_AUTO_TEST_CASE(all_local_vault_matrix_older_1)
 {
     const std::pair<int, int> policies[] = {
@@ -694,7 +782,6 @@ BOOST_AUTO_TEST_CASE(vault_recovery_only_key_omitted_from_musig)
                                             MultisigOptions{OutputType::BECH32M, 0, {}, /*fallback_older=*/144});
     BOOST_REQUIRE_MESSAGE(created, util::ErrorString(created).original);
     BOOST_REQUIRE(!created->descs.empty());
-    BOOST_CHECK_EQUAL(created->key_exprs.size(), 2U);
     const std::string& desc = created->descs[0];
     BOOST_CHECK(desc.find("tr(musig(") != std::string::npos);
     BOOST_CHECK(desc.find("older(144)") != std::string::npos);
@@ -722,7 +809,6 @@ BOOST_AUTO_TEST_CASE(vault_recovery_only_key_omitted_from_musig)
     auto after_created = CreateMultisigDescriptor(*after_w, /*nrequired=*/1, {ka, kb, kh},
                                                   MultisigOptions{OutputType::BECH32M, 0, {}, {}, /*fallback_after=*/500});
     BOOST_REQUIRE_MESSAGE(after_created, util::ErrorString(after_created).original);
-    BOOST_CHECK_EQUAL(after_created->key_exprs.size(), 2U);
     BOOST_CHECK(after_created->descs[0].find("after(500)") != std::string::npos);
     BOOST_CHECK(after_created->descs[0].find("older(") == std::string::npos);
 }

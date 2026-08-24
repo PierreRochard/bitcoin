@@ -7,10 +7,12 @@
 
 #include <consensus/amount.h>
 #include <outputtype.h>
+#include <support/allocators/secure.h>
 #include <util/result.h>
 #include <util/translation.h>
 
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -37,6 +39,13 @@ struct MultisigKeySpec {
     //! If true, this key is absent from the MuSig2 key-path and appears only
     //! in the delayed recovery script (inheritance / recovery-only signer).
     bool recovery_only{false};
+    //! Generate a fresh private HD root inside this wallet. This is distinct
+    //! from an omitted hdkey, which selects an existing wallet root.
+    bool generate_local{false};
+    //! Restore a local key from a BIP39 English mnemonic. This private field is
+    //! only available to in-process callers and is never parsed from RPC input.
+    //! It is mutually exclusive with every other key source above.
+    std::optional<SecureString> recovery_mnemonic;
 };
 
 struct MultisigOptions {
@@ -56,10 +65,25 @@ struct MultisigOptions {
     std::optional<uint32_t> fallback_older_one_key;
 };
 
+struct GeneratedMnemonic {
+    //! Position of this generated software participant in the input key list.
+    size_t key_index{0};
+    //! BIP39 English mnemonic. This is intentionally held in locked, cleansing
+    //! memory and must never be included in public descriptors or transcripts.
+    SecureString mnemonic;
+    //! Master fingerprint and derived account public key for matching restores.
+    std::string fingerprint;
+    //! Canonical exact account path (for example m/48h/1h/0h/3h).
+    std::string path;
+    std::string xpub;
+};
+
 struct MultisigDescriptorResult {
     int nrequired{0};
     std::vector<std::string> descs;
-    std::vector<std::string> key_exprs;
+    //! Recovery material only for keys freshly created with generate_local.
+    //! Supplying recovery_mnemonic restores a key and does not echo it here.
+    std::vector<GeneratedMnemonic> recovery;
     std::optional<uint32_t> fallback_older;
     std::optional<uint32_t> fallback_after;
     std::optional<uint32_t> fallback_older_one_key;
@@ -175,10 +199,32 @@ struct VaultPolicyPackage {
     std::vector<std::string> descs;
 };
 
+//! Public metadata identifying one mnemonic-derived participant in a vault.
+//! The mnemonic and all private key material are deliberately excluded.
+struct VaultMnemonicMatch {
+    size_t mnemonic_index{0};
+    std::string fingerprint;
+    std::string path;
+    std::string xpub;
+};
+
 std::string FormatVaultPolicyPackage(const VaultPolicyPackage& pkg);
 util::Result<VaultPolicyPackage> ParseVaultPolicyPackage(const std::string& json);
 VaultPolicyPackage ExportWalletVaultPolicy(const CWallet& wallet);
 util::Result<void> ImportWalletVaultPolicy(CWallet& wallet, const VaultPolicyPackage& pkg);
+//! Require the GUI's fixed policy: three active/recovery participants, 2-of-3
+//! after 4,320 blocks, then 1-of-3 after 8,640 blocks, on the standard account.
+//! The package must contain a public receive/change descriptor pair.
+util::Result<void> ValidateFixedStagedVaultPolicy(const VaultPolicyPackage& pkg);
+//! Validate 1-3 BIP39 phrases against both branches of a public three-key vault.
+//! No wallet state is read or changed.
+util::Result<std::vector<VaultMnemonicMatch>> ValidateVaultPolicyMnemonics(
+    const VaultPolicyPackage& pkg, std::span<const SecureString> mnemonics);
+//! Import both public vault branches with only the private account keys matched
+//! by mnemonics. Caller must hold cs_wallet and unlock an encrypted wallet.
+//! Validation completes before descriptor state is changed.
+util::Result<std::vector<VaultMnemonicMatch>> RestoreWalletVaultPolicy(
+    CWallet& wallet, const VaultPolicyPackage& pkg, std::span<const SecureString> mnemonics);
 } // namespace wallet
 
 #endif // BITCOIN_WALLET_MULTISIG_H

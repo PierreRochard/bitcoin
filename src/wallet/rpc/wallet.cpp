@@ -1184,7 +1184,9 @@ static RPCMethod setlostsigner()
             }
             const bool lost = request.params[1].isNull() || request.params[1].get_bool();
             LOCK(pwallet->cs_wallet);
-            pwallet->SetLostSigner(fpr, lost);
+            if (!pwallet->SetLostSigner(fpr, lost)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Unable to persist lost signer metadata");
+            }
             UniValue arr(UniValue::VARR);
             for (const auto& s : pwallet->m_lost_signers) arr.push_back(s);
             UniValue out(UniValue::VOBJ);

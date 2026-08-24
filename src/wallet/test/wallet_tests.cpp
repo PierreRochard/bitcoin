@@ -11,6 +11,7 @@
 
 #include <addresstype.h>
 #include <interfaces/chain.h>
+#include <interfaces/wallet.h>
 #include <key_io.h>
 #include <node/blockstorage.h>
 #include <node/types.h>
@@ -44,6 +45,26 @@ static_assert(DEFAULT_TRANSACTION_MINFEE >= DEFAULT_MIN_RELAY_TX_FEE, "wallet mi
 static_assert(WALLET_INCREMENTAL_RELAY_FEE >= DEFAULT_INCREMENTAL_RELAY_FEE, "wallet incremental fee is smaller than default incremental relay fee");
 
 BOOST_FIXTURE_TEST_SUITE(wallet_tests, WalletTestingSetup)
+
+BOOST_FIXTURE_TEST_CASE(check_rescan_from_genesis_rejects_missing_blocks_without_wallet_creation, TestChain100Setup)
+{
+    auto loader{interfaces::MakeWalletLoader(*m_node.chain, *Assert(m_node.args))};
+    BOOST_CHECK(loader->getWallets().empty());
+    const auto ready{loader->checkRescanFromGenesis()};
+    BOOST_REQUIRE_MESSAGE(ready, util::ErrorString(ready).original);
+
+    {
+        LOCK(Assert(m_node.chainman)->GetMutex());
+        const CChain& active{Assert(m_node.chainman)->ActiveChain()};
+        BOOST_REQUIRE_GT(active.Height(), 5);
+        active[5]->nStatus &= ~BLOCK_HAVE_DATA;
+    }
+
+    const auto blocked{loader->checkRescanFromGenesis()};
+    BOOST_REQUIRE(!blocked);
+    BOOST_CHECK(util::ErrorString(blocked).original.find("unpruned block data back to genesis") != std::string::npos);
+    BOOST_CHECK(loader->getWallets().empty());
+}
 
 static CMutableTransaction TestSimpleSpend(const CTransaction& from, uint32_t index, const CKey& key, const CScript& pubkey)
 {
