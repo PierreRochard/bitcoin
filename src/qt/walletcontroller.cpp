@@ -440,6 +440,68 @@ void RestoreWalletActivity::finish()
     Q_EMIT finished();
 }
 
+MnemonicRestoreActivity::MnemonicRestoreActivity(WalletController* wallet_controller, QWidget* parent_widget)
+    : WalletControllerActivity(wallet_controller, parent_widget)
+{
+}
+
+MnemonicRestoreActivity::~MnemonicRestoreActivity()
+{
+    m_mnemonics.clear();
+}
+
+void MnemonicRestoreActivity::restore(const std::string& wallet_name, const std::string& policy_json,
+                                      std::vector<SecureString> mnemonics)
+{
+    m_wallet_name = wallet_name;
+    m_policy_json = policy_json;
+    m_mnemonics = std::move(mnemonics);
+    showProgressDialog(
+        tr("Restore Scrooge Vault"),
+        tr("Restoring <b>%1</b> and rescanning the blockchain from genesis…")
+            .arg(QString::fromStdString(wallet_name).toHtmlEscaped()));
+
+    QTimer::singleShot(0, worker(), [this] {
+        auto rescan_ready{node().walletLoader().checkRescanFromGenesis()};
+        if (!rescan_ready) {
+            m_error_message = util::ErrorString(rescan_ready);
+            m_mnemonics.clear();
+            m_policy_json.clear();
+            QTimer::singleShot(0, this, &MnemonicRestoreActivity::finish);
+            return;
+        }
+        const uint64_t flags = WALLET_FLAG_DESCRIPTORS | WALLET_FLAG_BLANK_WALLET;
+        auto wallet{node().walletLoader().createWallet(m_wallet_name, SecureString{}, flags, m_warning_message)};
+        if (!wallet) {
+            m_error_message = util::ErrorString(wallet);
+        } else {
+            auto restored = (*wallet)->restoreVaultPolicy(m_policy_json, m_mnemonics);
+            if (!restored) {
+                m_error_message = util::ErrorString(restored);
+            } else {
+                m_wallet_model = m_wallet_controller->getOrCreateWallet(std::move(*wallet));
+            }
+        }
+        m_mnemonics.clear();
+        m_policy_json.clear();
+        QTimer::singleShot(0, this, &MnemonicRestoreActivity::finish);
+    });
+}
+
+void MnemonicRestoreActivity::finish()
+{
+    if (!m_error_message.empty()) {
+        QMessageBox::critical(m_parent_widget, tr("Restore vault failed"),
+                              QString::fromStdString(m_error_message.translated));
+        Q_EMIT failed();
+    } else if (!m_warning_message.empty()) {
+        QMessageBox::warning(m_parent_widget, tr("Restore vault warning"),
+                             QString::fromStdString(Join(m_warning_message, Untranslated("\n")).translated));
+    }
+    if (m_wallet_model) Q_EMIT restored(m_wallet_model);
+    Q_EMIT finished();
+}
+
 void MigrateWalletActivity::do_migrate(const std::string& name, bool load_wallet)
 {
     SecureString passphrase;

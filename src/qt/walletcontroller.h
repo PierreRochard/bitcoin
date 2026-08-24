@@ -41,6 +41,7 @@ class AskPassphraseDialog;
 class CreateWalletActivity;
 class CreateWalletDialog;
 class MigrateWalletActivity;
+class MnemonicRestoreActivity;
 class OpenWalletActivity;
 class WalletControllerActivity;
 
@@ -178,6 +179,30 @@ Q_SIGNALS:
 
 private:
     void finish();
+};
+
+/** Restore a vault from its public policy and printed BIP39 recovery sheets. */
+class MnemonicRestoreActivity : public WalletControllerActivity
+{
+    Q_OBJECT
+
+public:
+    MnemonicRestoreActivity(WalletController* wallet_controller, QWidget* parent_widget);
+    ~MnemonicRestoreActivity() override;
+
+    void restore(const std::string& wallet_name, const std::string& policy_json,
+                 std::vector<SecureString> mnemonics);
+
+Q_SIGNALS:
+    void restored(WalletModel* wallet_model);
+    void failed();
+
+private:
+    void finish();
+
+    std::string m_wallet_name;
+    std::string m_policy_json;
+    std::vector<SecureString> m_mnemonics;
 };
 
 class MigrateWalletActivity : public WalletControllerActivity
