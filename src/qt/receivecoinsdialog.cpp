@@ -86,28 +86,42 @@ void ReceiveCoinsDialog::setModel(WalletModel *_model)
             &QItemSelectionModel::selectionChanged, this,
             &ReceiveCoinsDialog::recentRequestsView_selectionChanged);
 
-        // Populate address type dropdown and select default
-        auto add_address_type = [&](OutputType type, const QString& text, const QString& tooltip) {
-            const auto index = ui->addressType->count();
-            ui->addressType->addItem(text, (int) type);
-            ui->addressType->setItemData(index, tooltip, Qt::ToolTipRole);
-            if (model->wallet().getDefaultAddressType() == type) ui->addressType->setCurrentIndex(index);
-        };
-        add_address_type(OutputType::LEGACY, tr("Base58 (Legacy)"), tr("Not recommended due to higher fees and less protection against typos."));
-        add_address_type(OutputType::P2SH_SEGWIT, tr("Base58 (P2SH-SegWit)"), tr("Generates an address compatible with older wallets."));
-        add_address_type(OutputType::BECH32, tr("Bech32 (SegWit)"), tr("Generates a native segwit address (BIP-173). Some old wallets don't support it."));
-        if (model->wallet().taprootEnabled()) {
-            add_address_type(OutputType::BECH32M, tr("Bech32m (Taproot)"), tr("Bech32m (BIP-350) is an upgrade to Bech32, wallet support is still limited."));
-        }
+        updateAddressTypes();
 
-        // Set the button to be enabled or disabled based on whether the wallet can give out new addresses.
-        ui->receiveButton->setEnabled(model->wallet().canGetAddresses());
-
-        // Enable/disable the receive button if the wallet is now able/unable to give out new addresses.
-        connect(model, &WalletModel::canGetAddressesChanged, [this] {
-            ui->receiveButton->setEnabled(model->wallet().canGetAddresses());
-        });
+        // Descriptor imports can add or replace address managers after the wallet
+        // model is created, so refresh both the types and the button.
+        connect(model, &WalletModel::canGetAddressesChanged, this, &ReceiveCoinsDialog::updateAddressTypes);
     }
+}
+
+void ReceiveCoinsDialog::updateAddressTypes()
+{
+    const QVariant previous_type = ui->addressType->currentData();
+    ui->addressType->clear();
+
+    if (!model) {
+        ui->receiveButton->setEnabled(false);
+        return;
+    }
+
+    auto add_address_type = [&](OutputType type, const QString& text, const QString& tooltip) {
+        if (!model->wallet().canGetAddresses(type)) return;
+        const auto index = ui->addressType->count();
+        ui->addressType->addItem(text, static_cast<int>(type));
+        ui->addressType->setItemData(index, tooltip, Qt::ToolTipRole);
+    };
+    add_address_type(OutputType::LEGACY, tr("Base58 (Legacy)"), tr("Not recommended due to higher fees and less protection against typos."));
+    add_address_type(OutputType::P2SH_SEGWIT, tr("Base58 (P2SH-SegWit)"), tr("Generates an address compatible with older wallets."));
+    add_address_type(OutputType::BECH32, tr("Bech32 (SegWit)"), tr("Generates a native segwit address (BIP-173). Some old wallets don't support it."));
+    add_address_type(OutputType::BECH32M, tr("Bech32m (Taproot)"), tr("Bech32m (BIP-350) is an upgrade to Bech32, wallet support is still limited."));
+
+    int selected_index = previous_type.isValid() ? ui->addressType->findData(previous_type) : -1;
+    if (selected_index < 0) {
+        selected_index = ui->addressType->findData(static_cast<int>(model->wallet().getDefaultAddressType()));
+    }
+    if (selected_index < 0 && ui->addressType->count() > 0) selected_index = 0;
+    ui->addressType->setCurrentIndex(selected_index);
+    ui->receiveButton->setEnabled(selected_index >= 0 && model->wallet().canGetAddresses());
 }
 
 ReceiveCoinsDialog::~ReceiveCoinsDialog()
@@ -147,6 +161,7 @@ void ReceiveCoinsDialog::on_receiveButton_clicked()
 {
     if(!model || !model->getOptionsModel() || !model->getAddressTableModel() || !model->getRecentRequestsTableModel())
         return;
+    if (ui->addressType->currentIndex() < 0) return;
 
     QString address;
     QString label = ui->reqLabel->text();

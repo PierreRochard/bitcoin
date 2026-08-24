@@ -60,6 +60,7 @@ private:
 
     QModelIndex selectedRow();
     void copyColumnToClipboard(int column);
+    void updateAddressTypes();
 
 private Q_SLOTS:
     void on_receiveButton_clicked();
