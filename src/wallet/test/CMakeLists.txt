@@ -31,5 +31,6 @@ target_sources(test_bitcoin
     taproot_vault_mixed_tests.cpp
     taproot_vault_send_tests.cpp
     taproot_scale_tests.cpp
+    vault_policy_qr_tests.cpp
 )
 target_link_libraries(test_bitcoin bitcoin_wallet)

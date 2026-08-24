@@ -33,6 +33,7 @@ add_library(bitcoin_wallet STATIC EXCLUDE_FROM_ALL
   spend.cpp
   sqlite.cpp
   transaction.cpp
+  vault_policy_qr.cpp
   wallet.cpp
   walletdb.cpp
   walletutil.cpp
