@@ -161,6 +161,7 @@ public:
     }
 
     bool CanSignTaproot() const override { return true; }
+    bool CanSignMuSig2() const override { return true; }
     void Close() override {}
 
     KeyFingerprint GetMasterFingerprint() const override
@@ -241,7 +242,7 @@ std::vector<DeviceInfo> EnumerateMockDevices()
     for (const auto& record : g_mocks) {
         DeviceInfo info;
         info.type = "mock";
-        info.model = "mock";
+        info.model = "Mock Trezor";
         info.path = record->path;
         info.fingerprint = record->fingerprint;
         result.push_back(std::move(info));

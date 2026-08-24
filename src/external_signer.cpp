@@ -141,6 +141,16 @@ UniValue ExternalSigner::GetXpub(const std::string& path) const
     return RunCommandParseJSON(Cat(m_command, Cat(Cat({"--fingerprint", m_fingerprint}, NetworkArg()), {"getxpub", path})), "");
 }
 
+std::optional<bool> ExternalSigner::SupportsStagedVault() const
+{
+    if (!m_native) return std::nullopt;
+    auto client = hwi::FindDevice(m_fingerprint);
+    if (!client) return false;
+    const bool supported = client->CanSignTaproot() && client->CanSignMuSig2();
+    client->Close();
+    return supported;
+}
+
 bool ExternalSigner::SignTransaction(PartiallySignedTransaction& psbtx, std::string& error)
 {
     // Serialize the PSBT

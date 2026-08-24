@@ -9,6 +9,7 @@
 #include <univalue.h>
 
 #include <string>
+#include <optional>
 #include <vector>
 
 class PartiallySignedTransaction;
@@ -67,6 +68,10 @@ public:
     //! subprocess API calls `<command> --fingerprint <fingerprint> --chain
     //! <chain> getxpub <path>` and expects `{"xpub": "..."}`.
     UniValue GetXpub(const std::string& path) const;
+
+    //! Native HWI Taproot + MuSig2 capability for the staged vault. Subprocess
+    //! signers currently have no capability field and return std::nullopt.
+    std::optional<bool> SupportsStagedVault() const;
 
     //! Sign PartiallySignedTransaction on the device.
     //! Calls `<command> --stdin --fingerprint <fingerprint> --chain <chain>` and passes the

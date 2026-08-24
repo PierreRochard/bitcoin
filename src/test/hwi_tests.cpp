@@ -181,7 +181,7 @@ BOOST_AUTO_TEST_CASE(native_external_signer)
     }
     BOOST_REQUIRE(mock_signer);
     BOOST_CHECK(mock_signer->m_native);
-    BOOST_CHECK_EQUAL(mock_signer->m_name, "mock");
+    BOOST_CHECK_EQUAL(mock_signer->m_name, "Mock Trezor");
 
     const UniValue xpub_res{mock_signer->GetXpub("m/48h/0h/0h/2h")};
     BOOST_CHECK(xpub_res.find_value("xpub").isStr());

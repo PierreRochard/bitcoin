@@ -112,6 +112,7 @@ public:
     ExternalSignerImpl(::ExternalSigner signer) : m_signer(std::move(signer)) {}
     std::string getName() override { return m_signer.m_name; }
     std::string getFingerprint() override { return m_signer.m_fingerprint; }
+    std::optional<bool> supportsStagedVault() override { return m_signer.SupportsStagedVault(); }
     ::ExternalSigner m_signer;
 };
 #endif

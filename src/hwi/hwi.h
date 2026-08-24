@@ -98,6 +98,9 @@ public:
     virtual PartiallySignedTransaction SignTx(PartiallySignedTransaction psbt) const = 0;
     virtual std::string SignMessage(const std::string& message, const std::string& bip32_path) const = 0;
     virtual bool CanSignTaproot() const = 0;
+    //! MuSig2 nonce and partial-signature support for PSBTv2. Drivers must opt
+    //! in explicitly; ordinary Taproot signing is not sufficient.
+    virtual bool CanSignMuSig2() const { return false; }
     virtual void Close() = 0;
 
     virtual KeyFingerprint GetMasterFingerprint() const;

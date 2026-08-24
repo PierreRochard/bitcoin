@@ -67,6 +67,11 @@ public:
 
     //! Master key fingerprint (8 hex characters).
     virtual std::string getFingerprint() = 0;
+
+    //! Whether this signer can complete the Taproot MuSig2 immediate path used
+    //! by the fixed staged vault. A missing value means the external-signer
+    //! protocol did not advertise a capability.
+    virtual std::optional<bool> supportsStagedVault() = 0;
 };
 
 //! Top-level interface for a bitcoin node (bitcoind process).
