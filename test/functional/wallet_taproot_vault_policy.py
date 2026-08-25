@@ -5,7 +5,9 @@
 """Vault policy package, lost signer, and mixed-maturity recovery."""
 
 import json
+import os
 import re
+import stat
 
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
@@ -40,6 +42,103 @@ class WalletTaprootVaultPolicyTest(BitcoinTestFramework):
         self.test_recovery_only_key()
         self.test_after_recovery()
         self.test_vault_recovery_option_edges()
+        self.test_rpc_recovery_vault_creation()
+
+    def test_rpc_recovery_vault_creation(self):
+        self.log.info("Two-phase RPC creation durably validates a private kit before atomic 90/180 wallet install")
+        node = self.nodes[0]
+        invalid_kit_path = os.path.join(self.options.tmpdir, "rpc-invalid-name-kit")
+        assert_raises_rpc_error(
+            -8,
+            "without path components",
+            node.preparerecoveryvault,
+            "../rpc_escape",
+            invalid_kit_path,
+        )
+        assert not os.path.exists(invalid_kit_path)
+        kit_path = os.path.join(self.options.tmpdir, "rpc-recovery-kit-pending")
+        prepared = node.preparerecoveryvault("rpc_fixed_pending", kit_path)
+        assert_equal(prepared["wallet_name"], "rpc_fixed_pending")
+        assert_equal(prepared["wallet_created"], False)
+        assert_equal(prepared["primary_delay"], 12960)
+        assert_equal(prepared["final_delay"], 25920)
+        assert_equal(prepared["software_keys"], 3)
+        assert_equal(len(prepared["policy_commitment"]), 64)
+        assert_equal(len(prepared["kit_commitment"]), 64)
+        assert "mnemonic" not in json.dumps(prepared).lower()
+        assert "xprv" not in json.dumps(prepared).lower()
+        assert "rpc_fixed_pending" not in node.listwallets()
+        assert_equal(
+            sorted(os.listdir(kit_path)),
+            ["README.txt", "manifest.json", "policy.json", "software-key-1.txt", "software-key-2.txt", "software-key-3.txt"],
+        )
+        if os.name != "nt":
+            assert_equal(stat.S_IMODE(os.stat(kit_path).st_mode), 0o700)
+            for filename in os.listdir(kit_path):
+                assert_equal(stat.S_IMODE(os.stat(os.path.join(kit_path, filename)).st_mode), 0o600)
+
+        assert_raises_rpc_error(
+            -4,
+            "commitment does not match",
+            node.createrecoveryvault,
+            kit_path,
+            "00" * 32,
+        )
+        assert "rpc_fixed_pending" not in [entry["name"] for entry in node.listwalletdir()["wallets"]]
+
+        created = node.createrecoveryvault(kit_path, prepared["kit_commitment"])
+        assert_equal(created["name"], "rpc_fixed_pending")
+        assert_equal(created["policy_commitment"], prepared["policy_commitment"])
+        assert_equal(created["kit_commitment"], prepared["kit_commitment"])
+        assert_equal(created["schedule"], "current_90_180")
+        assert_equal(created["setup_state"], "address_verification_required")
+        assert_equal(created["verification_state"], "recovery_kit_matched")
+        pending = node.get_wallet_rpc("rpc_fixed_pending")
+        status = pending.getvaultinfo()
+        assert_equal(status["schedule"], "current_90_180")
+        assert_equal(status["fallback_older"], 12960)
+        assert_equal(status["fallback_older_one_key"], 25920)
+        assert_equal(status["setup_state"], "address_verification_required")
+        assert_equal(status["verification_state"], "recovery_kit_matched")
+
+        node.unloadwallet("rpc_fixed_pending")
+        node.loadwallet("rpc_fixed_pending")
+        pending = node.get_wallet_rpc("rpc_fixed_pending")
+        assert_equal(pending.getvaultinfo()["verification_state"], "recovery_kit_matched")
+
+        finished_kit = os.path.join(self.options.tmpdir, "rpc-recovery-kit-finished")
+        finished_prepared = node.preparerecoveryvault("rpc_fixed_finished", finished_kit)
+        finished_created = node.createrecoveryvault(
+            finished_kit,
+            finished_prepared["kit_commitment"],
+            True,
+        )
+        assert_equal(finished_created["setup_state"], "complete")
+        assert_equal(finished_created["verification_state"], "finished_unverified")
+        assert "not independently verified" in " ".join(finished_created["warnings"]).lower()
+        finished = node.get_wallet_rpc("rpc_fixed_finished")
+        finished_status = finished.getvaultinfo()
+        assert_equal(finished_status["schedule"], "current_90_180")
+        assert_equal(finished_status["setup_state"], "complete")
+        assert_equal(finished_status["verification_state"], "finished_unverified")
+
+        self.funding.sendtoaddress(finished_created["address"], 1)
+        self.generate(node, 1)
+        destination = self.funding.getnewaddress()
+        spend = finished.send(
+            outputs={destination: 0.5},
+            options={"change_type": "bech32m", "fee_rate": 1, "add_to_wallet": False},
+        )
+        assert spend["complete"]
+        assert_equal(len(node.decoderawtransaction(spend["hex"])["vin"][0]["txinwitness"]), 1)
+
+        assert_raises_rpc_error(
+            -4,
+            "outside the Bitcoin data directory",
+            node.preparerecoveryvault,
+            "rpc_inside_data",
+            os.path.join(node.datadir_path, "inside-kit"),
+        )
 
     def test_journey1_keypath_hides_policy(self):
         self.log.info("Journey 1: 3-of-3 now / 2-of-3 later key-path spend does not reveal the policy")
@@ -266,20 +365,44 @@ class WalletTaprootVaultPolicyTest(BitcoinTestFramework):
                                     "add_inputs": False,
                                     "inputs": [{"txid": young["txid"], "vout": young["vout"], "sequence": 2}],
                                 })
-        rec = w.send(
+        # This deliberately custom one-stage policy has no durable exact
+        # participant roster. Marking a signer lost therefore keeps signing
+        # fail-closed even on a mature branch. Fixed 30/60 and 90/180 Recovery
+        # Vaults test participant-scoped reduced-quorum signing separately.
+        mature_options = {
+            "change_type": "bech32m",
+            "fee_rate": 1,
+            "add_to_wallet": False,
+            "add_inputs": False,
+            "inputs": [{"txid": old["txid"], "vout": old["vout"], "sequence": 2}],
+        }
+        assert_raises_rpc_error(
+            -25,
+            "additional signatures",
+            w.send,
+            outputs={dest: 1},
+            options=mature_options,
+        )
+        w.setlostsigner(signer_fingerprint, False)
+        rec = w.send(outputs={dest: 1}, options=mature_options)
+        assert rec["complete"]
+        dec = node.decoderawtransaction(rec["hex"])
+        assert_equal(dec["vin"][0]["sequence"], 2)
+        assert_greater_than(len(dec["vin"][0]["txinwitness"]), 1)
+        w.setlostsigner(signer_fingerprint, True)
+        assert_raises_rpc_error(
+            -25,
+            "additional signatures",
+            w.send,
             outputs={dest: 1},
             options={
                 "change_type": "bech32m",
                 "fee_rate": 1,
                 "add_to_wallet": False,
-                "add_inputs": False,
-                "inputs": [{"txid": old["txid"], "vout": old["vout"], "sequence": 2}],
+                "vault_recovery": True,
             },
         )
-        assert rec["complete"]
-        dec = node.decoderawtransaction(rec["hex"])
-        assert_equal(dec["vin"][0]["sequence"], 2)
-        assert_greater_than(len(dec["vin"][0]["txinwitness"]), 1)
+        w.setlostsigner(signer_fingerprint, False)
         mature_auto = w.send(
             outputs={dest: 1},
             options={

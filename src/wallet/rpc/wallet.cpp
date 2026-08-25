@@ -8,6 +8,7 @@
 #include <wallet/rpc/wallet.h>
 
 #include <chainparams.h>
+#include <common/args.h>
 #include <coins.h>
 #include <core_io.h>
 #include <external_signer.h>
@@ -25,8 +26,10 @@
 #include <wallet/external_signer_scriptpubkeyman.h>
 #include <wallet/context.h>
 #include <wallet/export.h>
+#include <wallet/fixed_vault_wallet.h>
 #include <wallet/multisig.h>
 #include <wallet/receive.h>
+#include <wallet/recovery_vault_kit.h>
 #include <wallet/rpc/util.h>
 #include <wallet/wallet.h>
 #include <wallet/walletutil.h>
@@ -1031,6 +1034,200 @@ static RPCMethod createmultisigdescriptor()
 }
 #endif // ENABLE_EXTERNAL_SIGNER
 
+static std::string FixedVaultScheduleName(const FixedVaultSchedule schedule)
+{
+    switch (schedule) {
+    case FixedVaultSchedule::CURRENT_90_180:
+        return "current_90_180";
+    case FixedVaultSchedule::LEGACY_30_60:
+        return "legacy_30_60";
+    case FixedVaultSchedule::CUSTOM:
+        return "custom";
+    }
+    assert(false);
+}
+
+static std::string VaultSetupStateName(const VaultSetupState state)
+{
+    switch (state) {
+    case VaultSetupState::NOT_RECORDED:
+        return "not_recorded";
+    case VaultSetupState::RECOVERY_KIT_REQUIRED:
+        return "recovery_kit_required";
+    case VaultSetupState::ADDRESS_VERIFICATION_REQUIRED:
+        return "address_verification_required";
+    case VaultSetupState::COMPLETE:
+        return "complete";
+    }
+    assert(false);
+}
+
+static std::string VaultVerificationStateName(const VaultVerificationState state)
+{
+    switch (state) {
+    case VaultVerificationState::NOT_RECORDED:
+        return "not_recorded";
+    case VaultVerificationState::PENDING:
+        return "pending";
+    case VaultVerificationState::RECOVERY_KIT_MATCHED:
+        return "recovery_kit_matched";
+    case VaultVerificationState::INDEPENDENTLY_VERIFIED:
+        return "independently_verified";
+    case VaultVerificationState::FINISHED_UNVERIFIED:
+        return "finished_unverified";
+    }
+    assert(false);
+}
+
+static RPCMethod preparerecoveryvault()
+{
+    return RPCMethod{
+        "preparerecoveryvault",
+        "Prepare a new three-software-key Recovery Vault using the current 90/180 schedule.\n"
+        "This writes a complete private Recovery Kit into a new permission-restricted directory, "
+        "but does not create a wallet. No recovery phrase is returned through RPC or written to logs.\n"
+        "The directory is an unencrypted bearer backup. Move a complete copy offline before funding the vault.\n",
+        {
+            {"wallet_name", RPCArg::Type::STR, RPCArg::Optional::NO, "Simple name for the future Recovery Vault wallet"},
+            {"recovery_kit_path", RPCArg::Type::STR, RPCArg::Optional::NO, "Absolute path to a new directory outside the Bitcoin data directory"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR, "wallet_name", "Future wallet name; no wallet exists yet"},
+                {RPCResult::Type::STR, "recovery_kit_path", "Canonical private Recovery Kit directory"},
+                {RPCResult::Type::STR, "policy_id", "Short public policy identifier"},
+                {RPCResult::Type::STR_HEX, "policy_commitment", "Full SHA-256 commitment to the canonical public policy"},
+                {RPCResult::Type::STR_HEX, "kit_commitment", "Full SHA-256 commitment to every exact Recovery Kit file, including the private phrases"},
+                {RPCResult::Type::NUM, "primary_delay", "Two-key recovery delay in blocks"},
+                {RPCResult::Type::NUM, "final_delay", "One-key recovery delay in blocks"},
+                {RPCResult::Type::NUM, "software_keys", "Number of generated software-key phrase files"},
+                {RPCResult::Type::BOOL, "wallet_created", "Always false for this preparation phase"},
+                {RPCResult::Type::STR, "warning", "Required handling warning"},
+            },
+        },
+        RPCExamples{
+            HelpExampleCli("preparerecoveryvault", "\"Recovery Vault 90-180\" \"/offline/path/Recovery Vault Kit\"")
+        },
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue {
+            WalletContext& context{EnsureWalletContext(request.context)};
+            const std::string wallet_name{request.params[0].get_str()};
+            if (!IsValidRecoveryVaultWalletName(wallet_name)) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "Recovery Vault requires a bounded simple wallet name without path components or control characters");
+            }
+            if (GetWallet(context, wallet_name)) {
+                throw JSONRPCError(RPC_WALLET_ALREADY_LOADED, "A wallet with that name is already loaded");
+            }
+            std::error_code exists_error;
+            const fs::file_status wallet_status{fs::symlink_status(GetWalletDir() / fs::PathFromString(wallet_name), exists_error)};
+            if ((exists_error && exists_error != std::errc::no_such_file_or_directory) ||
+                (!exists_error && fs::exists(wallet_status))) {
+                throw JSONRPCError(RPC_WALLET_ERROR, exists_error ? "Unable to inspect the proposed wallet path" : "A wallet with that name already exists");
+            }
+            auto prepared{PrepareRecoveryVaultKit(
+                fs::PathFromString(request.params[1].get_str()), wallet_name,
+                Params().GetChainTypeString(), Assert(context.args)->GetDataDirBase())};
+            if (!prepared) {
+                throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(prepared).original);
+            }
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("wallet_name", prepared->wallet_name);
+            out.pushKV("recovery_kit_path", fs::PathToString(prepared->path));
+            out.pushKV("policy_id", prepared->policy_id);
+            out.pushKV("policy_commitment", prepared->policy_commitment);
+            out.pushKV("kit_commitment", prepared->kit_commitment);
+            out.pushKV("primary_delay", static_cast<int>(FIXED_VAULT_CURRENT_PRIMARY_DELAY));
+            out.pushKV("final_delay", static_cast<int>(FIXED_VAULT_CURRENT_FINAL_DELAY));
+            out.pushKV("software_keys", static_cast<int>(prepared->software_key_count));
+            out.pushKV("wallet_created", false);
+            out.pushKV("warning", "This Recovery Kit is an unencrypted bearer backup. Keep a complete copy offline; passing its commitment back proves file integrity, not independent address verification.");
+            return out;
+        },
+    };
+}
+
+static RPCMethod createrecoveryvault()
+{
+    return RPCMethod{
+        "createrecoveryvault",
+        "Reopen and validate an exact Recovery Kit prepared by preparerecoveryvault, then atomically create and load its wallet.\n"
+        "Every file, permission, policy field, and phrase-derived identity is checked before wallet publication. "
+        "Private phrases remain in cleansing memory and are never returned through RPC or logs.\n"
+        "Setting finish_unverified records an explicit lack of independent address verification. It never records Ready or independent verification.\n",
+        {
+            {"recovery_kit_path", RPCArg::Type::STR, RPCArg::Optional::NO, "Absolute path to the prepared Recovery Kit directory"},
+            {"kit_commitment", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Exact commitment returned by preparerecoveryvault"},
+            {"finish_unverified", RPCArg::Type::BOOL, RPCArg::Default{false}, "Explicitly finish setup without independent device verification; a persistent warning remains"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR, "name", "Created and loaded wallet name"},
+                {RPCResult::Type::STR, "address", "First canonical receive address"},
+                {RPCResult::Type::STR, "policy_id", "Short public policy identifier"},
+                {RPCResult::Type::STR_HEX, "policy_commitment", "Full canonical public-policy commitment"},
+                {RPCResult::Type::STR_HEX, "kit_commitment", "Validated exact Recovery Kit commitment"},
+                {RPCResult::Type::STR, "schedule", "current_90_180"},
+                {RPCResult::Type::STR, "setup_state", "Durable setup state"},
+                {RPCResult::Type::STR, "verification_state", "Durable truthful address-verification state"},
+                {RPCResult::Type::ARR, "warnings", /*optional=*/true, "Creation warnings",
+                    {{RPCResult::Type::STR, "", ""}}},
+            },
+        },
+        RPCExamples{
+            HelpExampleCli("createrecoveryvault", "\"/offline/path/Recovery Vault Kit\" \"0123...abcd\" true")
+        },
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue {
+            WalletContext& context{EnsureWalletContext(request.context)};
+            auto kit{ReadRecoveryVaultKit(
+                fs::PathFromString(request.params[0].get_str()), request.params[1].get_str(),
+                Params().GetChainTypeString(), Assert(context.args)->GetDataDirBase())};
+            if (!kit) {
+                throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(kit).original);
+            }
+            const bool finish_unverified{self.Arg<bool>("finish_unverified")};
+            std::vector<bilingual_str> warnings;
+            const VaultSetupState setup{finish_unverified
+                    ? VaultSetupState::COMPLETE
+                    : VaultSetupState::ADDRESS_VERIFICATION_REQUIRED};
+            const VaultVerificationState verification{finish_unverified
+                    ? VaultVerificationState::FINISHED_UNVERIFIED
+                    : VaultVerificationState::RECOVERY_KIT_MATCHED};
+            auto installed{InstallFixedVaultWallet(
+                context, kit->summary.wallet_name, kit->summary.canonical_policy,
+                kit->mnemonics, FixedVaultWalletInstallMode::CREATE, warnings,
+                /*enable_external_signing=*/false,
+                FixedVaultWalletInitialMetadata{
+                    setup,
+                    verification,
+                    VaultParticipantType::LOCAL_SOFTWARE,
+                    /*create_receive_address=*/true})};
+            if (!installed) {
+                throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(installed).original);
+            }
+            if (installed->mnemonic_matches.size() != kit->summary.software_key_count ||
+                !installed->first_receive_address) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "Published Recovery Vault is missing staged creation results");
+            }
+
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("name", installed->wallet->GetName());
+            out.pushKV("address", *installed->first_receive_address);
+            out.pushKV("policy_id", kit->summary.policy_id);
+            out.pushKV("policy_commitment", kit->summary.policy_commitment);
+            out.pushKV("kit_commitment", kit->summary.kit_commitment);
+            out.pushKV("schedule", "current_90_180");
+            out.pushKV("setup_state", VaultSetupStateName(finish_unverified ? VaultSetupState::COMPLETE : VaultSetupState::ADDRESS_VERIFICATION_REQUIRED));
+            out.pushKV("verification_state", VaultVerificationStateName(finish_unverified ? VaultVerificationState::FINISHED_UNVERIFIED : VaultVerificationState::RECOVERY_KIT_MATCHED));
+            if (finish_unverified) {
+                warnings.push_back(Untranslated("Address not independently verified. The Recovery Kit was validated for internal consistency only."));
+            }
+            PushWarnings(warnings, out);
+            return out;
+        },
+    };
+}
+
 static RPCMethod getvaultinfo()
 {
     return RPCMethod{
@@ -1045,6 +1242,9 @@ static RPCMethod getvaultinfo()
                 {RPCResult::Type::NUM, "fallback_older", /*optional=*/true, "Relative recovery delay in blocks"},
                 {RPCResult::Type::NUM, "fallback_after", /*optional=*/true, "Absolute recovery height"},
                 {RPCResult::Type::NUM, "fallback_older_one_key", /*optional=*/true, "Later 1-of-n relative recovery delay"},
+                {RPCResult::Type::STR, "schedule", /*optional=*/true, "current_90_180, legacy_30_60, or custom"},
+                {RPCResult::Type::STR, "setup_state", /*optional=*/true, "Durable Recovery Vault setup state"},
+                {RPCResult::Type::STR, "verification_state", /*optional=*/true, "Durable truthful address-verification state"},
                 {RPCResult::Type::ARR, "recovery_stages", /*optional=*/true, "Ordered recovery stages",
                     {
                         {RPCResult::Type::OBJ, "", "", {
@@ -1070,6 +1270,10 @@ static RPCMethod getvaultinfo()
             if (!pwallet) return UniValue::VNULL;
             LOCK(pwallet->cs_wallet);
             const auto br = GetVaultBalanceBreakdown(*pwallet);
+            const VaultPolicyPackage active_package{ExportWalletVaultPolicy(*pwallet)};
+            const bool metadata_matches_policy{
+                !active_package.policy_id.empty() &&
+                pwallet->m_vault_metadata_policy_commitment == VaultPolicyCommitment(active_package)};
             UniValue out(UniValue::VOBJ);
             out.pushKV("is_vault", br.is_vault);
             if (br.is_vault) {
@@ -1083,6 +1287,11 @@ static RPCMethod getvaultinfo()
                         break;
                     }
                 }
+                out.pushKV("schedule", FixedVaultScheduleName(ClassifyFixedVaultSchedule(active_package)));
+                out.pushKV("setup_state", VaultSetupStateName(
+                    metadata_matches_policy ? pwallet->m_vault_setup_state : VaultSetupState::NOT_RECORDED));
+                out.pushKV("verification_state", VaultVerificationStateName(
+                    metadata_matches_policy ? pwallet->m_vault_verification_state : VaultVerificationState::NOT_RECORDED));
             }
             out.pushKV("spendable_now", ValueFromAmount(br.immediate));
             out.pushKV("recoverable_now", ValueFromAmount(br.recoverable_now));
@@ -1101,7 +1310,10 @@ static RPCMethod getvaultinfo()
             }
             out.pushKV("recovery_stages", std::move(stages));
             UniValue lost(UniValue::VARR);
-            for (const auto& fpr : pwallet->m_lost_signers) lost.push_back(fpr);
+            if (metadata_matches_policy) {
+                for (const auto& fpr : pwallet->m_lost_signers)
+                    lost.push_back(fpr);
+            }
             out.pushKV("lost_signers", std::move(lost));
             return out;
         },
@@ -1504,7 +1716,9 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &backupwallet},
         {"wallet", &bumpfee},
         {"wallet", &psbtbumpfee},
+        {"wallet", &preparerecoveryvault},
         {"wallet", &createwallet},
+        {"wallet", &createrecoveryvault},
         {"wallet", &createwalletdescriptor},
 #ifdef ENABLE_EXTERNAL_SIGNER
         {"wallet", &createmultisigdescriptor},

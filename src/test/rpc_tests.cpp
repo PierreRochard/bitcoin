@@ -459,6 +459,20 @@ BOOST_AUTO_TEST_CASE(rpc_convert_values_generatetoaddress)
     BOOST_CHECK_EQUAL(result[2].getInt<int>(), 9);
 }
 
+BOOST_AUTO_TEST_CASE(rpc_convert_values_recovery_vault)
+{
+    const UniValue prepared{RPCConvertValues(
+        "preparerecoveryvault", {"Vault=name", "/tmp/Kit=name"})};
+    BOOST_CHECK_EQUAL(prepared[0].get_str(), "Vault=name");
+    BOOST_CHECK_EQUAL(prepared[1].get_str(), "/tmp/Kit=name");
+
+    const UniValue created{RPCConvertValues(
+        "createrecoveryvault", {"/tmp/Kit=name", "abcd", "true"})};
+    BOOST_CHECK_EQUAL(created[0].get_str(), "/tmp/Kit=name");
+    BOOST_CHECK_EQUAL(created[1].get_str(), "abcd");
+    BOOST_CHECK(created[2].get_bool());
+}
+
 BOOST_AUTO_TEST_CASE(rpc_getblockstats_calculate_percentiles_by_weight)
 {
     int64_t total_weight = 200;
