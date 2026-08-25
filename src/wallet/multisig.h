@@ -17,6 +17,11 @@
 #include <string_view>
 #include <vector>
 
+class CTxOut;
+class CPubKey;
+class XOnlyPubKey;
+struct KeyOriginInfo;
+
 namespace wallet {
 class CWallet;
 class CCoinControl;
@@ -106,6 +111,24 @@ struct VaultRecoveryStage {
     std::optional<uint32_t> after;
 };
 
+//! The consumer Recovery Vault schedule used for newly created wallets.
+inline constexpr uint32_t FIXED_VAULT_CURRENT_PRIMARY_DELAY{12960};
+inline constexpr uint32_t FIXED_VAULT_CURRENT_FINAL_DELAY{25920};
+//! The original consumer schedule, retained for load, restore, and signing.
+inline constexpr uint32_t FIXED_VAULT_LEGACY_PRIMARY_DELAY{4320};
+inline constexpr uint32_t FIXED_VAULT_LEGACY_FINAL_DELAY{8640};
+
+//! Schedule classification is deliberately narrower than fixed-policy
+//! validation: it identifies only the exact relative-delay pair. The package
+//! overload also requires its redundant schedule fields and receive
+//! descriptor to agree, but makes no claim about descriptor shape,
+//! participant identity, network, or canonical encoding.
+enum class FixedVaultSchedule {
+    CUSTOM,
+    LEGACY_30_60,
+    CURRENT_90_180,
+};
+
 //! Parsed Scrooge vault fields from a descriptor string.
 struct InferredVaultPolicy {
     bool is_vault{false};
@@ -116,6 +139,8 @@ struct InferredVaultPolicy {
     std::optional<uint32_t> after;
     int recovery_m{0};
 };
+
+FixedVaultSchedule ClassifyFixedVaultSchedule(const InferredVaultPolicy& policy);
 
 //! BIP48 account path. Script type 0/1/2/3 = legacy / p2sh-segwit / bech32 / bech32m.
 std::string DefaultMultisigPath(OutputType type, uint32_t account);
@@ -168,6 +193,18 @@ util::Result<MultisigDescriptorResult> CreateMultisigDescriptor(CWallet& wallet,
 //! Infer a Scrooge vault from the wallet's active descriptors.
 InferredVaultPolicy InferWalletVaultPolicy(const CWallet& wallet);
 
+//! Whether an output belongs to one of the exact active Recovery Vault
+//! receive/change descriptor managers. Caller must hold wallet.cs_wallet.
+bool IsActiveVaultOutput(const CWallet& wallet, const CTxOut& output);
+
+//! Resolve a participant origin from the one exact active Recovery Vault
+//! receive/change manager owning this output. Caller-supplied PSBT origins are
+//! deliberately ignored. Returns false for no match or ambiguous ownership.
+bool GetActiveVaultKeyOrigin(const CWallet& wallet, const CTxOut& output,
+                             const CPubKey& pubkey, KeyOriginInfo& origin);
+bool GetActiveVaultKeyOrigin(const CWallet& wallet, const CTxOut& output,
+                             const XOnlyPubKey& pubkey, KeyOriginInfo& origin);
+
 //! BIP68 older(N): mature when depth >= N. after(H): mature when tip_height >= H.
 bool IsVaultUtxoMature(const InferredVaultPolicy& policy, int depth, int tip_height);
 
@@ -187,14 +224,24 @@ struct VaultBalanceBreakdown {
     std::vector<RecoveryStageBalance> recovery_stages;
 };
 
-//! Confirmed coins: key-path (immediate, 0 if a signer is marked lost),
-//! script-path mature, and confirmed-but-immature.
-VaultBalanceBreakdown GetVaultBalanceBreakdown(const CWallet& wallet);
+//! Confirmed coins by key path and recovery maturity. Existing balance/RPC
+//! callers can require locally available signers; lifecycle UIs can request
+//! policy eligibility so watch-only and offline coordinators can still build
+//! unsigned PSBTs without pretending those signers are locally available.
+VaultBalanceBreakdown GetVaultBalanceBreakdown(const CWallet& wallet,
+                                               bool require_available_signers = true);
 
-//! Set nSequence/min_depth (older) or nLockTime/script_path (after) for recovery.
+//! Set nSequence/min_depth (older) or nLockTime/script_path (after), and limit
+//! selection to coins owned by the exact active vault receive/change managers.
+//! An existing explicit selection is accepted only when every input is an
+//! eligible active-vault coin. When sweep is true and there is no explicit
+//! selection, all eligible vault coins are selected; otherwise normal wallet
+//! coin selection runs inside the vault-only boundary.
 util::Result<void> ApplyVaultRecoveryToCoinControl(const CWallet& wallet,
                                                    CCoinControl& coin_control,
-                                                   std::optional<uint32_t> selected_older = {});
+                                                   std::optional<uint32_t> selected_older = {},
+                                                   std::optional<uint32_t> selected_after = {},
+                                                   bool sweep = false);
 
 struct VaultPolicyPackage {
     std::string format{"bitcoin-core-vault-policy"};
@@ -208,6 +255,8 @@ struct VaultPolicyPackage {
     std::vector<VaultRecoveryStage> recovery_stages;
     std::vector<std::string> descs;
 };
+
+FixedVaultSchedule ClassifyFixedVaultSchedule(const VaultPolicyPackage& pkg);
 
 //! Public metadata identifying one mnemonic-derived participant in a vault.
 //! The mnemonic and all private key material are deliberately excluded.
@@ -226,15 +275,19 @@ struct FixedVaultParticipant {
 };
 
 std::string FormatVaultPolicyPackage(const VaultPolicyPackage& pkg);
+//! Full cryptographic commitment to the canonical public package. Unlike the
+//! short display policy_id, this is suitable for scoping trusted metadata.
+std::string VaultPolicyCommitment(const VaultPolicyPackage& pkg);
 util::Result<VaultPolicyPackage> ParseVaultPolicyPackage(const std::string& json);
 VaultPolicyPackage ExportWalletVaultPolicy(const CWallet& wallet);
 //! True only for the exact fixed 3/2/1 staged policy used by the consumer
 //! journey. The caller must hold wallet.cs_wallet.
 bool IsFixedStagedVault(const CWallet& wallet);
 util::Result<void> ImportWalletVaultPolicy(CWallet& wallet, const VaultPolicyPackage& pkg);
-//! Require the GUI's fixed policy: three active/recovery participants, 2-of-3
-//! after 4,320 blocks, then 1-of-3 after 8,640 blocks, on the standard account.
-//! The package must contain a public receive/change descriptor pair.
+//! Require one of the GUI's canonical fixed policies: three active/recovery
+//! participants, 2-of-3 then 1-of-3 on either the current or legacy schedule,
+//! on the standard account. The package must contain a public receive/change
+//! descriptor pair.
 util::Result<void> ValidateFixedStagedVaultPolicy(const VaultPolicyPackage& pkg);
 //! Validate 1-3 BIP39 phrases against both branches of a public three-key vault.
 //! No wallet state is read or changed.

@@ -6,11 +6,13 @@
 #include <chain.h>
 #include <coins.h>
 #include <consensus/amount.h>
+#include <interfaces/wallet.h>
 #include <key.h>
 #include <key_io.h>
 #include <outputtype.h>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
+#include <psbt.h>
 #include <pubkey.h>
 #include <script/descriptor.h>
 #include <script/script.h>
@@ -27,6 +29,7 @@
 #include <util/translation.h>
 #include <validation.h>
 #include <wallet/coincontrol.h>
+#include <wallet/context.h>
 #include <wallet/feebumper.h>
 #include <wallet/multisig.h>
 #include <wallet/spend.h>
@@ -106,6 +109,24 @@ static MultisigKeySpec XpubSpec(const CExtKey& master)
     spec.xpub = EncodeExtPubKey(child->first.Neuter());
     spec.label = "lost-computer";
     return spec;
+}
+
+static CScript AddImportedSingleKeyDescriptor(CWallet& wallet, const CKey& key)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    const CScript script{GetScriptForDestination(WitnessV0KeyHash(key.GetPubKey()))};
+    FlatSigningProvider provider;
+    std::string error;
+    auto descriptors = Parse("wpkh(" + EncodeSecret(key) + ")", provider, error,
+                             /*require_checksum=*/false);
+    BOOST_REQUIRE_MESSAGE(descriptors.size() == 1, error);
+    WalletDescriptor wallet_descriptor(std::move(descriptors.front()), /*creation_time=*/1,
+                                       /*range_start=*/0, /*range_end=*/0,
+                                       /*next_index=*/0);
+    auto manager = wallet.AddWalletDescriptor(wallet_descriptor, provider, "", /*internal=*/false);
+    BOOST_REQUIRE_MESSAGE(manager, util::ErrorString(manager).original);
+    BOOST_REQUIRE(manager->get().IsMine(script));
+    return script;
 }
 
 static std::shared_ptr<CWallet> MakeChainWallet(interfaces::Chain& chain, const std::string& name, uint64_t extra_flags = 0)
@@ -565,6 +586,155 @@ BOOST_AUTO_TEST_CASE(vault_recovery_skips_immature_coins)
     BOOST_CHECK_EQUAL(mature_only->tx->vin[0].nSequence, 2U);
 }
 
+BOOST_AUTO_TEST_CASE(vault_recovery_excludes_imported_descriptor_coins)
+{
+    mineBlocks(1);
+    constexpr CAmount VAULT_AMOUNT{10 * COIN};
+    constexpr CAmount ORDINARY_AMOUNT{7 * COIN};
+    auto vault = MakeFundedVault(*this, /*m=*/2, /*n=*/3, /*older=*/1, {0, 1},
+                                 VAULT_AMOUNT, /*coinbase_index=*/0);
+
+    CScript ordinary_spk;
+    {
+        LOCK(vault.full->cs_wallet);
+        ordinary_spk = AddImportedSingleKeyDescriptor(*vault.full, GenerateRandomKey());
+    }
+    CMutableTransaction ordinary_fund = CreateValidMempoolTransaction(
+        m_coinbase_txns.at(1), /*input_vout=*/0, /*input_height=*/2, coinbaseKey,
+        ordinary_spk, ORDINARY_AMOUNT, /*submit=*/false);
+    CreateAndProcessBlock({ordinary_fund}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    ScanWallet(*vault.full, *Assert(m_node.chainman));
+
+    std::optional<COutPoint> ordinary_outpoint;
+    for (uint32_t index = 0; index < ordinary_fund.vout.size(); ++index) {
+        if (ordinary_fund.vout[index].scriptPubKey == ordinary_spk) {
+            ordinary_outpoint.emplace(ordinary_fund.GetHash(), index);
+            break;
+        }
+    }
+    BOOST_REQUIRE(ordinary_outpoint);
+
+    // The GUI-facing wallet interface must apply the same vault-only scope as
+    // the core helper for custom policies too. Otherwise its delayed-recovery
+    // balance and transaction construction can silently include an ordinary
+    // descriptor imported into the same wallet.
+    WalletContext context;
+    context.chain = m_node.chain.get();
+    auto wallet_interface{interfaces::MakeWallet(context, vault.full)};
+    CCoinControl interface_recovery = FeeCC();
+    interface_recovery.m_script_path = true;
+    interface_recovery.m_vault_recovery_sweep = true;
+    BOOST_CHECK_EQUAL(wallet_interface->getAvailableBalance(interface_recovery), VAULT_AMOUNT);
+    const std::vector<CRecipient> over_vault_balance{{DummyTap(), VAULT_AMOUNT + 1 * COIN, /*fSubtractFeeFromAmount=*/false}};
+    const auto interface_inflated{wallet_interface->createTransaction(
+        over_vault_balance, interface_recovery, /*sign=*/false,
+        /*change_pos=*/std::nullopt, /*expected_vault_policy_commitment=*/std::nullopt)};
+    BOOST_CHECK_MESSAGE(!interface_inflated,
+                        "ordinary descriptor balance must not fund GUI delayed recovery");
+
+    CCoinControl recovery = FeeCC();
+    CCoinControl rpc_recovery = FeeCC();
+    {
+        LOCK(vault.full->cs_wallet);
+        BOOST_CHECK_GE(AvailableCoins(*vault.full).GetTotalAmount(), VAULT_AMOUNT + ORDINARY_AMOUNT);
+        const auto balance = GetVaultBalanceBreakdown(*vault.full);
+        BOOST_CHECK_EQUAL(balance.immediate, VAULT_AMOUNT);
+        BOOST_CHECK_EQUAL(balance.recoverable_now, VAULT_AMOUNT);
+
+        // RPC/core recovery retains ordinary amount-driven coin selection,
+        // but its automatic candidate pool is vault-only.
+        BOOST_REQUIRE(ApplyVaultRecoveryToCoinControl(*vault.full, rpc_recovery));
+        BOOST_CHECK(!rpc_recovery.HasSelected());
+        BOOST_CHECK(rpc_recovery.m_allow_other_inputs);
+        BOOST_REQUIRE(rpc_recovery.m_allowed_inputs);
+        BOOST_REQUIRE_EQUAL(rpc_recovery.m_allowed_inputs->size(), 1U);
+        BOOST_CHECK(!rpc_recovery.m_allowed_inputs->contains(*ordinary_outpoint));
+
+        // The consumer GUI explicitly requests its default full-balance sweep.
+        BOOST_REQUIRE(ApplyVaultRecoveryToCoinControl(*vault.full, recovery,
+                                                      /*selected_older=*/{},
+                                                      /*selected_after=*/{},
+                                                      /*sweep=*/true));
+        BOOST_CHECK(!recovery.m_allow_other_inputs);
+        const auto selected = recovery.ListSelected();
+        BOOST_REQUIRE_EQUAL(selected.size(), 1U);
+        BOOST_CHECK(selected.front() != *ordinary_outpoint);
+        const auto selected_txo = vault.full->GetTXO(selected.front());
+        BOOST_REQUIRE(selected_txo);
+        BOOST_CHECK_EQUAL(selected_txo->GetTxOut().nValue, VAULT_AMOUNT);
+
+        CCoinControl rejected = FeeCC();
+        rejected.Select(*ordinary_outpoint);
+        const auto applied = ApplyVaultRecoveryToCoinControl(*vault.full, rejected);
+        BOOST_CHECK(!applied);
+        if (!applied) {
+            BOOST_CHECK(util::ErrorString(applied).original.find("active Recovery Vault policy") != std::string::npos);
+        }
+    }
+
+    auto rpc_partial = SendFrom(*vault.full, 1 * COIN, rpc_recovery);
+    BOOST_REQUIRE_MESSAGE(rpc_partial, util::ErrorString(rpc_partial).original);
+    BOOST_REQUIRE_EQUAL(rpc_partial->tx->vin.size(), 1U);
+    BOOST_CHECK(rpc_partial->tx->vin.front().prevout != *ordinary_outpoint);
+
+    auto inflated = SendFrom(*vault.full, VAULT_AMOUNT + 1 * COIN, recovery, /*sign=*/false);
+    BOOST_CHECK_MESSAGE(!inflated, "ordinary descriptor balance must not fund delayed recovery");
+    auto recovered = SendFrom(*vault.full, 1 * COIN, recovery);
+    BOOST_REQUIRE_MESSAGE(recovered, util::ErrorString(recovered).original);
+    BOOST_REQUIRE_EQUAL(recovered->tx->vin.size(), 1U);
+    BOOST_CHECK(recovered->tx->vin.front().prevout != *ordinary_outpoint);
+
+    // Vault loss metadata is scoped to vault-owned inputs. An ordinary
+    // imported-descriptor input in the same wallet remains signable, and an
+    // already finalized ordinary input is accepted unchanged by FillPSBT.
+    {
+        LOCK(vault.full->cs_wallet);
+        BOOST_REQUIRE(vault.full->SetLostSigner(vault.fingerprints.front(), true));
+    }
+    CCoinControl ordinary_control = FeeCC();
+    ordinary_control.Select(*ordinary_outpoint);
+    ordinary_control.m_allow_other_inputs = false;
+    std::vector<CRecipient> ordinary_recipient{{DummyTap(), ORDINARY_AMOUNT, /*fSubtractFeeFromAmount=*/true}};
+    const auto ordinary_signed = CreateTransaction(
+        *vault.full, ordinary_recipient, /*change_pos=*/std::nullopt,
+        ordinary_control, /*sign=*/true);
+    BOOST_REQUIRE_MESSAGE(ordinary_signed, util::ErrorString(ordinary_signed).original);
+    BOOST_REQUIRE_EQUAL(ordinary_signed->tx->vin.size(), 1U);
+    BOOST_CHECK(ordinary_signed->tx->vin.front().prevout == *ordinary_outpoint);
+
+    PartiallySignedTransaction finalized_ordinary{CMutableTransaction{*ordinary_signed->tx}};
+    finalized_ordinary.inputs.front().final_script_sig = ordinary_signed->tx->vin.front().scriptSig;
+    finalized_ordinary.inputs.front().final_script_witness = ordinary_signed->tx->vin.front().scriptWitness;
+    BOOST_CHECK(!finalized_ordinary.inputs.front().non_witness_utxo);
+    BOOST_CHECK(finalized_ordinary.inputs.front().witness_utxo.IsNull());
+    bool complete{false};
+    BOOST_CHECK(!vault.full->FillPSBT(
+        finalized_ordinary,
+        {.sign = true, .finalize = true, .bip32_derivs = true}, complete));
+    BOOST_CHECK(complete);
+    BOOST_CHECK(!finalized_ordinary.inputs.front().non_witness_utxo);
+    BOOST_CHECK(finalized_ordinary.inputs.front().witness_utxo.IsNull());
+
+    // Finalization must not hide the fact that an input belongs to the active
+    // vault. Resolve that classification from the trusted wallet transaction,
+    // reject the existing contribution while a participant is marked lost,
+    // and leave the caller's finalized PSBT fields untouched.
+    PartiallySignedTransaction finalized_vault{CMutableTransaction{*recovered->tx}};
+    finalized_vault.inputs.front().final_script_sig = recovered->tx->vin.front().scriptSig;
+    finalized_vault.inputs.front().final_script_witness = recovered->tx->vin.front().scriptWitness;
+    BOOST_CHECK(!finalized_vault.inputs.front().non_witness_utxo);
+    BOOST_CHECK(finalized_vault.inputs.front().witness_utxo.IsNull());
+    complete = true;
+    const auto finalized_vault_error{vault.full->FillPSBT(
+        finalized_vault,
+        {.sign = true, .finalize = true, .bip32_derivs = true}, complete)};
+    BOOST_REQUIRE(finalized_vault_error);
+    BOOST_CHECK(*finalized_vault_error == PSBTError::INCOMPLETE);
+    BOOST_CHECK(!complete);
+    BOOST_CHECK(!finalized_vault.inputs.front().non_witness_utxo);
+    BOOST_CHECK(finalized_vault.inputs.front().witness_utxo.IsNull());
+}
+
 BOOST_AUTO_TEST_CASE(vault_lost_signer_zeroes_immediate)
 {
     mineBlocks(1);
@@ -593,6 +763,151 @@ BOOST_AUTO_TEST_CASE(vault_lost_signer_zeroes_immediate)
         BOOST_CHECK_EQUAL(br.immediate, 0);
         BOOST_CHECK_GT(br.recoverable_now, 0);
     }
+
+    // This deliberately custom policy has no durable exact participant roster.
+    // Preserve the advanced-wallet fail-closed contract: immediate signing is
+    // unavailable and even a mature branch must be coordinated as an unsigned
+    // PSBT until the operator explicitly marks the participant found. Fixed
+    // Recovery Vaults exercise participant-scoped reduced-quorum signing in
+    // their dedicated backend and Qt tests.
+    const auto immediate = SendFrom(*vault.full, 1 * COIN, FeeCC());
+    BOOST_CHECK_MESSAGE(!immediate, "a marked-lost participant must block the immediate path");
+    CCoinControl recovery = FeeCC();
+    {
+        LOCK(vault.full->cs_wallet);
+        BOOST_REQUIRE(ApplyVaultRecoveryToCoinControl(*vault.full, recovery));
+    }
+    const auto signed_recovery = SendFrom(*vault.full, 1 * COIN, recovery);
+    BOOST_CHECK_MESSAGE(!signed_recovery, "custom vault recovery must not sign while any participant is manually lost");
+    const auto unsigned_recovery = SendFrom(*vault.full, 1 * COIN, recovery, /*sign=*/false);
+    BOOST_REQUIRE_MESSAGE(unsigned_recovery, util::ErrorString(unsigned_recovery).original);
+    BOOST_CHECK(unsigned_recovery->tx->vin.front().scriptWitness.IsNull());
+
+    PartiallySignedTransaction recovery_psbt{CMutableTransaction{*unsigned_recovery->tx}};
+    bool complete{false};
+    const auto blocked_fill{vault.full->FillPSBT(
+        recovery_psbt, {.sign = true, .finalize = true, .bip32_derivs = true}, complete)};
+    BOOST_REQUIRE(blocked_fill);
+    BOOST_CHECK(*blocked_fill == PSBTError::INCOMPLETE);
+    BOOST_CHECK(!complete);
+
+    {
+        LOCK(vault.full->cs_wallet);
+        BOOST_REQUIRE(vault.full->SetLostSigner(vault.fingerprints.front(), false));
+    }
+    const auto recovered_after_unmark = SendFrom(*vault.full, 1 * COIN, recovery);
+    BOOST_REQUIRE_MESSAGE(recovered_after_unmark, util::ErrorString(recovered_after_unmark).original);
+    BOOST_CHECK_GT(recovered_after_unmark->tx->vin.front().scriptWitness.stack.size(), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(fixed_vault_finalized_input_retains_lost_signer_guard)
+{
+    mineBlocks(1);
+    auto vault = MakeFundedVault(
+        *this, /*m=*/2, /*n=*/3, /*older=*/4320, /*recover_priv=*/{0, 1, 2},
+        10 * COIN, /*coinbase_index=*/0, /*after=*/{},
+        /*fallback_older_one_key=*/8640);
+    BOOST_REQUIRE(WITH_LOCK(vault.full->cs_wallet,
+                            return IsFixedStagedVault(*vault.full)));
+
+    const auto signed_spend{SendFrom(*vault.full, 1 * COIN, FeeCC())};
+    BOOST_REQUIRE_MESSAGE(signed_spend, util::ErrorString(signed_spend).original);
+    {
+        LOCK(vault.full->cs_wallet);
+        BOOST_REQUIRE(vault.full->SetLostSigner(vault.fingerprints.front(), true));
+    }
+
+    PartiallySignedTransaction finalized{CMutableTransaction{*signed_spend->tx}};
+    finalized.inputs.front().final_script_sig = signed_spend->tx->vin.front().scriptSig;
+    finalized.inputs.front().final_script_witness = signed_spend->tx->vin.front().scriptWitness;
+    BOOST_CHECK(!finalized.inputs.front().non_witness_utxo);
+    BOOST_CHECK(finalized.inputs.front().witness_utxo.IsNull());
+
+    bool complete{true};
+    const auto error{vault.full->FillPSBT(
+        finalized,
+        {.sign = true, .finalize = true, .bip32_derivs = true},
+        complete)};
+    BOOST_REQUIRE(error);
+    BOOST_CHECK(*error == PSBTError::INCOMPLETE);
+    BOOST_CHECK(!complete);
+    BOOST_CHECK(!finalized.inputs.front().non_witness_utxo);
+    BOOST_CHECK(finalized.inputs.front().witness_utxo.IsNull());
+}
+
+BOOST_AUTO_TEST_CASE(vault_commit_rejects_post_sign_policy_or_manual_loss_change)
+{
+    mineBlocks(1);
+    auto vault = MakeFundedVault(
+        *this, /*m=*/2, /*n=*/3, /*older=*/4320,
+        /*recover_priv=*/{0, 1, 2}, 10 * COIN, /*coinbase_index=*/0,
+        /*after=*/{}, /*fallback_older_one_key=*/8640);
+    BOOST_REQUIRE(WITH_LOCK(vault.full->cs_wallet,
+                            return IsFixedStagedVault(*vault.full)));
+
+    const auto draft{SendFrom(*vault.full, 1 * COIN, FeeCC(), /*sign=*/false)};
+    BOOST_REQUIRE_MESSAGE(draft, util::ErrorString(draft).original);
+    PartiallySignedTransaction psbt{CMutableTransaction{*draft->tx}};
+    bool complete{false};
+    BOOST_REQUIRE(!vault.full->FillPSBT(
+        psbt, {.sign = false, .bip32_derivs = true}, complete));
+    BOOST_CHECK(!complete);
+
+    std::optional<VaultCommitState> signed_vault_state;
+    BOOST_REQUIRE(!vault.full->FillPSBT(
+        psbt, {.sign = true, .finalize = true, .bip32_derivs = false},
+        complete, /*n_signed=*/nullptr, &signed_vault_state));
+    BOOST_REQUIRE(complete);
+    BOOST_REQUIRE(signed_vault_state);
+    BOOST_CHECK(signed_vault_state->manually_lost_signers.empty());
+    CMutableTransaction signed_mtx;
+    BOOST_REQUIRE(FinalizeAndExtractPSBT(psbt, signed_mtx));
+    const CTransactionRef signed_tx{MakeTransactionRef(std::move(signed_mtx))};
+
+    // A setlostsigner call that was blocked on the wallet lock while signing
+    // must win before commit and prevent the already-signed transaction from
+    // entering the wallet or mempool.
+    {
+        LOCK(vault.full->cs_wallet);
+        BOOST_REQUIRE(vault.full->SetLostSigner(
+            vault.fingerprints.front(), /*lost=*/true));
+    }
+    BOOST_CHECK(!vault.full->CommitTransaction(
+        signed_tx, /*replaces_txid=*/std::nullopt,
+        /*comment=*/std::nullopt, /*comment_to=*/std::nullopt,
+        /*messages=*/{}, /*payment_requests=*/{}, signed_vault_state));
+    BOOST_CHECK(!WITH_LOCK(vault.full->cs_wallet,
+                           return vault.full->mapWallet.contains(signed_tx->GetHash())));
+
+    // Clearing the marker restores policy A's value snapshot. Replacing the
+    // active descriptors with policy B must independently fail the policy
+    // half of the same commit-time compare-and-set.
+    {
+        LOCK(vault.full->cs_wallet);
+        BOOST_REQUIRE(vault.full->SetLostSigner(
+            vault.fingerprints.front(), /*lost=*/false));
+        std::vector<MultisigKeySpec> replacement_specs;
+        for (int i = 0; i < 3; ++i) {
+            const CExtKey master{RandomMaster()};
+            AddUnused(*vault.full, master);
+            replacement_specs.push_back(LocalSpec(master));
+        }
+        const auto replacement{CreateMultisigDescriptor(
+            *vault.full, /*nrequired=*/2, replacement_specs,
+            MultisigOptions{OutputType::BECH32M, 0, {}, /*fallback_older=*/4320,
+                            /*fallback_after=*/{},
+                            /*fallback_older_one_key=*/8640})};
+        BOOST_REQUIRE_MESSAGE(replacement, util::ErrorString(replacement).original);
+        BOOST_REQUIRE_NE(
+            VaultPolicyCommitment(ExportWalletVaultPolicy(*vault.full)),
+            signed_vault_state->policy_commitment);
+    }
+    BOOST_CHECK(!vault.full->CommitTransaction(
+        signed_tx, /*replaces_txid=*/std::nullopt,
+        /*comment=*/std::nullopt, /*comment_to=*/std::nullopt,
+        /*messages=*/{}, /*payment_requests=*/{}, signed_vault_state));
+    BOOST_CHECK(!WITH_LOCK(vault.full->cs_wallet,
+                           return vault.full->mapWallet.contains(signed_tx->GetHash())));
 }
 
 BOOST_AUTO_TEST_CASE(vault_after_script_path_size)
@@ -833,7 +1148,12 @@ BOOST_AUTO_TEST_CASE(vault_two_stage_balances_and_one_key_send)
                                  10 * COIN, /*coinbase_index=*/0, /*after=*/{}, /*fallback_older_one_key=*/4);
     {
         LOCK(vault.full->cs_wallet);
-        BOOST_REQUIRE(vault.full->SetLostSigner(vault.fingerprints[2], true));
+        // This short-delay policy is deliberately custom so the maturity
+        // transitions can be exercised without mining 8,640 blocks. Model
+        // the missing participant as runtime/discovery unavailability rather
+        // than an explicit user declaration: custom policies fail closed
+        // while a participant is deliberately marked lost.
+        BOOST_REQUIRE(vault.full->SetLostSigners({vault.fingerprints[2]}));
         const auto br = GetVaultBalanceBreakdown(*vault.full);
         BOOST_REQUIRE_EQUAL(br.recovery_stages.size(), 2U);
         BOOST_CHECK_EQUAL(br.recovery_stages[0].stage.nrequired, 2);
@@ -843,14 +1163,23 @@ BOOST_AUTO_TEST_CASE(vault_two_stage_balances_and_one_key_send)
     }
     {
         LOCK(vault.recover->cs_wallet);
-        BOOST_REQUIRE(vault.recover->SetLostSigner(vault.fingerprints[1], true));
-        BOOST_REQUIRE(vault.recover->SetLostSigner(vault.fingerprints[2], true));
+        BOOST_REQUIRE(vault.recover->SetLostSigners(
+            {vault.fingerprints[1], vault.fingerprints[2]}));
         const auto br = GetVaultBalanceBreakdown(*vault.recover);
         BOOST_REQUIRE_EQUAL(br.recovery_stages.size(), 2U);
         BOOST_CHECK_EQUAL(br.recovery_stages[0].recoverable_now, 0);
         BOOST_CHECK_EQUAL(br.recovery_stages[0].awaiting, 0);
         BOOST_CHECK(!br.recovery_stages[0].earliest_blocks_remaining);
         BOOST_CHECK_GT(br.recovery_stages[1].awaiting, 0);
+
+        // Local signer metadata must not erase policy eligibility. A
+        // watch-only/offline coordinator still needs these amounts to build
+        // an unsigned PSBT for the missing participants.
+        const auto policy_br = GetVaultBalanceBreakdown(
+            *vault.recover, /*require_available_signers=*/false);
+        BOOST_CHECK_GT(policy_br.immediate, 0);
+        BOOST_CHECK_GT(policy_br.recovery_stages[0].awaiting, 0);
+        BOOST_CHECK_GT(policy_br.recovery_stages[1].awaiting, 0);
     }
 
     mineBlocks(1);
@@ -868,6 +1197,10 @@ BOOST_AUTO_TEST_CASE(vault_two_stage_balances_and_one_key_send)
         BOOST_CHECK_EQUAL(br.recovery_stages[0].recoverable_now, 0);
         BOOST_CHECK_EQUAL(br.recovery_stages[0].awaiting, 0);
         BOOST_CHECK_GT(br.recovery_stages[1].awaiting, 0);
+        const auto policy_br = GetVaultBalanceBreakdown(
+            *vault.recover, /*require_available_signers=*/false);
+        BOOST_CHECK_GT(policy_br.recovery_stages[0].recoverable_now, 0);
+        BOOST_CHECK_GT(policy_br.recovery_stages[1].awaiting, 0);
     }
 
     mineBlocks(2);
@@ -890,6 +1223,10 @@ BOOST_AUTO_TEST_CASE(vault_two_stage_balances_and_one_key_send)
         BOOST_CHECK(!br.recovery_stages[0].earliest_blocks_remaining);
         BOOST_CHECK_GT(br.recovery_stages[1].recoverable_now, 0);
         BOOST_CHECK_EQUAL(br.recovery_stages[1].awaiting, 0);
+        const auto policy_br = GetVaultBalanceBreakdown(
+            *vault.recover, /*require_available_signers=*/false);
+        BOOST_CHECK_GT(policy_br.recovery_stages[0].recoverable_now, 0);
+        BOOST_CHECK_GT(policy_br.recovery_stages[1].recoverable_now, 0);
         BOOST_REQUIRE(ApplyVaultRecoveryToCoinControl(*vault.recover, one_key, 4));
     }
     auto recovered = SendFrom(*vault.recover, 1 * COIN, one_key);

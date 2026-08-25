@@ -36,6 +36,7 @@
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/transaction.h>
 #include <wallet/types.h>
+#include <wallet/vault_state.h>
 #include <wallet/walletutil.h>
 
 #include <atomic>
@@ -333,7 +334,13 @@ private:
     std::optional<common::PSBTError> FillPSBTLocked(PartiallySignedTransaction& psbtx,
                                                     const common::PSBTFillOptions& options,
                                                     bool& complete,
-                                                    size_t* n_signed) const
+                                                    size_t* n_signed,
+                                                    std::optional<VaultCommitState>* signed_vault_state = nullptr) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    //! Return the active policy and trusted manual-loss state used for a
+    //! commit-time compare-and-set, or nullopt when no vault is active.
+    std::optional<VaultCommitState> GetVaultCommitState() const
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     std::atomic<bool> fAbortRescan{false};
@@ -529,8 +536,32 @@ public:
 
     //! Local labels for vault signers believed permanently lost. Does not change on-chain policy.
     std::set<std::string> m_lost_signers GUARDED_BY(cs_wallet);
-    bool SetLostSigner(const std::string& fingerprint, bool lost) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! Subset of m_lost_signers explicitly marked lost by the user or RPC.
+    //! Restore-time unavailable signers are intentionally not included so an
+    //! exact hardware rediscovery can continue to reconcile legacy metadata.
+    std::set<std::string> m_manually_lost_signers GUARDED_BY(cs_wallet);
+    //! Recovery Vault journey state. Missing records retain NOT_RECORDED for
+    //! backward compatibility and must never be interpreted as success.
+    VaultSetupState m_vault_setup_state GUARDED_BY(cs_wallet){VaultSetupState::NOT_RECORDED};
+    VaultVerificationState m_vault_verification_state GUARDED_BY(cs_wallet){VaultVerificationState::NOT_RECORDED};
+    //! Durable participant source only. Runtime availability is never stored.
+    std::map<std::string, VaultParticipantType> m_vault_participant_types GUARDED_BY(cs_wallet);
+    //! Exact active policy to which all setup, participant-source, and lost-
+    //! signer metadata belongs. A missing or mismatched binding makes every
+    //! such record advisory-only and therefore invisible to trusted status.
+    std::string m_vault_metadata_policy_commitment GUARDED_BY(cs_wallet);
+    bool BindVaultMetadataToActivePolicy() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool SetLostSignerMetadata(const std::set<std::string>& lost,
+                               const std::set<std::string>& manually_lost) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool SetLostSigner(const std::string& fingerprint, bool lost,
+                       const std::optional<std::string>& expected_policy_commitment = std::nullopt) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool ClearAutomaticallyLostSigner(const std::string& fingerprint,
+                                      const std::optional<std::string>& expected_policy_commitment = std::nullopt) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool SetLostSigners(const std::set<std::string>& fingerprints) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool SetVaultSetupState(VaultSetupState setup, VaultVerificationState verification,
+                            const std::optional<std::string>& expected_policy_commitment = std::nullopt) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool SetVaultParticipantType(const std::string& fingerprint, VaultParticipantType type,
+                                 const std::optional<std::string>& expected_policy_commitment = std::nullopt) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     /** Set of Coins owned by this wallet that we won't try to spend from. A
      * Coin may be locked if it has already been used to fund a transaction
@@ -691,7 +722,9 @@ public:
     OutputType TransactionChangeType(const std::optional<OutputType>& change_type, const std::vector<CRecipient>& vecSend) const;
 
     /** Fetch the inputs and sign with SIGHASH_ALL. */
-    bool SignTransaction(CMutableTransaction& tx) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool SignTransaction(CMutableTransaction& tx,
+                         std::optional<VaultCommitState>* signed_vault_state = nullptr) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Sign the tx given the input coins and sighash. */
     bool SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors) const;
     SigningResult SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const;
@@ -706,12 +739,15 @@ public:
      * @param[in]  options options for filling or signing
      * @param[out] complete indicates whether the PSBT is now complete
      * @param[out] n_signed the number of inputs signed by this wallet
+     * @param[out] signed_vault_state safety-relevant vault state captured in
+     * the same wallet-lock acquisition as successful vault signing
      * @returns an error if something goes wrong
      */
     std::optional<common::PSBTError> FillPSBT(PartiallySignedTransaction& psbtx,
-                  const common::PSBTFillOptions& options,
-                  bool& complete,
-                  size_t* n_signed = nullptr) const;
+                                              const common::PSBTFillOptions& options,
+                                              bool& complete,
+                                              size_t* n_signed = nullptr,
+                                              std::optional<VaultCommitState>* signed_vault_state = nullptr) const;
 
     /**
      * Submit the transaction to the node's mempool and then relay to peers.
@@ -723,15 +759,23 @@ public:
      * @param[in] comment The user's comment for this transaction
      * @param[in] comment_to The comment for this transaction indicating where coins are sent to
      * @param[in] messages The BIP 21 URI messages to attach to this transaction
+     * @param[in] expected_vault_state safety-relevant state captured while
+     * signing; a mismatch rejects the commit before it enters the wallet
+     * @param[out] broadcast_attempted whether immediate mempool submission was attempted
+     * @param[out] broadcast_succeeded whether that immediate submission succeeded
+     * @param[out] broadcast_error node rejection detail when immediate submission fails
      */
-    void CommitTransaction(
+    bool CommitTransaction(
         CTransactionRef tx,
         std::optional<Txid> replaces_txid = std::nullopt,
         std::optional<std::string> comment = std::nullopt,
         std::optional<std::string> comment_to = std::nullopt,
         const std::vector<std::string>& messages = {},
-        const std::vector<std::string>& payment_requests = {}
-    );
+        const std::vector<std::string>& payment_requests = {},
+        const std::optional<VaultCommitState>& expected_vault_state = std::nullopt,
+        bool* broadcast_attempted = nullptr,
+        bool* broadcast_succeeded = nullptr,
+        std::string* broadcast_error = nullptr);
 
     /** Pass this transaction to node for optional mempool insertion and relay to peers. */
     bool SubmitTxMemoryPoolAndRelay(CWalletTx& wtx, std::string& err_string, node::TxBroadcast broadcast_method) const
@@ -1020,6 +1064,11 @@ public:
     bool HaveCryptedKeys() const;
 
     /** Get last block processed height */
+    bool HasProcessedBlock() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        AssertLockHeld(cs_wallet);
+        return m_last_block_processed_height >= 0;
+    }
     int GetLastBlockHeight() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
         AssertLockHeld(cs_wallet);

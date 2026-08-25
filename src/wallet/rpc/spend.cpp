@@ -117,7 +117,10 @@ static UniValue FinishTransaction(const std::shared_ptr<CWallet> pwallet, const 
     // so external signers are not asked to sign more than once.
     bool complete;
     pwallet->FillPSBT(psbtx, {.sign = false, .bip32_derivs = true}, complete);
-    const auto err{pwallet->FillPSBT(psbtx, {.sign = true, .bip32_derivs = false}, complete)};
+    std::optional<VaultCommitState> signed_vault_state;
+    const auto err{pwallet->FillPSBT(
+        psbtx, {.sign = true, .bip32_derivs = false}, complete,
+        /*n_signed=*/nullptr, &signed_vault_state)};
     if (err) {
         throw JSONRPCPSBTError(*err);
     }
@@ -141,7 +144,14 @@ static UniValue FinishTransaction(const std::shared_ptr<CWallet> pwallet, const 
         CTransactionRef tx(MakeTransactionRef(std::move(mtx)));
         result.pushKV("txid", tx->GetHash().GetHex());
         if (add_to_wallet && !psbt_opt_in) {
-            pwallet->CommitTransaction(tx);
+            if (!pwallet->CommitTransaction(
+                    tx, /*replaces_txid=*/std::nullopt,
+                    /*comment=*/std::nullopt, /*comment_to=*/std::nullopt,
+                    /*messages=*/{}, /*payment_requests=*/{}, signed_vault_state)) {
+                throw JSONRPCError(
+                    RPC_WALLET_ERROR,
+                    "Recovery Vault policy or participant loss state changed after signing; create and review a new transaction");
+            }
         } else {
             result.pushKV("hex", hex);
         }
@@ -186,6 +196,11 @@ UniValue SendMoney(CWallet& wallet, const CCoinControl &coin_control, std::vecto
 
     // Shuffle recipient list
     std::shuffle(recipients.begin(), recipients.end(), FastRandomContext());
+
+    // Local signing does not leave the wallet lock, so keep it through commit.
+    // This gives sendtoaddress/sendmany the same policy/loss atomicity as the
+    // explicit snapshot used by workflows that may block on external signing.
+    LOCK(wallet.cs_wallet);
 
     // Send
     auto res = CreateTransaction(wallet, recipients, /*change_pos=*/std::nullopt, coin_control, true);
@@ -1185,7 +1200,8 @@ static RPCMethod bumpfee_helper(std::string method_name)
     // For bumpfee, return the new transaction id.
     // For psbtbumpfee, return the base64-encoded unsigned PSBT of the new transaction.
     if (!want_psbt) {
-        if (!feebumper::SignTransaction(*pwallet, mtx)) {
+        std::optional<VaultCommitState> signed_vault_state;
+        if (!feebumper::SignTransaction(*pwallet, mtx, &signed_vault_state)) {
             if (pwallet->IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
                 throw JSONRPCError(RPC_WALLET_ERROR, "Transaction incomplete. Try psbtbumpfee instead.");
             }
@@ -1193,7 +1209,9 @@ static RPCMethod bumpfee_helper(std::string method_name)
         }
 
         Txid txid;
-        if (feebumper::CommitTransaction(*pwallet, hash, std::move(mtx), errors, txid) != feebumper::Result::OK) {
+        if (feebumper::CommitTransaction(
+                *pwallet, hash, std::move(mtx), errors, txid,
+                signed_vault_state) != feebumper::Result::OK) {
             throw JSONRPCError(RPC_WALLET_ERROR, errors[0].original);
         }
 

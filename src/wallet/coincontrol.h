@@ -92,6 +92,13 @@ public:
     //! If true, the selection process can add extra unselected inputs from the wallet
     //! while requires all selected inputs be used
     bool m_allow_other_inputs = true;
+    //! Optional hard boundary for both explicitly selected and automatically
+    //! selected inputs. A disengaged value is unrestricted; an engaged empty
+    //! set permits no wallet inputs.
+    std::optional<std::set<COutPoint>> m_allowed_inputs;
+    //! Request the consumer Recovery Vault flow's full eligible-balance sweep.
+    //! Core/RPC recovery keeps this false and retains normal coin selection.
+    bool m_vault_recovery_sweep{false};
     //! Override automatic min/max checks on fee, m_feerate must be set if true
     bool fOverrideFeeRate = false;
     //! Override the wallet's fee rate if set

@@ -331,8 +331,13 @@ Result CreateRateBumpTransaction(CWallet& wallet, const Txid& txid, const CCoinC
     return Result::OK;
 }
 
-bool SignTransaction(CWallet& wallet, CMutableTransaction& mtx) {
+bool SignTransaction(
+    CWallet& wallet,
+    CMutableTransaction& mtx,
+    std::optional<VaultCommitState>* signed_vault_state)
+{
     LOCK(wallet.cs_wallet);
+    if (signed_vault_state) signed_vault_state->reset();
 
     if (wallet.IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
         // Make a blank psbt
@@ -342,16 +347,24 @@ bool SignTransaction(CWallet& wallet, CMutableTransaction& mtx) {
         // so external signers are not asked to sign more than once.
         bool complete;
         wallet.FillPSBT(psbtx, {.sign = false, .bip32_derivs = true}, complete);
-        auto err{wallet.FillPSBT(psbtx, {.sign = true, .bip32_derivs = false}, complete)};
+        auto err{wallet.FillPSBT(
+            psbtx, {.sign = true, .bip32_derivs = false}, complete,
+            /*n_signed=*/nullptr, signed_vault_state)};
         if (err) return false;
         complete = FinalizeAndExtractPSBT(psbtx, mtx);
         return complete;
     } else {
-        return wallet.SignTransaction(mtx);
+        return wallet.SignTransaction(mtx, signed_vault_state);
     }
 }
 
-Result CommitTransaction(CWallet& wallet, const Txid& txid, CMutableTransaction&& mtx, std::vector<bilingual_str>& errors, Txid& bumped_txid)
+Result CommitTransaction(
+    CWallet& wallet,
+    const Txid& txid,
+    CMutableTransaction&& mtx,
+    std::vector<bilingual_str>& errors,
+    Txid& bumped_txid,
+    const std::optional<VaultCommitState>& expected_vault_state)
 {
     LOCK(wallet.cs_wallet);
     if (!errors.empty()) {
@@ -372,7 +385,14 @@ Result CommitTransaction(CWallet& wallet, const Txid& txid, CMutableTransaction&
 
     // commit/broadcast the tx
     CTransactionRef tx = MakeTransactionRef(std::move(mtx));
-    wallet.CommitTransaction(tx, oldWtx.GetHash(), oldWtx.m_comment, oldWtx.m_comment_to, oldWtx.m_messages, oldWtx.m_payment_requests);
+    if (!wallet.CommitTransaction(
+            tx, oldWtx.GetHash(), oldWtx.m_comment, oldWtx.m_comment_to,
+            oldWtx.m_messages, oldWtx.m_payment_requests,
+            expected_vault_state)) {
+        errors.emplace_back(Untranslated(
+            "Recovery Vault policy or participant loss state changed after signing; create and review a new fee-bump transaction"));
+        return Result::WALLET_ERROR;
+    }
 
     // mark the original tx as bumped
     bumped_txid = tx->GetHash();

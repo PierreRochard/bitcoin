@@ -3,9 +3,9 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <wallet/wallet.h>
-
 #include <bitcoin-build-config.h> // IWYU pragma: keep
+
+#include <wallet/wallet.h>
 
 #include <addresstype.h>
 #include <blockfilter.h>
@@ -20,6 +20,8 @@
 #include <consensus/consensus.h>
 #include <consensus/validation.h>
 #include <external_signer.h>
+#include <external_signer_discovery.h>
+#include <hwi/hwi.h>
 #include <interfaces/chain.h>
 #include <interfaces/handler.h>
 #include <interfaces/wallet.h>
@@ -60,6 +62,7 @@
 #include <util/result.h>
 #include <util/strencodings.h>
 #include <util/string.h>
+#include <util/syserror.h>
 #include <util/time.h>
 #include <util/translation.h>
 #include <wallet/coincontrol.h>
@@ -76,8 +79,11 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <condition_variable>
 #include <exception>
+#include <functional>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -85,6 +91,14 @@
 #include <tuple>
 #include <utility>
 #include <variant>
+
+#ifndef WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#else
+#include <windows.h>
+#endif
 
 struct KeyOriginInfo;
 
@@ -285,6 +299,94 @@ void WaitForDeleteWallet(std::shared_ptr<CWallet>&& wallet)
 }
 
 namespace {
+class FileIdentity
+{
+public:
+    explicit FileIdentity(const fs::path& path)
+    {
+#ifndef WIN32
+        int flags{O_RDONLY};
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+        m_fd = ::open(path.c_str(), flags);
+        if (m_fd == -1) {
+            m_error = SysErrorString(errno);
+            return;
+        }
+        struct stat info;
+        if (::fstat(m_fd, &info) != 0) {
+            m_error = SysErrorString(errno);
+            return;
+        }
+        m_identity = Identity{info.st_dev, info.st_ino};
+#else
+        m_handle = CreateFileW(path.wstring().c_str(), FILE_READ_ATTRIBUTES,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (m_handle == INVALID_HANDLE_VALUE) {
+            m_error = Win32ErrorString(GetLastError());
+            return;
+        }
+        BY_HANDLE_FILE_INFORMATION info;
+        if (!GetFileInformationByHandle(m_handle, &info)) {
+            m_error = Win32ErrorString(GetLastError());
+            return;
+        }
+        m_identity = Identity{info.dwVolumeSerialNumber,
+                              info.nFileIndexHigh,
+                              info.nFileIndexLow};
+#endif
+    }
+
+    FileIdentity(const FileIdentity&) = delete;
+    FileIdentity& operator=(const FileIdentity&) = delete;
+
+    ~FileIdentity()
+    {
+#ifndef WIN32
+        if (m_fd != -1) ::close(m_fd);
+#else
+        if (m_handle != INVALID_HANDLE_VALUE) CloseHandle(m_handle);
+#endif
+    }
+
+    bool IsValid() const { return m_identity.has_value(); }
+    const std::string& Error() const { return m_error; }
+
+    std::optional<bool> Matches(const fs::path& path, std::string& error) const
+    {
+        assert(m_identity);
+        FileIdentity other{path};
+        if (!other.IsValid()) {
+            error = other.Error();
+            return std::nullopt;
+        }
+        return m_identity == other.m_identity;
+    }
+
+private:
+    struct Identity {
+#ifndef WIN32
+        dev_t device;
+        ino_t inode;
+#else
+        DWORD volume_serial;
+        DWORD file_index_high;
+        DWORD file_index_low;
+#endif
+        friend bool operator==(const Identity&, const Identity&) = default;
+    };
+
+#ifndef WIN32
+    int m_fd{-1};
+#else
+    HANDLE m_handle{INVALID_HANDLE_VALUE};
+#endif
+    std::optional<Identity> m_identity;
+    std::string m_error;
+};
+
 bool CleanupWalletAfterFailedLoad(WalletContext& context, std::shared_ptr<CWallet>& wallet, bool notification_started)
 {
     if (!wallet) return true;
@@ -504,6 +606,20 @@ std::shared_ptr<CWallet> PublishStagedVaultWallet(
         return nullptr;
     }
 
+    // Keep an open handle to the closed staging database for the full
+    // publication/load operation. Its file identity remains stable even after
+    // the staging name is unlinked, so rollback can distinguish our published
+    // hard link from an unrelated regular file installed at the same path by a
+    // failing callback or concurrent actor.
+    FileIdentity published_identity{normalized_database};
+    if (!published_identity.IsValid()) {
+        status = DatabaseStatus::FAILED_CREATE;
+        error = Untranslated(strprintf(
+            "Unable to anchor fixed vault staging database identity: %s",
+            published_identity.Error()));
+        return nullptr;
+    }
+
     // A hard link publishes the already closed SQLite file atomically and,
     // unlike rename-over helpers, is guaranteed to fail if the destination
     // appeared during candidate preparation. Both paths are in wallet_dir, so
@@ -518,6 +634,15 @@ std::shared_ptr<CWallet> PublishStagedVaultWallet(
         error = final_exists
             ? Untranslated("A wallet with this name was created concurrently; the existing wallet was not changed")
             : Untranslated(strprintf("Unable to atomically publish fixed vault wallet: %s", link_error.message()));
+        return nullptr;
+    }
+
+    std::string identity_error;
+    const std::optional<bool> published_path_matches{
+        published_identity.Matches(final_path, identity_error)};
+    if (!published_path_matches || !*published_path_matches) {
+        status = DatabaseStatus::FAILED_CREATE;
+        error = Untranslated(!published_path_matches ? strprintf("The fixed vault wallet was published, but its file identity could not be verified: %s. The final wallet name may still exist and must be inspected before retrying.", identity_error) : "The fixed vault wallet publication path was replaced before it could be verified. The final wallet name was not removed and must be inspected before retrying.");
         return nullptr;
     }
 
@@ -540,6 +665,16 @@ std::shared_ptr<CWallet> PublishStagedVaultWallet(
         }
         if (before.type() != fs::file_type::regular) {
             return "the published path was replaced with a non-wallet path; refusing to remove it";
+        }
+
+        std::string match_error;
+        const std::optional<bool> matches_published{
+            published_identity.Matches(final_path, match_error)};
+        if (!matches_published) {
+            return strprintf("the published path identity could not be verified (%s); refusing to remove it", match_error);
+        }
+        if (!*matches_published) {
+            return "the published path was replaced with a different regular file; refusing to remove it";
         }
 
         std::error_code remove_error;
@@ -1954,9 +2089,10 @@ void CWallet::SetWalletFlag(uint64_t flags)
 void CWallet::SetWalletFlagWithDB(WalletBatch& batch, uint64_t flags)
 {
     LOCK(cs_wallet);
-    m_wallet_flags |= flags;
-    if (!batch.WriteWalletFlags(m_wallet_flags))
+    const uint64_t updated_flags{m_wallet_flags | flags};
+    if (!batch.WriteWalletFlags(updated_flags))
         throw std::runtime_error(std::string(__func__) + ": writing wallet flags failed");
+    m_wallet_flags = updated_flags;
 }
 
 void CWallet::UnsetWalletFlag(uint64_t flag)
@@ -1968,9 +2104,10 @@ void CWallet::UnsetWalletFlag(uint64_t flag)
 void CWallet::UnsetWalletFlagWithDB(WalletBatch& batch, uint64_t flag)
 {
     LOCK(cs_wallet);
-    m_wallet_flags &= ~flag;
-    if (!batch.WriteWalletFlags(m_wallet_flags))
+    const uint64_t updated_flags{m_wallet_flags & ~flag};
+    if (!batch.WriteWalletFlags(updated_flags))
         throw std::runtime_error(std::string(__func__) + ": writing wallet flags failed");
+    m_wallet_flags = updated_flags;
 }
 
 void CWallet::UnsetBlankWalletFlag(WalletBatch& batch)
@@ -2369,9 +2506,123 @@ void MaybeResendWalletTxs(WalletContext& context)
 }
 
 
-bool CWallet::SignTransaction(CMutableTransaction& tx) const
+static std::vector<KeyFingerprint> ManuallyLostFixedVaultFingerprints(const CWallet& wallet)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    std::vector<KeyFingerprint> result;
+    if (wallet.m_manually_lost_signers.empty()) return result;
+    const VaultPolicyPackage package{ExportWalletVaultPolicy(wallet)};
+    if (package.policy_id.empty() ||
+        wallet.m_vault_metadata_policy_commitment != VaultPolicyCommitment(package)) {
+        return result;
+    }
+    const auto participants{FixedVaultParticipants(package)};
+    if (!participants) return result;
+    for (const auto& participant : *participants) {
+        if (!wallet.m_manually_lost_signers.contains(participant.fingerprint)) continue;
+        const std::vector<unsigned char> parsed{ParseHex(participant.fingerprint)};
+        if (parsed.size() != KeyFingerprint{}.size()) continue;
+        KeyFingerprint fingerprint;
+        std::copy(parsed.begin(), parsed.end(), fingerprint.begin());
+        result.push_back(fingerprint);
+    }
+    return result;
+}
+
+static bool HasPolicyBoundManualVaultLoss(const CWallet& wallet)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    if (wallet.m_manually_lost_signers.empty()) return false;
+    const VaultPolicyPackage package{ExportWalletVaultPolicy(wallet)};
+    if (package.policy_id.empty() || package.descs.empty() ||
+        wallet.m_vault_metadata_policy_commitment != VaultPolicyCommitment(package)) {
+        return false;
+    }
+    if (FixedVaultParticipants(package)) {
+        return !ManuallyLostFixedVaultFingerprints(wallet).empty();
+    }
+    return InferVaultPolicy(package.descs.front()).is_vault;
+}
+
+static bool PSBTContainsLostSignerContribution(
+    const CWallet& wallet,
+    const PartiallySignedTransaction& psbt,
+    const std::vector<KeyFingerprint>& excluded,
+    const std::vector<size_t>& vault_input_indices)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    const auto origin_is_excluded = [&](const KeyOriginInfo& origin) {
+        return std::ranges::find(excluded, origin.fingerprint) != excluded.end();
+    };
+    for (const size_t index : vault_input_indices) {
+        if (index >= psbt.inputs.size()) return true;
+        const PSBTInput& input{psbt.inputs[index]};
+        CTxOut prevout;
+        const auto wallet_tx{wallet.mapWallet.find(input.prev_txid)};
+        if (wallet_tx != wallet.mapWallet.end()) {
+            const CTransactionRef& trusted_previous{wallet_tx->second.GetTx()};
+            if (!trusted_previous || input.prev_out >= trusted_previous->vout.size()) return true;
+            prevout = trusted_previous->vout[input.prev_out];
+        } else if (!input.GetUTXO(prevout)) {
+            return true;
+        }
+
+        // A final witness or aggregate key-path signature no longer carries
+        // enough attribution to prove that a deliberately lost participant
+        // was excluded. Fail closed and require a fresh, unsigned PSBT.
+        if (!input.final_script_sig.empty() || !input.final_script_witness.IsNull() ||
+            !input.m_tap_key_sig.empty() || !input.partial_sigs.empty()) {
+            return true;
+        }
+        for (const auto& [pubkey_and_leaf, _] : input.m_tap_script_sigs) {
+            KeyOriginInfo trusted_origin;
+            if (!GetActiveVaultKeyOrigin(wallet, prevout, pubkey_and_leaf.first, trusted_origin) ||
+                origin_is_excluded(trusted_origin)) return true;
+        }
+        for (const auto& [_, public_nonces] : input.m_musig2_pubnonces) {
+            for (const auto& [participant, _] : public_nonces) {
+                KeyOriginInfo trusted_origin;
+                if (!GetActiveVaultKeyOrigin(wallet, prevout, participant, trusted_origin) ||
+                    origin_is_excluded(trusted_origin)) return true;
+            }
+        }
+        for (const auto& [_, partial_signatures] : input.m_musig2_partial_sigs) {
+            for (const auto& [participant, _] : partial_signatures) {
+                KeyOriginInfo trusted_origin;
+                if (!GetActiveVaultKeyOrigin(wallet, prevout, participant, trusted_origin) ||
+                    origin_is_excluded(trusted_origin)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+std::optional<VaultCommitState> CWallet::GetVaultCommitState() const
 {
     AssertLockHeld(cs_wallet);
+    const VaultPolicyPackage package{ExportWalletVaultPolicy(*this)};
+    if (package.policy_id.empty() || package.descs.empty() ||
+        !InferVaultPolicy(package.descs.front()).is_vault) {
+        return std::nullopt;
+    }
+
+    VaultCommitState state;
+    state.policy_commitment = VaultPolicyCommitment(package);
+    if (m_vault_metadata_policy_commitment == state.policy_commitment) {
+        state.manually_lost_signers = m_manually_lost_signers;
+    }
+    return state;
+}
+
+bool CWallet::SignTransaction(
+    CMutableTransaction& tx,
+    std::optional<VaultCommitState>* signed_vault_state) const
+{
+    AssertLockHeld(cs_wallet);
+    if (signed_vault_state) signed_vault_state->reset();
     if (IsWalletFlagSet(WALLET_FLAG_GENESIS_RESCAN_REQUIRED)) return false;
 
     // MuSig2 is two-round. ProduceSignature (the 4-arg SignTransaction path) is a
@@ -2379,7 +2630,9 @@ bool CWallet::SignTransaction(CMutableTransaction& tx) const
     // aggregate, which CreateTransaction/GUI send need for Scrooge vaults.
     PartiallySignedTransaction psbtx(tx);
     bool complete = false;
-    if (FillPSBTLocked(psbtx, {.sign = true, .finalize = true, .bip32_derivs = true}, complete, nullptr)) {
+    if (FillPSBTLocked(
+            psbtx, {.sign = true, .finalize = true, .bip32_derivs = true},
+            complete, /*n_signed=*/nullptr, signed_vault_state)) {
         return false;
     }
     return complete && FinalizeAndExtractPSBT(psbtx, tx);
@@ -2391,6 +2644,15 @@ bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint,
     if (IsWalletFlagSet(WALLET_FLAG_GENESIS_RESCAN_REQUIRED)) {
         for (size_t i = 0; i < tx.vin.size(); ++i) {
             input_errors.emplace(i, _("Vault restore must finish rescanning from genesis before signing"));
+        }
+        return false;
+    }
+    const bool signs_vault_input{std::ranges::any_of(coins, [&](const auto& entry) {
+        return IsActiveVaultOutput(*this, entry.second.out);
+    })};
+    if (signs_vault_input && HasPolicyBoundManualVaultLoss(*this)) {
+        for (size_t i = 0; i < tx.vin.size(); ++i) {
+            input_errors.emplace(i, _("A Recovery Vault participant is marked lost; create an unsigned PSBT for the remaining trusted participants"));
         }
         return false;
     }
@@ -2408,46 +2670,206 @@ bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint,
     return false;
 }
 
-std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, const common::PSBTFillOptions& options, bool& complete, size_t* n_signed) const
+std::optional<PSBTError> CWallet::FillPSBT(
+    PartiallySignedTransaction& psbtx,
+    const common::PSBTFillOptions& options,
+    bool& complete,
+    size_t* n_signed,
+    std::optional<VaultCommitState>* signed_vault_state) const
 {
     LOCK(cs_wallet);
-    return FillPSBTLocked(psbtx, options, complete, n_signed);
+    if (signed_vault_state) signed_vault_state->reset();
+    return FillPSBTLocked(psbtx, options, complete, n_signed, signed_vault_state);
 }
 
-std::optional<PSBTError> CWallet::FillPSBTLocked(PartiallySignedTransaction& psbtx, const common::PSBTFillOptions& options, bool& complete, size_t* n_signed) const
+std::optional<PSBTError> CWallet::FillPSBTLocked(
+    PartiallySignedTransaction& psbtx,
+    const common::PSBTFillOptions& options,
+    bool& complete,
+    size_t* n_signed,
+    std::optional<VaultCommitState>* signed_vault_state) const
 {
     AssertLockHeld(cs_wallet);
     if (n_signed) {
         *n_signed = 0;
     }
+    if (options.expected_vault_policy_commitment) {
+        const VaultPolicyPackage active_package{ExportWalletVaultPolicy(*this)};
+        if (active_package.policy_id.empty() ||
+            VaultPolicyCommitment(active_package) != *options.expected_vault_policy_commitment) {
+            complete = false;
+            return PSBTError::VAULT_POLICY_MISMATCH;
+        }
+    }
     if (options.sign && IsWalletFlagSet(WALLET_FLAG_GENESIS_RESCAN_REQUIRED)) {
         complete = false;
         return PSBTError::WALLET_RESCAN_REQUIRED;
     }
-    // Get all of the previous transactions
-    for (PSBTInput& input : psbtx.inputs) {
-        if (PSBTInputSigned(input)) {
-            continue;
+    const std::vector<KeyFingerprint> excluded_signers{
+        options.sign ? ManuallyLostFixedVaultFingerprints(*this) : std::vector<KeyFingerprint>{}};
+    std::vector<size_t> vault_input_indices;
+    std::vector<CTransactionRef> trusted_previous_transactions(psbtx.inputs.size());
+    for (size_t index = 0; index < psbtx.inputs.size(); ++index) {
+        PSBTInput& input{psbtx.inputs[index]};
+        const auto wallet_tx{mapWallet.find(input.prev_txid)};
+        CTransactionRef trusted_previous;
+        if (wallet_tx != mapWallet.end()) trusted_previous = wallet_tx->second.GetTx();
+        trusted_previous_transactions[index] = trusted_previous;
+
+        // Classify wallet-owned inputs from the wallet's authoritative previous
+        // transaction, not from caller-supplied PSBT metadata. This must also
+        // work for finalized inputs so an existing lost-participant signature
+        // cannot bypass the vault guard. If the wallet does not know the
+        // transaction, retain normal PSBT UTXO-based classification.
+        CTxOut prevout;
+        bool have_prevout{false};
+        if (trusted_previous) {
+            if (input.prev_out >= trusted_previous->vout.size()) {
+                complete = false;
+                return PSBTError::INVALID_TX;
+            }
+            prevout = trusted_previous->vout[input.prev_out];
+            have_prevout = true;
+        } else {
+            have_prevout = input.GetUTXO(prevout);
+        }
+        if (have_prevout && IsActiveVaultOutput(*this, prevout)) {
+            vault_input_indices.push_back(index);
         }
 
-        // If we have no utxo, grab it from the wallet.
-        if (!input.non_witness_utxo) {
-            const Txid& txhash = input.prev_txid;
-            const auto it = mapWallet.find(txhash);
-            if (it != mapWallet.end()) {
-                const CWalletTx& wtx = it->second;
-                // We only need the non_witness_utxo, which is a superset of the witness_utxo.
-                //   The signing code will switch to the smaller witness_utxo if this is ok.
-                input.non_witness_utxo = wtx.GetTx();
-            }
+        // Preserve the historical FillPSBT contract for already-finalized
+        // inputs: classify them above, but do not enrich or otherwise mutate
+        // them. Unsigned inputs still receive the wallet transaction when it
+        // is available, exactly as before.
+        if (PSBTInputSigned(input)) continue;
+        if (!input.non_witness_utxo && trusted_previous) {
+            // We only need the non_witness_utxo, which is a superset of the witness_utxo.
+            // The signing code will switch to the smaller witness_utxo if this is ok.
+            input.non_witness_utxo = trusted_previous;
         }
     }
+    // Fixed Recovery Vaults have an exact participant roster, so a mature
+    // reduced-quorum branch can safely exclude only the participant marked
+    // lost. Advanced/custom policies do not provide that exact mapping. Keep
+    // their historical fail-closed behavior: any policy-bound manual loss
+    // blocks signing active-vault inputs while still allowing an unsigned PSBT
+    // and unrelated ordinary inputs.
+    if (options.sign && !vault_input_indices.empty() &&
+        HasPolicyBoundManualVaultLoss(*this) && !IsFixedStagedVault(*this)) {
+        complete = false;
+        return PSBTError::INCOMPLETE;
+    }
+    if (!excluded_signers.empty() &&
+        PSBTContainsLostSignerContribution(
+            *this, psbtx, excluded_signers, vault_input_indices)) {
+        complete = false;
+        return PSBTError::INCOMPLETE;
+    }
 
-    std::optional<PrecomputedTransactionData> txdata_res = PrecomputePSBTData(psbtx);
+    // Finalized inputs historically remain byte-for-byte untouched. Use a
+    // private copy with authoritative wallet prevouts for sighash precomputation
+    // and completion verification, so an already-finalized ordinary input can
+    // still be verified without leaking enrichment into the caller's PSBT.
+    const auto hydrate_trusted_prevouts = [&](PartiallySignedTransaction& verification) {
+        for (size_t index = 0; index < verification.inputs.size(); ++index) {
+            if (trusted_previous_transactions[index]) {
+                verification.inputs[index].non_witness_utxo = trusted_previous_transactions[index];
+            }
+        }
+    };
+    PartiallySignedTransaction txdata_psbt{psbtx};
+    hydrate_trusted_prevouts(txdata_psbt);
+    std::optional<PrecomputedTransactionData> txdata_res = PrecomputePSBTData(txdata_psbt);
     if (!txdata_res) {
         return PSBTError::INVALID_TX;
     }
     const PrecomputedTransactionData& txdata = *txdata_res;
+    const auto inputs_complete = [&] {
+        PartiallySignedTransaction verification{psbtx};
+        hydrate_trusted_prevouts(verification);
+        for (size_t index = 0; index < verification.inputs.size(); ++index) {
+            if (!PSBTInputSignedAndVerified(verification, index, &txdata)) return false;
+        }
+        return true;
+    };
+    common::PSBTFillOptions signing_options{options};
+    if (options.sign && !vault_input_indices.empty()) {
+        for (const KeyFingerprint& fingerprint : excluded_signers) {
+            if (std::ranges::find(signing_options.excluded_signer_fingerprints,
+                                  fingerprint) ==
+                signing_options.excluded_signer_fingerprints.end()) {
+                signing_options.excluded_signer_fingerprints.push_back(fingerprint);
+            }
+        }
+        signing_options.excluded_signer_input_indices = vault_input_indices;
+    }
+
+#ifdef ENABLE_EXTERNAL_SIGNER
+    const bool use_exact_vault_signers{
+        options.sign && IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER) &&
+        IsFixedStagedVault(*this) && !vault_input_indices.empty()};
+    std::vector<interfaces::ExternalSignerExpectedIdentity> exact_vault_signers;
+    std::function<bool(const PartiallySignedTransaction&)> validate_exact_vault_response;
+    if (use_exact_vault_signers && !excluded_signers.empty()) {
+        validate_exact_vault_response = [&](const PartiallySignedTransaction& candidate)
+                                            EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
+                                                return !PSBTContainsLostSignerContribution(
+                                                    *this, candidate, excluded_signers, vault_input_indices);
+                                            };
+    }
+    if (use_exact_vault_signers) {
+        const VaultPolicyPackage package{ExportWalletVaultPolicy(*this)};
+        const bool metadata_matches_policy{
+            m_vault_metadata_policy_commitment == VaultPolicyCommitment(package)};
+        // Fixed vaults created before participant provenance existed have no
+        // policy binding at all. Preserve their historical HWI behavior only
+        // while every metadata namespace is pristine and the caller is not a
+        // new flow carrying a policy-CAS token. A newly policy-bound wallet
+        // with an UNKNOWN source remains fail-closed, including after a
+        // source-persistence failure.
+        const bool pristine_legacy_metadata{
+            m_vault_metadata_policy_commitment.empty() &&
+            m_vault_participant_types.empty() && m_lost_signers.empty() &&
+            m_manually_lost_signers.empty() &&
+            m_vault_setup_state == VaultSetupState::NOT_RECORDED &&
+            m_vault_verification_state == VaultVerificationState::NOT_RECORDED &&
+            !options.expected_vault_policy_commitment};
+        if (metadata_matches_policy || pristine_legacy_metadata) {
+            if (const auto participants{FixedVaultParticipants(package)}) {
+                for (const auto& participant : *participants) {
+                    const auto type{m_vault_participant_types.find(participant.fingerprint)};
+                    if (metadata_matches_policy) {
+                        if (type == m_vault_participant_types.end() ||
+                            type->second != VaultParticipantType::HARDWARE ||
+                            m_lost_signers.contains(participant.fingerprint)) {
+                            continue;
+                        }
+                    } else {
+                        // This compatibility path still requires fresh exact
+                        // fingerprint/path/full-xpub validation. Do not offer a
+                        // participant whose account private key is held by an
+                        // active vault manager to external discovery.
+                        bool locally_owned{false};
+                        const CExtPubKey account{DecodeExtPubKey(participant.xpub)};
+                        if (account.pubkey.IsValid()) {
+                            for (const bool internal : {false, true}) {
+                                auto* manager{dynamic_cast<DescriptorScriptPubKeyMan*>(
+                                    GetScriptPubKeyMan(OutputType::BECH32M, internal))};
+                                if (!manager) continue;
+                                LOCK(manager->cs_desc_man);
+                                locally_owned |= manager->HasPrivKey(account.pubkey.GetID());
+                            }
+                        }
+                        if (locally_owned) continue;
+                    }
+                    exact_vault_signers.push_back({participant.fingerprint,
+                                                   participant.path,
+                                                   participant.xpub});
+                }
+            }
+        }
+    }
+#endif
 
     auto CountMuSig2 = [&]() {
         size_t nonces = 0;
@@ -2469,7 +2891,7 @@ std::optional<PSBTError> CWallet::FillPSBTLocked(PartiallySignedTransaction& psb
     for (int round = 0; round < max_rounds; ++round) {
         for (ScriptPubKeyMan* spk_man : GetAllScriptPubKeyMans()) {
             int n_signed_this_spkm = 0;
-            const auto error{spk_man->FillPSBT(psbtx, txdata, options, &n_signed_this_spkm)};
+            const auto error{spk_man->FillPSBT(psbtx, txdata, signing_options, &n_signed_this_spkm)};
             if (error) {
                 return error;
             }
@@ -2480,18 +2902,44 @@ std::optional<PSBTError> CWallet::FillPSBTLocked(PartiallySignedTransaction& psb
 
 #ifdef ENABLE_EXTERNAL_SIGNER
         if (options.sign && IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
-            const auto error{ExternalSignerScriptPubKeyMan::SignPSBT(
-                psbtx, options.finalize, /*allow_native_default=*/IsFixedStagedVault(*this))};
-            if (error) {
-                return error;
+            if (use_exact_vault_signers) {
+                // Fixed Recovery Vaults never select hardware by a 32-bit
+                // fingerprint alone. The external-signing wallet flag records
+                // explicit authority to reconnect exact policy participants,
+                // while durable participant provenance decides which exact
+                // identities may receive the transaction. Local, air-gapped,
+                // lost, and unknown participants are excluded before fresh
+                // full-identity checks.
+                // A reduced-quorum recovery can be complete after trusted
+                // local managers run above. Do not disclose that finalized
+                // transaction to an unnecessary hardware signer. The
+                // response validator remains mandatory whenever hardware
+                // actually contributes to an incomplete PSBT.
+                if (!inputs_complete() && !exact_vault_signers.empty()) {
+                    const std::string command{gArgs.IsArgSet("-signer") ? gArgs.GetArg("-signer", "") : std::string{hwi::NATIVE_SIGNER_COMMAND}};
+                    if (command.empty()) return PSBTError::EXTERNAL_SIGNER_NOT_FOUND;
+                    auto signed_by{SignPSBTWithExactExternalSigners(
+                        command, Params().GetChainTypeString(),
+                        exact_vault_signers, psbtx,
+                        validate_exact_vault_response)};
+                    if (!signed_by) {
+                        WalletLogPrintf("Exact Recovery Vault hardware signing failed: %s\n",
+                                        util::ErrorString(signed_by).original);
+                        return PSBTError::EXTERNAL_SIGNER_FAILED;
+                    }
+                    if (options.finalize) FinalizePSBT(psbtx);
+                }
+            } else {
+                const auto error{ExternalSignerScriptPubKeyMan::SignPSBT(
+                    psbtx, options.finalize, /*allow_native_default=*/false)};
+                if (error) {
+                    return error;
+                }
             }
         }
 #endif
 
-        complete = true;
-        for (size_t i = 0; i < psbtx.inputs.size(); ++i) {
-            complete &= PSBTInputSignedAndVerified(psbtx, i, &txdata);
-        }
+        complete = inputs_complete();
         if (complete) break;
 
         const auto musig = CountMuSig2();
@@ -2503,9 +2951,15 @@ std::optional<PSBTError> CWallet::FillPSBTLocked(PartiallySignedTransaction& psb
     RemoveUnnecessaryTransactions(psbtx);
 
     // Complete if every input is now signed
-    complete = true;
-    for (size_t i = 0; i < psbtx.inputs.size(); ++i) {
-        complete &= PSBTInputSignedAndVerified(psbtx, i, &txdata);
+    complete = inputs_complete();
+
+    if (signed_vault_state && options.sign && !vault_input_indices.empty()) {
+        const auto state{GetVaultCommitState()};
+        if (!state) {
+            complete = false;
+            return PSBTError::INVALID_TX;
+        }
+        *signed_vault_state = *state;
     }
 
     return {};
@@ -2585,16 +3039,26 @@ OutputType CWallet::TransactionChangeType(const std::optional<OutputType>& chang
     return m_default_address_type;
 }
 
-void CWallet::CommitTransaction(
+bool CWallet::CommitTransaction(
     CTransactionRef tx,
     std::optional<Txid> replaces_txid,
     std::optional<std::string> comment,
     std::optional<std::string> comment_to,
     const std::vector<std::string>& messages,
-    const std::vector<std::string>& payment_requests
-)
+    const std::vector<std::string>& payment_requests,
+    const std::optional<VaultCommitState>& expected_vault_state,
+    bool* broadcast_attempted,
+    bool* broadcast_succeeded,
+    std::string* broadcast_error)
 {
     LOCK(cs_wallet);
+    if (broadcast_attempted) *broadcast_attempted = false;
+    if (broadcast_succeeded) *broadcast_succeeded = false;
+    if (broadcast_error) broadcast_error->clear();
+    if (expected_vault_state && GetVaultCommitState() != expected_vault_state) {
+        WalletLogPrintf("CommitTransaction(): Recovery Vault policy or manual-loss state changed after signing; transaction rejected\n");
+        return false;
+    }
     WalletLogPrintf("CommitTransaction:\n%s\n", util::RemoveSuffixView(tx->ToString(), "\n"));
 
     // Add tx to wallet, because if it has change it's also ours,
@@ -2622,14 +3086,20 @@ void CWallet::CommitTransaction(
 
     if (!fBroadcastTransactions) {
         // Don't submit tx to the mempool
-        return;
+        if (broadcast_error) *broadcast_error = "Wallet transaction broadcasting is disabled";
+        return true;
     }
 
     std::string err_string;
-    if (!SubmitTxMemoryPoolAndRelay(*wtx, err_string, node::TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL)) {
+    if (broadcast_attempted) *broadcast_attempted = true;
+    const bool submitted{SubmitTxMemoryPoolAndRelay(*wtx, err_string, node::TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL)};
+    if (broadcast_succeeded) *broadcast_succeeded = submitted;
+    if (!submitted) {
+        if (broadcast_error) *broadcast_error = err_string.empty() ? "The node did not accept the transaction" : err_string;
         WalletLogPrintf("CommitTransaction(): Transaction cannot be broadcast immediately, %s\n", err_string);
         // TODO: if we expect the failure to be long term or permanent, instead delete wtx from the wallet and return failure.
     }
+    return true;
 }
 
 DBErrors CWallet::PopulateWalletFromDB(bilingual_str& error, std::vector<bilingual_str>& warnings)
@@ -3040,6 +3510,105 @@ void CWallet::LoadLockedCoin(const COutPoint& coin, bool persistent)
     m_locked_coins.emplace(coin, persistent);
 }
 
+bool CWallet::SetLostSignerMetadata(const std::set<std::string>& lost,
+                                    const std::set<std::string>& manually_lost)
+{
+    AssertLockHeld(cs_wallet);
+    if (!std::ranges::includes(lost, manually_lost)) return false;
+    if (lost == m_lost_signers && manually_lost == m_manually_lost_signers) return true;
+
+    const bool written = RunWithinTxn(GetDatabase(), /*process_desc=*/"update lost vault signers",
+        [&](WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
+        for (const std::string& fingerprint : m_lost_signers) {
+            if (!lost.contains(fingerprint) && !batch.EraseLostSigner(fingerprint)) return false;
+        }
+        for (const std::string& fingerprint : lost) {
+            if (!m_lost_signers.contains(fingerprint) && !batch.WriteLostSigner(fingerprint)) return false;
+        }
+        for (const std::string& fingerprint : m_manually_lost_signers) {
+            if (!manually_lost.contains(fingerprint) && !batch.EraseManualLostSigner(fingerprint)) return false;
+        }
+        for (const std::string& fingerprint : manually_lost) {
+            if (!m_manually_lost_signers.contains(fingerprint) && !batch.WriteManualLostSigner(fingerprint)) return false;
+        }
+        return true;
+    });
+    if (!written) return false;
+    m_lost_signers = lost;
+    m_manually_lost_signers = manually_lost;
+    return true;
+}
+
+bool CWallet::BindVaultMetadataToActivePolicy()
+{
+    AssertLockHeld(cs_wallet);
+    const VaultPolicyPackage package{ExportWalletVaultPolicy(*this)};
+    if (package.policy_id.empty()) return false;
+    const std::string active_policy_commitment{VaultPolicyCommitment(package)};
+    if (m_vault_metadata_policy_commitment == active_policy_commitment) return true;
+
+    // `lostsigner` predates policy-scoped metadata. A wallet with only those
+    // legacy records could not yet persist provenance or verification state.
+    // Conservatively attach them to the currently active policy and treat
+    // each as an explicit decision, preserving the user's spending block.
+    const bool migrate_legacy_lost{
+        m_vault_metadata_policy_commitment.empty() &&
+        !m_lost_signers.empty() && m_manually_lost_signers.empty() &&
+        m_vault_participant_types.empty() &&
+        m_vault_setup_state == VaultSetupState::NOT_RECORDED &&
+        m_vault_verification_state == VaultVerificationState::NOT_RECORDED};
+    std::set<std::string> preserved_legacy_lost;
+    if (migrate_legacy_lost) {
+        if (auto participants{FixedVaultParticipants(package)}) {
+            for (const auto& participant : *participants) {
+                if (m_lost_signers.contains(participant.fingerprint)) {
+                    preserved_legacy_lost.insert(participant.fingerprint);
+                }
+            }
+        } else {
+            // The lostsigner RPC predates the fixed consumer policy and also
+            // applied to advanced/custom vaults. Their general signer roster
+            // is not safely reducible to FixedVaultParticipants, so preserve
+            // every valid legacy marker rather than silently re-enable a path.
+            preserved_legacy_lost = m_lost_signers;
+        }
+    }
+
+    // A wallet can activate a new policy through advanced/RPC tooling. Clear
+    // every policy-scoped assertion in one database transaction before
+    // binding future writes to the replacement policy. This prevents an old
+    // address-verification result, signer type, or lost marker from being
+    // inherited by a new descriptor whose fingerprint merely collides.
+    const bool written = RunWithinTxn(GetDatabase(), /*process_desc=*/"bind Recovery Vault metadata to active policy",
+                                      [&](WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
+                                          for (const std::string& fingerprint : m_lost_signers) {
+                                              if (!batch.EraseLostSigner(fingerprint)) return false;
+                                          }
+                                          for (const std::string& fingerprint : m_manually_lost_signers) {
+                                              if (!batch.EraseManualLostSigner(fingerprint)) return false;
+                                          }
+                                          for (const auto& [fingerprint, _] : m_vault_participant_types) {
+                                              if (!batch.EraseVaultParticipantType(fingerprint)) return false;
+                                          }
+                                          if (!batch.EraseVaultState() || !batch.EraseVaultMetadataPolicy() ||
+                                              !batch.EraseVaultRescanProgress()) return false;
+                                          for (const std::string& fingerprint : preserved_legacy_lost) {
+                                              if (!batch.WriteLostSigner(fingerprint) ||
+                                                  !batch.WriteManualLostSigner(fingerprint)) return false;
+                                          }
+                                          return batch.WriteVaultMetadataPolicy(active_policy_commitment);
+                                      });
+    if (!written) return false;
+
+    m_lost_signers = preserved_legacy_lost;
+    m_manually_lost_signers = preserved_legacy_lost;
+    m_vault_participant_types.clear();
+    m_vault_setup_state = VaultSetupState::NOT_RECORDED;
+    m_vault_verification_state = VaultVerificationState::NOT_RECORDED;
+    m_vault_metadata_policy_commitment = active_policy_commitment;
+    return true;
+}
+
 bool CWallet::SetLostSigners(const std::set<std::string>& fingerprints)
 {
     AssertLockHeld(cs_wallet);
@@ -3048,35 +3617,170 @@ bool CWallet::SetLostSigners(const std::set<std::string>& fingerprints)
         if (fingerprint.size() != 8 || !IsHex(fingerprint)) return false;
         normalized.insert(ToLower(fingerprint));
     }
-    if (normalized == m_lost_signers) return true;
-
-    const bool written = RunWithinTxn(GetDatabase(), /*process_desc=*/"update lost vault signers",
-        [&](WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
-        for (const std::string& fingerprint : m_lost_signers) {
-            if (!normalized.contains(fingerprint) && !batch.EraseLostSigner(fingerprint)) return false;
-        }
-        for (const std::string& fingerprint : normalized) {
-            if (!m_lost_signers.contains(fingerprint) && !batch.WriteLostSigner(fingerprint)) return false;
-        }
-        return true;
-    });
-    if (!written) return false;
-    m_lost_signers = std::move(normalized);
-    return true;
+    // Preserve pre-existing RPC behavior for ordinary descriptor wallets.
+    // Their markers are inert and remain in the legacy LOST_SIGNER namespace;
+    // manual provenance is meaningful only when it can be policy-bound.
+    if (ExportWalletVaultPolicy(*this).policy_id.empty()) {
+        if (!m_vault_metadata_policy_commitment.empty()) return false;
+        return SetLostSignerMetadata(normalized, {});
+    }
+    if (!BindVaultMetadataToActivePolicy()) return false;
+    std::set<std::string> retained_manual;
+    std::ranges::set_intersection(m_manually_lost_signers, normalized,
+                                  std::inserter(retained_manual, retained_manual.end()));
+    return SetLostSignerMetadata(normalized, retained_manual);
 }
 
-bool CWallet::SetLostSigner(const std::string& fingerprint, bool lost)
+bool CWallet::SetLostSigner(
+    const std::string& fingerprint, bool lost,
+    const std::optional<std::string>& expected_policy_commitment)
 {
     AssertLockHeld(cs_wallet);
     if (fingerprint.size() != 8 || !IsHex(fingerprint)) return false;
     std::set<std::string> updated{m_lost_signers};
     const std::string normalized{ToLower(fingerprint)};
+    const VaultPolicyPackage package{ExportWalletVaultPolicy(*this)};
+    if (expected_policy_commitment &&
+        (package.policy_id.empty() ||
+         VaultPolicyCommitment(package) != *expected_policy_commitment)) {
+        return false;
+    }
+    if (package.policy_id.empty()) {
+        if (!m_vault_metadata_policy_commitment.empty()) return false;
+        if (lost) {
+            updated.insert(normalized);
+        } else {
+            updated.erase(normalized);
+        }
+        return SetLostSignerMetadata(updated, {});
+    }
+    if (!BindVaultMetadataToActivePolicy()) return false;
+    if (expected_policy_commitment &&
+        m_vault_metadata_policy_commitment != *expected_policy_commitment) {
+        return false;
+    }
+    updated = m_lost_signers;
+    std::set<std::string> updated_manual{m_manually_lost_signers};
     if (lost) {
         updated.insert(normalized);
+        updated_manual.insert(normalized);
     } else {
         updated.erase(normalized);
+        updated_manual.erase(normalized);
     }
-    return SetLostSigners(updated);
+    return SetLostSignerMetadata(updated, updated_manual);
+}
+
+bool CWallet::ClearAutomaticallyLostSigner(
+    const std::string& fingerprint,
+    const std::optional<std::string>& expected_policy_commitment)
+{
+    AssertLockHeld(cs_wallet);
+    if (fingerprint.size() != 8 || !IsHex(fingerprint)) return false;
+    const std::string normalized{ToLower(fingerprint)};
+    const VaultPolicyPackage package{ExportWalletVaultPolicy(*this)};
+    if (expected_policy_commitment &&
+        (package.policy_id.empty() ||
+         VaultPolicyCommitment(package) != *expected_policy_commitment)) {
+        return false;
+    }
+    if (package.policy_id.empty()) {
+        if (!m_vault_metadata_policy_commitment.empty()) return false;
+        std::set<std::string> updated{m_lost_signers};
+        updated.erase(normalized);
+        return SetLostSignerMetadata(updated, {});
+    }
+    if (!BindVaultMetadataToActivePolicy()) return false;
+    if (expected_policy_commitment &&
+        m_vault_metadata_policy_commitment != *expected_policy_commitment) {
+        return false;
+    }
+
+    // Discovery may race an explicit setlostsigner RPC or GUI decision. Keep
+    // the provenance check and update in one wallet-lock acquisition so fresh
+    // device discovery can never erase a deliberate lost-signer marker.
+    if (m_manually_lost_signers.contains(normalized)) return false;
+    if (!m_lost_signers.contains(normalized)) return true;
+
+    std::set<std::string> updated{m_lost_signers};
+    updated.erase(normalized);
+    return SetLostSignerMetadata(updated, m_manually_lost_signers);
+}
+
+bool CWallet::SetVaultSetupState(
+    VaultSetupState setup, VaultVerificationState verification,
+    const std::optional<std::string>& expected_policy_commitment)
+{
+    AssertLockHeld(cs_wallet);
+    if (!IsValidVaultSetupState(setup) || !IsValidVaultVerificationState(verification) ||
+        !IsConsistentVaultState(setup, verification)) {
+        return false;
+    }
+
+    // Address verification and setup completion are evidence about one exact
+    // public policy. The GUI may be waiting for a device while advanced/RPC
+    // tooling replaces that policy. Compare under cs_wallet before binding or
+    // writing anything so stale evidence cannot certify the replacement.
+    if (expected_policy_commitment) {
+        const VaultPolicyPackage active_package{ExportWalletVaultPolicy(*this)};
+        if (active_package.policy_id.empty() ||
+            VaultPolicyCommitment(active_package) != *expected_policy_commitment) {
+            return false;
+        }
+    }
+    if (!BindVaultMetadataToActivePolicy()) return false;
+    if (expected_policy_commitment &&
+        m_vault_metadata_policy_commitment != *expected_policy_commitment) {
+        return false;
+    }
+    if (setup == m_vault_setup_state && verification == m_vault_verification_state) return true;
+
+    WalletBatch batch(GetDatabase());
+    const bool written = setup == VaultSetupState::NOT_RECORDED ? batch.EraseVaultState() : batch.WriteVaultState(setup, verification);
+    if (!written) return false;
+    m_vault_setup_state = setup;
+    m_vault_verification_state = verification;
+    return true;
+}
+
+bool CWallet::SetVaultParticipantType(
+    const std::string& fingerprint, VaultParticipantType type,
+    const std::optional<std::string>& expected_policy_commitment)
+{
+    AssertLockHeld(cs_wallet);
+    if (fingerprint.size() != 8 || !IsHex(fingerprint) || !IsValidVaultParticipantType(type)) return false;
+    const VaultPolicyPackage package{ExportWalletVaultPolicy(*this)};
+    if (expected_policy_commitment &&
+        (package.policy_id.empty() || VaultPolicyCommitment(package) != *expected_policy_commitment)) {
+        return false;
+    }
+    if (!BindVaultMetadataToActivePolicy()) return false;
+    if (expected_policy_commitment &&
+        m_vault_metadata_policy_commitment != *expected_policy_commitment) {
+        return false;
+    }
+    const std::string normalized{ToLower(fingerprint)};
+    const auto participants{FixedVaultParticipants(package)};
+    if (!participants || std::ranges::none_of(*participants, [&](const auto& participant) {
+            return participant.fingerprint == normalized;
+        })) {
+        return false;
+    }
+
+    const auto existing = m_vault_participant_types.find(normalized);
+    if ((type == VaultParticipantType::UNKNOWN && existing == m_vault_participant_types.end()) ||
+        (existing != m_vault_participant_types.end() && existing->second == type)) {
+        return true;
+    }
+    WalletBatch batch(GetDatabase());
+    const bool written = type == VaultParticipantType::UNKNOWN ? batch.EraseVaultParticipantType(normalized) : batch.WriteVaultParticipantType(normalized, type);
+    if (!written) return false;
+    if (type == VaultParticipantType::UNKNOWN) {
+        m_vault_participant_types.erase(normalized);
+    } else {
+        m_vault_participant_types[normalized] = type;
+    }
+    return true;
 }
 
 bool CWallet::LockCoin(const COutPoint& output, bool persist)
@@ -3546,6 +4250,7 @@ bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interf
 {
     LOCK(walletInstance->cs_wallet);
     const bool genesis_rescan_required{walletInstance->IsWalletFlagSet(WALLET_FLAG_GENESIS_RESCAN_REQUIRED)};
+    const std::string vault_scan_policy_commitment{genesis_rescan_required ? VaultPolicyCommitment(ExportWalletVaultPolicy(*walletInstance)) : std::string{}};
     defer_genesis_rescan &= genesis_rescan_required;
     // allow setting the chain if it hasn't been set already but prevent changing it
     assert(!walletInstance->m_chain || walletInstance->m_chain == &chain);
@@ -3565,6 +4270,20 @@ bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interf
         }
     }
 
+    // Migrate legacy unscoped lost-signer records only after proving this
+    // wallet belongs to the active chain. A rejected wrong-network open must
+    // never rewrite durable metadata using that network's policy encoding.
+    if (walletInstance->m_vault_metadata_policy_commitment.empty() &&
+        !walletInstance->m_lost_signers.empty()) {
+        const VaultPolicyPackage active_package{ExportWalletVaultPolicy(*walletInstance)};
+        if (!active_package.policy_id.empty() &&
+            !walletInstance->BindVaultMetadataToActivePolicy()) {
+            error = Untranslated(
+                "Legacy lost-signer metadata could not be bound to the active Recovery Vault policy. The wallet was not loaded because its signer safety state could not be persisted.");
+            return false;
+        }
+    }
+
     // Register wallet with validationinterface. It's done before rescan to avoid
     // missing block connections during the rescan.
     // Because of the wallet lock being held, block connection notifications are going to
@@ -3573,10 +4292,30 @@ bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interf
     // so the wallet will only be completeley synced after the notifications delivery.
     walletInstance->m_chain_notifications_handler = walletInstance->chain().handleNotifications(walletInstance);
 
-    // If rescan_required = true, rescan_height remains equal to 0
+    const std::optional<int> tip_height = chain.getHeight();
+
+    // If rescan_required = true, rescan_height remains equal to 0. A fixed
+    // vault genesis scan may resume only from its dedicated checkpoint; the
+    // ordinary best-block locator can advance from tip notifications before
+    // historical scanning is complete and is therefore not authoritative.
     int rescan_height = 0;
-    if (!rescan_required && !genesis_rescan_required)
-    {
+    if (genesis_rescan_required && !defer_genesis_rescan && tip_height) {
+        WalletBatch batch(walletInstance->GetDatabase());
+        int checkpoint_height{-1};
+        uint256 checkpoint_hash;
+        std::string checkpoint_policy_commitment;
+        if (batch.ReadVaultRescanProgress(checkpoint_height, checkpoint_hash,
+                                          checkpoint_policy_commitment)) {
+            if (checkpoint_height >= 0 && checkpoint_height <= *tip_height &&
+                checkpoint_policy_commitment == vault_scan_policy_commitment &&
+                chain.getBlockHash(checkpoint_height) == checkpoint_hash) {
+                rescan_height = checkpoint_height;
+            } else if (!batch.EraseVaultRescanProgress()) {
+                warnings.push_back(Untranslated(
+                    "The saved Recovery Vault scan checkpoint is invalid and could not be cleared; the scan will restart from genesis."));
+            }
+        }
+    } else if (!rescan_required && !genesis_rescan_required) {
         WalletBatch batch(walletInstance->GetDatabase());
         CBlockLocator locator;
         if (batch.ReadBestBlock(locator)) {
@@ -3586,7 +4325,6 @@ bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interf
         }
     }
 
-    const std::optional<int> tip_height = chain.getHeight();
     if (tip_height) {
         walletInstance->SetLastBlockProcessedInMem(*tip_height, chain.getBlockHash(*tip_height));
     } else {
@@ -3660,6 +4398,17 @@ bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interf
             if (ScanResult::SUCCESS != scan_res.status) {
                 error = _("Failed to rescan the wallet during initialization");
                 if (!genesis_rescan_required) return false;
+                if (scan_res.status == ScanResult::USER_ABORT && scan_res.last_scanned_height &&
+                    scan_res.last_failed_block.IsNull()) {
+                    WalletBatch batch(walletInstance->GetDatabase());
+                    if (batch.WriteVaultRescanProgress(*scan_res.last_scanned_height,
+                                                       scan_res.last_scanned_block,
+                                                       vault_scan_policy_commitment)) {
+                        warnings.push_back(Untranslated(strprintf(
+                            "Recovery Vault scan progress was saved at height %d.",
+                            *scan_res.last_scanned_height)));
+                    }
+                }
                 warnings.push_back(error + Untranslated(" The fixed vault remains marked as requiring a genesis rescan and will retry when loaded again."));
                 error.clear();
                 return true;
@@ -3669,6 +4418,12 @@ bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interf
             // Also save the best block locator because rescanning only updates it intermittently.
             walletInstance->SetLastBlockProcessed(*scan_res.last_scanned_height, scan_res.last_scanned_block);
             if (genesis_rescan_required) {
+                WalletBatch batch(walletInstance->GetDatabase());
+                if (!batch.EraseVaultRescanProgress()) {
+                    warnings.push_back(Untranslated(
+                        "The Recovery Vault scan completed, but its checkpoint could not be cleared. Sending remains blocked until cleanup succeeds."));
+                    return true;
+                }
                 walletInstance->UnsetWalletFlag(WALLET_FLAG_GENESIS_RESCAN_REQUIRED);
             }
         }

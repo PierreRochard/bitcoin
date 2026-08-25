@@ -49,8 +49,8 @@ PolicyData MakePolicy(const std::string& name)
         spec.generate_local = true;
     MultisigOptions options;
     options.type = OutputType::BECH32M;
-    options.fallback_older = 4320;
-    options.fallback_older_one_key = 8640;
+    options.fallback_older = FIXED_VAULT_LEGACY_PRIMARY_DELAY;
+    options.fallback_older_one_key = FIXED_VAULT_LEGACY_FINAL_DELAY;
 
     LOCK(wallet->cs_wallet);
     auto created{CreateMultisigDescriptor(*wallet, /*nrequired=*/2, specs, options)};

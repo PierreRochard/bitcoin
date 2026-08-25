@@ -1425,6 +1425,23 @@ std::optional<PSBTError> DescriptorScriptPubKeyMan::FillPSBT(PartiallySignedTran
             }
         }
 
+        const bool excludes_signers_on_input{
+            std::ranges::find(options.excluded_signer_input_indices,
+                              static_cast<size_t>(i)) !=
+            options.excluded_signer_input_indices.end()};
+        if (options.sign && excludes_signers_on_input &&
+            !options.excluded_signer_fingerprints.empty()) {
+            for (const auto& [key_id, pubkey_origin] : keys->origins) {
+                if (std::ranges::find(options.excluded_signer_fingerprints,
+                                      pubkey_origin.second.fingerprint) !=
+                    options.excluded_signer_fingerprints.end()) {
+                    // Retain public origin data for PSBT coordination, but do
+                    // not expose this participant's secret key to the signer.
+                    keys->keys.erase(key_id);
+                }
+            }
+        }
+
         PSBTError res = SignPSBTInput(HidingSigningProvider(keys.get(), /*hide_secret=*/!options.sign, /*hide_origin=*/!options.bip32_derivs), psbtx, i, &txdata, options, /*out_sigdata=*/nullptr);
         if (res != PSBTError::OK && res != PSBTError::INCOMPLETE) {
             return res;

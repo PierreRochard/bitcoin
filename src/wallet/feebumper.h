@@ -6,8 +6,11 @@
 #define BITCOIN_WALLET_FEEBUMPER_H
 
 #include <consensus/consensus.h>
-#include <script/interpreter.h>
 #include <primitives/transaction.h>
+#include <script/interpreter.h>
+#include <wallet/vault_state.h>
+
+#include <optional>
 
 class uint256;
 enum class FeeEstimateMode;
@@ -60,17 +63,21 @@ Result CreateRateBumpTransaction(CWallet& wallet,
 //! Sign the new transaction,
 //! @return false if the tx couldn't be found or if it was
 //! impossible to create the signature(s)
-bool SignTransaction(CWallet& wallet, CMutableTransaction& mtx);
+bool SignTransaction(
+    CWallet& wallet,
+    CMutableTransaction& mtx,
+    std::optional<VaultCommitState>* signed_vault_state = nullptr);
 
 //! Commit the bumpfee transaction.
 //! @return success in case of CWallet::CommitTransaction was successful,
 //! but sets errors if the tx could not be added to the mempool (will try later)
 //! or if the old transaction could not be marked as replaced.
 Result CommitTransaction(CWallet& wallet,
-    const Txid& txid,
-    CMutableTransaction&& mtx,
-    std::vector<bilingual_str>& errors,
-    Txid& bumped_txid);
+                         const Txid& txid,
+                         CMutableTransaction&& mtx,
+                         std::vector<bilingual_str>& errors,
+                         Txid& bumped_txid,
+                         const std::optional<VaultCommitState>& expected_vault_state = std::nullopt);
 
 struct SignatureWeights
 {

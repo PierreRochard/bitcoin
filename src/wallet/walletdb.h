@@ -11,6 +11,7 @@
 #include <primitives/transaction_identifier.h>
 #include <script/sign.h>
 #include <wallet/db.h>
+#include <wallet/vault_state.h>
 #include <wallet/walletutil.h>
 
 #include <cstdint>
@@ -72,6 +73,7 @@ extern const std::string KEY;
 extern const std::string KEYMETA;
 extern const std::string LOCKED_UTXO;
 extern const std::string LOST_SIGNER;
+extern const std::string MANUAL_LOST_SIGNER;
 extern const std::string MASTER_KEY;
 extern const std::string MINVERSION;
 extern const std::string NAME;
@@ -81,6 +83,10 @@ extern const std::string POOL;
 extern const std::string PURPOSE;
 extern const std::string SETTINGS;
 extern const std::string TX;
+extern const std::string VAULT_PARTICIPANT_TYPE;
+extern const std::string VAULT_METADATA_POLICY;
+extern const std::string VAULT_RESCAN_PROGRESS;
+extern const std::string VAULT_STATE;
 extern const std::string WTX_VARIANT;
 extern const std::string VERSION;
 extern const std::string WALLETDESCRIPTOR;
@@ -263,6 +269,19 @@ public:
     bool EraseLockedUTXO(const COutPoint& output);
     bool WriteLostSigner(const std::string& fingerprint);
     bool EraseLostSigner(const std::string& fingerprint);
+    bool WriteManualLostSigner(const std::string& fingerprint);
+    bool EraseManualLostSigner(const std::string& fingerprint);
+    bool WriteVaultState(VaultSetupState setup, VaultVerificationState verification);
+    bool EraseVaultState();
+    bool WriteVaultParticipantType(const std::string& fingerprint, VaultParticipantType type);
+    bool EraseVaultParticipantType(const std::string& fingerprint);
+    bool WriteVaultMetadataPolicy(const std::string& policy_commitment);
+    bool EraseVaultMetadataPolicy();
+    bool WriteVaultRescanProgress(int height, const uint256& block_hash,
+                                  const std::string& policy_commitment);
+    bool ReadVaultRescanProgress(int& height, uint256& block_hash,
+                                 std::string& policy_commitment);
+    bool EraseVaultRescanProgress();
 
     bool WriteAddressPreviouslySpent(const CTxDestination& dest, bool previously_spent);
     bool WriteAddressReceiveRequest(const CTxDestination& dest, const std::string& id, const std::string& receive_request);

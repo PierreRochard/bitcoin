@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <exception>
 #include <limits>
 #include <map>
 #include <memory>
@@ -271,6 +272,51 @@ InferredVaultPolicy InferVaultPolicy(const std::string& desc)
         out.is_vault = true;
     }
     return out;
+}
+
+FixedVaultSchedule ClassifyFixedVaultSchedule(const InferredVaultPolicy& policy)
+{
+    if (!policy.is_vault || policy.recovery_stages.size() != 2) {
+        return FixedVaultSchedule::CUSTOM;
+    }
+    const VaultRecoveryStage& primary{policy.recovery_stages[0]};
+    const VaultRecoveryStage& final{policy.recovery_stages[1]};
+    if (primary.nrequired != 2 || !primary.older || primary.after ||
+        final.nrequired != 1 || !final.older || final.after) {
+        return FixedVaultSchedule::CUSTOM;
+    }
+    if (*primary.older == FIXED_VAULT_CURRENT_PRIMARY_DELAY &&
+        *final.older == FIXED_VAULT_CURRENT_FINAL_DELAY) {
+        return FixedVaultSchedule::CURRENT_90_180;
+    }
+    if (*primary.older == FIXED_VAULT_LEGACY_PRIMARY_DELAY &&
+        *final.older == FIXED_VAULT_LEGACY_FINAL_DELAY) {
+        return FixedVaultSchedule::LEGACY_30_60;
+    }
+    return FixedVaultSchedule::CUSTOM;
+}
+
+FixedVaultSchedule ClassifyFixedVaultSchedule(const VaultPolicyPackage& package)
+{
+    InferredVaultPolicy policy;
+    policy.is_vault = !package.recovery_stages.empty();
+    policy.recovery_stages = package.recovery_stages;
+    const FixedVaultSchedule schedule{ClassifyFixedVaultSchedule(policy)};
+    if (schedule == FixedVaultSchedule::CUSTOM) return schedule;
+
+    const uint32_t primary_delay{schedule == FixedVaultSchedule::CURRENT_90_180 ? FIXED_VAULT_CURRENT_PRIMARY_DELAY : FIXED_VAULT_LEGACY_PRIMARY_DELAY};
+    const uint32_t final_delay{schedule == FixedVaultSchedule::CURRENT_90_180 ? FIXED_VAULT_CURRENT_FINAL_DELAY : FIXED_VAULT_LEGACY_FINAL_DELAY};
+    if (package.nrequired != 2 ||
+        package.fallback_older != std::optional<uint32_t>{primary_delay} ||
+        package.fallback_after ||
+        package.fallback_older_one_key != std::optional<uint32_t>{final_delay} ||
+        package.descs.empty()) {
+        return FixedVaultSchedule::CUSTOM;
+    }
+    if (ClassifyFixedVaultSchedule(InferVaultPolicy(package.descs.front())) != schedule) {
+        return FixedVaultSchedule::CUSTOM;
+    }
+    return schedule;
 }
 
 static std::optional<std::string> NormalizeDescriptorBranch(const std::string& desc, char expected_branch)
@@ -805,6 +851,46 @@ struct VaultPolicySigners {
     std::set<std::string> recovery;
 };
 
+struct ActiveVaultDescriptors {
+    VaultPolicyPackage package;
+    InferredVaultPolicy policy;
+    std::set<DescriptorScriptPubKeyMan*> managers;
+};
+
+std::optional<ActiveVaultDescriptors> GetActiveVaultDescriptors(const CWallet& wallet)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    ActiveVaultDescriptors out;
+    out.package = ExportWalletVaultPolicy(wallet);
+    if (out.package.descs.empty()) return std::nullopt;
+    out.policy = InferVaultPolicy(out.package.descs.front());
+    if (!out.policy.is_vault) return std::nullopt;
+
+    // ExportWalletVaultPolicy deliberately identifies the active bech32m
+    // receive/change pair. Match those exact descriptors back to their
+    // managers so unrelated imported descriptors in the same wallet can
+    // never contribute coins to Recovery Vault accounting or selection.
+    for (const bool internal : {false, true}) {
+        auto* manager = dynamic_cast<DescriptorScriptPubKeyMan*>(
+            wallet.GetScriptPubKeyMan(OutputType::BECH32M, internal));
+        if (!manager) continue;
+        std::string descriptor;
+        if (!manager->GetDescriptorString(descriptor, /*priv=*/false)) continue;
+        if (std::find(out.package.descs.begin(), out.package.descs.end(), descriptor) != out.package.descs.end()) {
+            out.managers.insert(manager);
+        }
+    }
+    if (out.managers.empty()) return std::nullopt;
+    return out;
+}
+
+bool IsActiveVaultOutput(const ActiveVaultDescriptors& vault, const CTxOut& output)
+{
+    return std::any_of(vault.managers.begin(), vault.managers.end(), [&](const DescriptorScriptPubKeyMan* manager) {
+        return manager->IsMine(output.scriptPubKey);
+    });
+}
+
 std::optional<VaultPolicySigners> ExtractVaultPolicySigners(
     const std::string& descriptor,
     const InferredVaultPolicy& policy)
@@ -875,52 +961,95 @@ std::optional<VaultPolicySigners> ExtractVaultPolicySigners(
     return signers;
 }
 
-std::optional<VaultPolicySigners> GetWalletVaultPolicySigners(const CWallet& wallet)
-{
-    AssertLockHeld(wallet.cs_wallet);
-    for (auto* man : wallet.GetActiveScriptPubKeyMans()) {
-        auto* desc_man = dynamic_cast<DescriptorScriptPubKeyMan*>(man);
-        if (!desc_man) continue;
-        std::string descriptor;
-        if (!desc_man->GetDescriptorString(descriptor, /*priv=*/false)) continue;
-        const InferredVaultPolicy policy{InferVaultPolicy(descriptor)};
-        if (policy.is_vault) return ExtractVaultPolicySigners(descriptor, policy);
-    }
-    return std::nullopt;
-}
-
 } // namespace
 
-VaultBalanceBreakdown GetVaultBalanceBreakdown(const CWallet& wallet)
+bool IsActiveVaultOutput(const CWallet& wallet, const CTxOut& output)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    const auto vault = GetActiveVaultDescriptors(wallet);
+    return vault && IsActiveVaultOutput(*vault, output);
+}
+
+static DescriptorScriptPubKeyMan* GetUniqueActiveVaultManager(
+    const CWallet& wallet, const CTxOut& output)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    const auto vault{GetActiveVaultDescriptors(wallet)};
+    if (!vault) return nullptr;
+    DescriptorScriptPubKeyMan* match{nullptr};
+    for (DescriptorScriptPubKeyMan* manager : vault->managers) {
+        if (!manager->IsMine(output.scriptPubKey)) continue;
+        if (match) return nullptr;
+        match = manager;
+    }
+    return match;
+}
+
+bool GetActiveVaultKeyOrigin(const CWallet& wallet, const CTxOut& output,
+                             const CPubKey& pubkey, KeyOriginInfo& origin)
+{
+    DescriptorScriptPubKeyMan* manager{GetUniqueActiveVaultManager(wallet, output)};
+    if (!manager) return false;
+    const auto provider{manager->GetSigningProvider(output.scriptPubKey)};
+    return provider && provider->GetKeyOrigin(pubkey.GetID(), origin);
+}
+
+bool GetActiveVaultKeyOrigin(const CWallet& wallet, const CTxOut& output,
+                             const XOnlyPubKey& pubkey, KeyOriginInfo& origin)
+{
+    DescriptorScriptPubKeyMan* manager{GetUniqueActiveVaultManager(wallet, output)};
+    if (!manager) return false;
+    const auto provider{manager->GetSigningProvider(output.scriptPubKey)};
+    return provider && provider->GetKeyOriginByXOnly(pubkey, origin);
+}
+
+VaultBalanceBreakdown GetVaultBalanceBreakdown(const CWallet& wallet,
+                                               bool require_available_signers)
 {
     AssertLockHeld(wallet.cs_wallet);
     VaultBalanceBreakdown out;
-    out.policy = InferWalletVaultPolicy(wallet);
-    out.is_vault = out.policy.is_vault;
+    const auto vault = GetActiveVaultDescriptors(wallet);
+    if (vault) {
+        out.policy = vault->policy;
+        out.is_vault = true;
+    }
+    // Callers use the zeroed vault fields for ordinary wallets. Avoid walking
+    // coins (and therefore consulting an as-yet-uninitialized processed tip)
+    // when there is no vault policy at all.
+    if (!out.is_vault) return out;
     for (const auto& stage : out.policy.recovery_stages) {
         VaultBalanceBreakdown::RecoveryStageBalance balance;
         balance.stage = stage;
         out.recovery_stages.push_back(std::move(balance));
     }
-    const auto signers = GetWalletVaultPolicySigners(wallet);
+    // A WalletModel can be constructed before its wallet is attached and has
+    // processed a chain tip. Policy/setup metadata is still useful then, but
+    // amount maturity cannot be stated truthfully yet.
+    if (!wallet.HasProcessedBlock()) return out;
+    const auto signers = ExtractVaultPolicySigners(vault->package.descs.front(), vault->policy);
+    const VaultPolicyPackage& active_package{vault->package};
+    const bool metadata_matches_policy{
+        !active_package.policy_id.empty() &&
+        wallet.m_vault_metadata_policy_commitment == VaultPolicyCommitment(active_package)};
     const auto available_count = [&](const std::set<std::string>& participants) {
         return static_cast<size_t>(std::count_if(participants.begin(), participants.end(), [&](const std::string& fingerprint) {
-            return !wallet.m_lost_signers.contains(fingerprint);
+            return !metadata_matches_policy || !wallet.m_lost_signers.contains(fingerprint);
         }));
     };
-    const bool immediate_available = !out.is_vault ||
-        (signers && available_count(signers->active) == signers->active.size());
+    const bool immediate_available = !require_available_signers || !out.is_vault ||
+                                     (signers && available_count(signers->active) == signers->active.size());
     const size_t recovery_available = signers ? available_count(signers->recovery) : 0;
     const int tip = wallet.HaveChain() ? wallet.GetLastBlockHeight() : 0;
     const auto coins = AvailableCoins(wallet);
     for (const auto& coin : coins.All()) {
-        if (coin.depth <= 0) continue;
+        if (coin.depth <= 0 || !IsActiveVaultOutput(*vault, coin.txout)) continue;
         if (immediate_available) {
             out.immediate += coin.txout.nValue;
         }
         for (auto& stage_balance : out.recovery_stages) {
             if (stage_balance.stage.nrequired <= 0 ||
-                recovery_available < static_cast<size_t>(stage_balance.stage.nrequired)) {
+                (require_available_signers &&
+                 recovery_available < static_cast<size_t>(stage_balance.stage.nrequired))) {
                 continue;
             }
             if (IsVaultRecoveryStageMature(stage_balance.stage, coin.depth, tip)) {
@@ -949,21 +1078,28 @@ VaultBalanceBreakdown GetVaultBalanceBreakdown(const CWallet& wallet)
 
 util::Result<void> ApplyVaultRecoveryToCoinControl(const CWallet& wallet,
                                                    CCoinControl& coin_control,
-                                                   std::optional<uint32_t> selected_older)
+                                                   std::optional<uint32_t> selected_older,
+                                                   std::optional<uint32_t> selected_after,
+                                                   bool sweep)
 {
     AssertLockHeld(wallet.cs_wallet);
-    const auto policy = InferWalletVaultPolicy(wallet);
-    if (!policy.is_vault || policy.recovery_stages.empty()) {
-        if (selected_older) return util::Error{Untranslated("The wallet does not have the requested relative recovery stage")};
+    if (selected_older && selected_after) {
+        return util::Error{Untranslated("A recovery stage cannot use both older() and after()")};
+    }
+    const auto vault = GetActiveVaultDescriptors(wallet);
+    if (!vault || vault->policy.recovery_stages.empty()) {
+        if (selected_older || selected_after) {
+            return util::Error{Untranslated("The wallet does not have the requested recovery stage")};
+        }
         return {};
     }
-    const VaultRecoveryStage* selected = &policy.recovery_stages.front();
-    if (selected_older) {
-        const auto it = std::find_if(policy.recovery_stages.begin(), policy.recovery_stages.end(), [&](const VaultRecoveryStage& stage) {
-            return stage.older == selected_older;
+    const VaultRecoveryStage* selected = &vault->policy.recovery_stages.front();
+    if (selected_older || selected_after) {
+        const auto it = std::find_if(vault->policy.recovery_stages.begin(), vault->policy.recovery_stages.end(), [&](const VaultRecoveryStage& stage) {
+            return stage.older == selected_older && stage.after == selected_after;
         });
-        if (it == policy.recovery_stages.end()) {
-            return util::Error{Untranslated(strprintf("The wallet does not have a recovery stage at older(%u)", *selected_older))};
+        if (it == vault->policy.recovery_stages.end()) {
+            return util::Error{selected_older ? Untranslated(strprintf("The wallet does not have a recovery stage at older(%u)", *selected_older)) : Untranslated(strprintf("The wallet does not have a recovery stage at after(%u)", *selected_after))};
         }
         selected = &*it;
     }
@@ -978,6 +1114,40 @@ util::Result<void> ApplyVaultRecoveryToCoinControl(const CWallet& wallet,
         if (tip < static_cast<int>(*selected->after)) {
             coin_control.m_min_depth = std::numeric_limits<int>::max();
         }
+    }
+
+    // Respect an explicit vault-only subset, but reject selected ordinary or
+    // imported-descriptor coins. Automatic selection remains available for
+    // RPC compatibility, bounded by m_allowed_inputs below. Only the explicit
+    // consumer sweep mode preselects every eligible vault coin.
+    const bool had_explicit_selection{coin_control.HasSelected()};
+    std::set<COutPoint> allowed_inputs;
+    coin_control.m_allowed_inputs.reset();
+    if (had_explicit_selection) {
+        for (const COutPoint& outpoint : coin_control.ListSelected()) {
+            const auto txo = wallet.GetTXO(outpoint);
+            const CWalletTx* wtx = wallet.GetWalletTx(outpoint.hash);
+            if (!txo || !wtx || !IsActiveVaultOutput(*vault, txo->GetTxOut())) {
+                return util::Error{Untranslated("Delayed recovery inputs must belong to the active Recovery Vault policy")};
+            }
+            const int depth = wallet.GetTxDepthInMainChain(*wtx);
+            if (depth <= 0 || !IsVaultRecoveryStageMature(*selected, depth,
+                                                          wallet.HaveChain() ? wallet.GetLastBlockHeight() : 0)) {
+                return util::Error{Untranslated("A selected Recovery Vault input is not yet eligible for this recovery stage")};
+            }
+            allowed_inputs.insert(outpoint);
+        }
+    }
+    if (wallet.HasProcessedBlock()) {
+        for (const COutput& coin : AvailableCoins(wallet, &coin_control).All()) {
+            if (IsActiveVaultOutput(*vault, coin.txout)) allowed_inputs.insert(coin.outpoint);
+        }
+    }
+    coin_control.m_allowed_inputs = allowed_inputs;
+    if ((sweep || coin_control.m_vault_recovery_sweep) && !had_explicit_selection) {
+        for (const COutPoint& outpoint : allowed_inputs)
+            coin_control.Select(outpoint);
+        coin_control.m_allow_other_inputs = false;
     }
     return {};
 }
@@ -1010,122 +1180,135 @@ std::string FormatVaultPolicyPackage(const VaultPolicyPackage& pkg)
     return obj.write(2) + "\n";
 }
 
+std::string VaultPolicyCommitment(const VaultPolicyPackage& pkg)
+{
+    const std::string canonical{FormatVaultPolicyPackage(pkg)};
+    return Hash(MakeUCharSpan(canonical)).GetHex();
+}
+
 util::Result<VaultPolicyPackage> ParseVaultPolicyPackage(const std::string& json)
 {
-    UniValue obj;
-    if (!obj.read(json) || !obj.isObject()) {
-        return util::Error{Untranslated("Vault policy package is not valid JSON")};
-    }
-    VaultPolicyPackage pkg;
-    if (obj.exists("format")) pkg.format = obj["format"].get_str();
-    if (pkg.format != "bitcoin-core-vault-policy") {
-        return util::Error{Untranslated("Unknown vault policy package format")};
-    }
-    if (obj.exists("version")) pkg.version = obj["version"].getInt<int>();
-    if (pkg.version != 1) {
-        return util::Error{Untranslated("Unsupported vault policy package version")};
-    }
-    if (obj.exists("policy_id")) pkg.policy_id = obj["policy_id"].get_str();
-    if (obj.exists("network")) pkg.network = obj["network"].get_str();
-    if (obj.exists("nrequired")) pkg.nrequired = obj["nrequired"].getInt<int>();
-    auto read_lock = [&](const char* name, uint32_t max) -> util::Result<std::optional<uint32_t>> {
-        if (!obj.exists(name)) return std::optional<uint32_t>{};
-        const int64_t value = obj[name].getInt<int64_t>();
-        if (value < 1 || value > max) {
-            return util::Error{Untranslated(strprintf("Vault policy package %s is out of range", name))};
+    try {
+        UniValue obj;
+        if (!obj.read(json) || !obj.isObject()) {
+            return util::Error{Untranslated("Vault policy package is not valid JSON")};
         }
-        return std::optional<uint32_t>{static_cast<uint32_t>(value)};
-    };
-    auto fallback_older = read_lock("fallback_older", CTxIn::SEQUENCE_LOCKTIME_MASK);
-    if (!fallback_older) return util::Error{util::ErrorString(fallback_older)};
-    pkg.fallback_older = *fallback_older;
-    auto fallback_after = read_lock("fallback_after", std::numeric_limits<int32_t>::max());
-    if (!fallback_after) return util::Error{util::ErrorString(fallback_after)};
-    pkg.fallback_after = *fallback_after;
-    auto fallback_older_one_key = read_lock("fallback_older_one_key", CTxIn::SEQUENCE_LOCKTIME_MASK);
-    if (!fallback_older_one_key) return util::Error{util::ErrorString(fallback_older_one_key)};
-    pkg.fallback_older_one_key = *fallback_older_one_key;
-    if (obj.exists("recovery_stages")) {
-        if (!obj["recovery_stages"].isArray()) {
-            return util::Error{Untranslated("Vault policy package recovery_stages must be an array")};
+        VaultPolicyPackage pkg;
+        if (obj.exists("format")) pkg.format = obj["format"].get_str();
+        if (pkg.format != "bitcoin-core-vault-policy") {
+            return util::Error{Untranslated("Unknown vault policy package format")};
         }
-        for (const UniValue& value : obj["recovery_stages"].getValues()) {
-            if (!value.isObject() || !value.exists("nrequired")) {
-                return util::Error{Untranslated("Vault policy package has an invalid recovery stage")};
+        if (obj.exists("version")) pkg.version = obj["version"].getInt<int>();
+        if (pkg.version != 1) {
+            return util::Error{Untranslated("Unsupported vault policy package version")};
+        }
+        if (obj.exists("policy_id")) pkg.policy_id = obj["policy_id"].get_str();
+        if (obj.exists("network")) pkg.network = obj["network"].get_str();
+        if (obj.exists("nrequired")) pkg.nrequired = obj["nrequired"].getInt<int>();
+        auto read_lock = [&](const char* name, uint32_t max) -> util::Result<std::optional<uint32_t>> {
+            if (!obj.exists(name)) return std::optional<uint32_t>{};
+            const int64_t value = obj[name].getInt<int64_t>();
+            if (value < 1 || value > max) {
+                return util::Error{Untranslated(strprintf("Vault policy package %s is out of range", name))};
             }
-            VaultRecoveryStage stage;
-            stage.nrequired = value["nrequired"].getInt<int>();
-            if (value.exists("fallback_older")) {
-                const int64_t older = value["fallback_older"].getInt<int64_t>();
-                if (older < 1 || older > CTxIn::SEQUENCE_LOCKTIME_MASK) {
+            return std::optional<uint32_t>{static_cast<uint32_t>(value)};
+        };
+        auto fallback_older = read_lock("fallback_older", CTxIn::SEQUENCE_LOCKTIME_MASK);
+        if (!fallback_older) return util::Error{util::ErrorString(fallback_older)};
+        pkg.fallback_older = *fallback_older;
+        auto fallback_after = read_lock("fallback_after", std::numeric_limits<int32_t>::max());
+        if (!fallback_after) return util::Error{util::ErrorString(fallback_after)};
+        pkg.fallback_after = *fallback_after;
+        auto fallback_older_one_key = read_lock("fallback_older_one_key", CTxIn::SEQUENCE_LOCKTIME_MASK);
+        if (!fallback_older_one_key) return util::Error{util::ErrorString(fallback_older_one_key)};
+        pkg.fallback_older_one_key = *fallback_older_one_key;
+        if (obj.exists("recovery_stages")) {
+            if (!obj["recovery_stages"].isArray()) {
+                return util::Error{Untranslated("Vault policy package recovery_stages must be an array")};
+            }
+            for (const UniValue& value : obj["recovery_stages"].getValues()) {
+                if (!value.isObject() || !value.exists("nrequired")) {
                     return util::Error{Untranslated("Vault policy package has an invalid recovery stage")};
                 }
-                stage.older = static_cast<uint32_t>(older);
-            }
-            if (value.exists("fallback_after")) {
-                const int64_t after = value["fallback_after"].getInt<int64_t>();
-                if (after < 1 || after > std::numeric_limits<int32_t>::max()) {
+                VaultRecoveryStage stage;
+                stage.nrequired = value["nrequired"].getInt<int>();
+                if (value.exists("fallback_older")) {
+                    const int64_t older = value["fallback_older"].getInt<int64_t>();
+                    if (older < 1 || older > CTxIn::SEQUENCE_LOCKTIME_MASK) {
+                        return util::Error{Untranslated("Vault policy package has an invalid recovery stage")};
+                    }
+                    stage.older = static_cast<uint32_t>(older);
+                }
+                if (value.exists("fallback_after")) {
+                    const int64_t after = value["fallback_after"].getInt<int64_t>();
+                    if (after < 1 || after > std::numeric_limits<int32_t>::max()) {
+                        return util::Error{Untranslated("Vault policy package has an invalid recovery stage")};
+                    }
+                    stage.after = static_cast<uint32_t>(after);
+                }
+                if (stage.nrequired <= 0 || stage.older.has_value() == stage.after.has_value()) {
                     return util::Error{Untranslated("Vault policy package has an invalid recovery stage")};
                 }
-                stage.after = static_cast<uint32_t>(after);
+                pkg.recovery_stages.push_back(stage);
             }
-            if (stage.nrequired <= 0 || stage.older.has_value() == stage.after.has_value()) {
-                return util::Error{Untranslated("Vault policy package has an invalid recovery stage")};
-            }
-            pkg.recovery_stages.push_back(stage);
         }
-    }
-    if (!obj.exists("descs") || !obj["descs"].isArray() || obj["descs"].empty()) {
-        return util::Error{Untranslated("Vault policy package is missing descriptors")};
-    }
-    for (const UniValue& d : obj["descs"].getValues()) {
-        pkg.descs.push_back(d.get_str());
-    }
-    if (pkg.descs.size() > 2) {
-        return util::Error{Untranslated("Vault policy package may contain only a receive descriptor and its matching change descriptor")};
-    }
-    if (pkg.descs.size() == 2 && !IsCanonicalDescriptorPair(pkg.descs[0], pkg.descs[1])) {
-        return util::Error{Untranslated("Vault policy package receive and change descriptors do not form a matching vault pair")};
-    }
-    const std::string inferred_policy_id = VaultPolicyId(pkg.descs.front());
-    if (!pkg.policy_id.empty() && pkg.policy_id != inferred_policy_id) {
-        return util::Error{Untranslated("Vault policy package policy_id does not match its receive descriptor")};
-    }
-    pkg.policy_id = inferred_policy_id;
+        if (!obj.exists("descs") || !obj["descs"].isArray() || obj["descs"].empty()) {
+            return util::Error{Untranslated("Vault policy package is missing descriptors")};
+        }
+        for (const UniValue& d : obj["descs"].getValues()) {
+            pkg.descs.push_back(d.get_str());
+        }
+        if (pkg.descs.size() > 2) {
+            return util::Error{Untranslated("Vault policy package may contain only a receive descriptor and its matching change descriptor")};
+        }
+        if (pkg.descs.size() == 2 && !IsCanonicalDescriptorPair(pkg.descs[0], pkg.descs[1])) {
+            return util::Error{Untranslated("Vault policy package receive and change descriptors do not form a matching vault pair")};
+        }
+        const std::string inferred_policy_id = VaultPolicyId(pkg.descs.front());
+        if (!pkg.policy_id.empty() && pkg.policy_id != inferred_policy_id) {
+            return util::Error{Untranslated("Vault policy package policy_id does not match its receive descriptor")};
+        }
+        pkg.policy_id = inferred_policy_id;
 
-    const auto descriptor_stages = ParseRecoveryStages(pkg.descs.front());
-    if (std::any_of(descriptor_stages.begin(), descriptor_stages.end(), [](const VaultRecoveryStage& stage) {
-            return stage.older && *stage.older > CTxIn::SEQUENCE_LOCKTIME_MASK;
-        })) {
-        return util::Error{Untranslated("Vault policy package descriptor has an out-of-range relative recovery delay")};
-    }
-    const InferredVaultPolicy inferred = InferVaultPolicy(pkg.descs.front());
-    std::optional<uint32_t> inferred_one_key;
-    for (size_t i = 1; i < inferred.recovery_stages.size(); ++i) {
-        if (inferred.recovery_stages[i].nrequired == 1 && inferred.recovery_stages[i].older) {
-            inferred_one_key = inferred.recovery_stages[i].older;
-            break;
+        const auto descriptor_stages = ParseRecoveryStages(pkg.descs.front());
+        if (std::any_of(descriptor_stages.begin(), descriptor_stages.end(), [](const VaultRecoveryStage& stage) {
+                return stage.older && *stage.older > CTxIn::SEQUENCE_LOCKTIME_MASK;
+            })) {
+            return util::Error{Untranslated("Vault policy package descriptor has an out-of-range relative recovery delay")};
         }
-    }
-    if (inferred.is_vault) {
-        if ((obj.exists("nrequired") && pkg.nrequired != inferred.recovery_m) ||
-            (obj.exists("fallback_older") && pkg.fallback_older != inferred.older) ||
-            (obj.exists("fallback_after") && pkg.fallback_after != inferred.after) ||
-            (obj.exists("fallback_older_one_key") && pkg.fallback_older_one_key != inferred_one_key) ||
-            (obj.exists("recovery_stages") && !RecoveryStagesEqual(pkg.recovery_stages, inferred.recovery_stages))) {
-            return util::Error{Untranslated("Vault policy package recovery metadata does not match its receive descriptor")};
+        const InferredVaultPolicy inferred = InferVaultPolicy(pkg.descs.front());
+        std::optional<uint32_t> inferred_one_key;
+        for (size_t i = 1; i < inferred.recovery_stages.size(); ++i) {
+            if (inferred.recovery_stages[i].nrequired == 1 && inferred.recovery_stages[i].older) {
+                inferred_one_key = inferred.recovery_stages[i].older;
+                break;
+            }
         }
-        pkg.nrequired = inferred.recovery_m;
-        pkg.fallback_older = inferred.older;
-        pkg.fallback_after = inferred.after;
-        pkg.fallback_older_one_key = inferred_one_key;
-        pkg.recovery_stages = inferred.recovery_stages;
-    } else {
-        if (pkg.fallback_older || pkg.fallback_after || pkg.fallback_older_one_key || !pkg.recovery_stages.empty()) {
-            return util::Error{Untranslated("Vault policy package recovery metadata does not match its receive descriptor")};
+        if (inferred.is_vault) {
+            if ((obj.exists("nrequired") && pkg.nrequired != inferred.recovery_m) ||
+                (obj.exists("fallback_older") && pkg.fallback_older != inferred.older) ||
+                (obj.exists("fallback_after") && pkg.fallback_after != inferred.after) ||
+                (obj.exists("fallback_older_one_key") && pkg.fallback_older_one_key != inferred_one_key) ||
+                (obj.exists("recovery_stages") && !RecoveryStagesEqual(pkg.recovery_stages, inferred.recovery_stages))) {
+                return util::Error{Untranslated("Vault policy package recovery metadata does not match its receive descriptor")};
+            }
+            pkg.nrequired = inferred.recovery_m;
+            pkg.fallback_older = inferred.older;
+            pkg.fallback_after = inferred.after;
+            pkg.fallback_older_one_key = inferred_one_key;
+            pkg.recovery_stages = inferred.recovery_stages;
+        } else {
+            if (pkg.fallback_older || pkg.fallback_after || pkg.fallback_older_one_key || !pkg.recovery_stages.empty()) {
+                return util::Error{Untranslated("Vault policy package recovery metadata does not match its receive descriptor")};
+            }
         }
+        return pkg;
+    } catch (const std::exception& e) {
+        return util::Error{Untranslated(
+            "Vault policy package is malformed: invalid field type: " + std::string{e.what()})};
+    } catch (...) {
+        return util::Error{Untranslated("Vault policy package is malformed: invalid field type")};
     }
-    return pkg;
 }
 
 namespace {
@@ -1369,9 +1552,6 @@ util::Result<PreparedVaultMnemonicRestore> PrepareVaultMnemonicRestore(
 
 util::Result<void> ValidateFixedStagedVaultPolicy(const VaultPolicyPackage& package)
 {
-    static constexpr uint32_t PRIMARY_DELAY{4320};
-    static constexpr uint32_t FINAL_DELAY{8640};
-
     auto checked = ParseVaultPolicyPackage(FormatVaultPolicyPackage(package));
     if (!checked) return util::Error{util::ErrorString(checked)};
     if (checked->network.empty() || checked->network != Params().GetChainTypeString()) {
@@ -1382,14 +1562,20 @@ util::Result<void> ValidateFixedStagedVaultPolicy(const VaultPolicyPackage& pack
     if (checked->descs.size() != 2) {
         return util::Error{Untranslated("The fixed staged vault requires matching receive and change descriptors")};
     }
-    if (checked->recovery_stages.size() != 2 ||
-        checked->recovery_stages[0].nrequired != 2 ||
-        checked->recovery_stages[0].older != PRIMARY_DELAY ||
-        checked->recovery_stages[0].after ||
-        checked->recovery_stages[1].nrequired != 1 ||
-        checked->recovery_stages[1].older != FINAL_DELAY ||
-        checked->recovery_stages[1].after) {
-        return util::Error{Untranslated("The policy is not the fixed 2-of-3 at 4,320 blocks, then 1-of-3 at 8,640 blocks staged vault")};
+    const FixedVaultSchedule schedule{ClassifyFixedVaultSchedule(*checked)};
+    uint32_t primary_delay{0};
+    uint32_t final_delay{0};
+    switch (schedule) {
+    case FixedVaultSchedule::CURRENT_90_180:
+        primary_delay = FIXED_VAULT_CURRENT_PRIMARY_DELAY;
+        final_delay = FIXED_VAULT_CURRENT_FINAL_DELAY;
+        break;
+    case FixedVaultSchedule::LEGACY_30_60:
+        primary_delay = FIXED_VAULT_LEGACY_PRIMARY_DELAY;
+        final_delay = FIXED_VAULT_LEGACY_FINAL_DELAY;
+        break;
+    case FixedVaultSchedule::CUSTOM:
+        return util::Error{Untranslated("The policy is not a supported fixed 3-to-2-to-1 staged vault schedule")};
     }
 
     const std::string standard_path_string = DefaultMultisigPath(OutputType::BECH32M, /*account=*/0);
@@ -1477,10 +1663,10 @@ util::Result<void> ValidateFixedStagedVaultPolicy(const VaultPolicyPackage& pack
     std::string canonical = WrapSortedMulti(OutputType::BECH32M,
                                             /*nrequired=*/2,
                                             key_expressions,
-                                            PRIMARY_DELAY,
+                                            primary_delay,
                                             /*fallback_after=*/{},
                                             key_expressions,
-                                            FINAL_DELAY);
+                                            final_delay);
     const std::string checksum{GetDescriptorChecksum(canonical)};
     if (canonical.empty() || checksum.empty()) {
         return util::Error{Untranslated("Unable to reconstruct the canonical fixed staged vault")};

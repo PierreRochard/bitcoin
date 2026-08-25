@@ -144,7 +144,8 @@ struct SignOut {
     CMutableTransaction extracted;
 };
 
-static SignOut SignSpk(CWallet& wallet, const CScript& spk, uint32_t sequence)
+static SignOut SignSpk(CWallet& wallet, const CScript& spk, uint32_t sequence,
+                       std::optional<std::string> expected_policy_commitment = {})
     EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
     CMutableTransaction prev_tx;
@@ -164,8 +165,19 @@ static SignOut SignSpk(CWallet& wallet, const CScript& spk, uint32_t sequence)
 
     SignOut out;
     bool complete = false;
-    BOOST_REQUIRE(!wallet.FillPSBT(psbt, {.sign = false, .bip32_derivs = true}, complete));
-    out.error = wallet.FillPSBT(psbt, {.sign = true, .finalize = true, .bip32_derivs = false}, complete);
+    BOOST_REQUIRE(!wallet.FillPSBT(
+        psbt,
+        {.sign = false,
+         .bip32_derivs = true,
+         .expected_vault_policy_commitment = expected_policy_commitment},
+        complete));
+    out.error = wallet.FillPSBT(
+        psbt,
+        {.sign = true,
+         .finalize = true,
+         .bip32_derivs = false,
+         .expected_vault_policy_commitment = expected_policy_commitment},
+        complete);
     out.complete = complete;
     out.input_signed = PSBTInputSigned(psbt.inputs[0]);
     if (complete || out.input_signed) {
@@ -385,6 +397,20 @@ BOOST_AUTO_TEST_CASE(fixed_vault_native_default_signs_without_signer_option)
         const CTxDestination dest{*Assert(wallet->GetNewDestination(OutputType::BECH32M, ""))};
         spk = GetScriptForDestination(dest);
         ExpectKeypath(SignSpk(*wallet, spk, CTxIn::SEQUENCE_FINAL), "fixed native-default key-path");
+
+        // The compatibility bridge is strictly for pristine pre-provenance
+        // wallets invoked through the legacy API. A new flow carrying its
+        // policy token must fail closed even before any metadata write, and
+        // once a policy is durably bound UNKNOWN participants must not be
+        // silently reclassified as hardware.
+        const std::string commitment{VaultPolicyCommitment(ExportWalletVaultPolicy(*wallet))};
+        ExpectIncomplete(SignSpk(*wallet, spk, CTxIn::SEQUENCE_FINAL, commitment),
+                         "CAS-tagged unknown source remains fail-closed");
+        BOOST_REQUIRE(wallet->SetVaultSetupState(
+            VaultSetupState::RECOVERY_KIT_REQUIRED, VaultVerificationState::PENDING,
+            commitment));
+        ExpectIncomplete(SignSpk(*wallet, spk, CTxIn::SEQUENCE_FINAL),
+                         "policy-bound unknown source remains fail-closed");
     }
 
     // An explicitly empty option is a deliberate disable, never an implicit
@@ -392,6 +418,98 @@ BOOST_AUTO_TEST_CASE(fixed_vault_native_default_signs_without_signer_option)
     gArgs.ForceSetArg("-signer", "");
     LOCK(wallet->cs_wallet);
     ExpectIncomplete(SignSpk(*wallet, spk, CTxIn::SEQUENCE_FINAL), "explicitly disabled native signer");
+}
+
+BOOST_AUTO_TEST_CASE(fixed_vault_local_final_stage_skips_unneeded_hardware)
+{
+    gArgs.ForceSetArg("-signer", "internal");
+    const CExtKey local{RandomMaster()};
+    const CExtKey connected_hardware{UniqueMockMaster()};
+    const CExtKey lost_hardware{UniqueMockMaster()};
+    hwi::MockRegistration connected{connected_hardware};
+    auto wallet{MakeMixedWallet()};
+
+    LOCK(wallet->cs_wallet);
+    AddUnused(*wallet, local);
+    const std::vector<MultisigKeySpec> specs{
+        LocalSpec(local),
+        XpubSpec(connected_hardware),
+        XpubSpec(lost_hardware),
+    };
+    MultisigOptions options;
+    options.type = OutputType::BECH32M;
+    options.fallback_older = 4320;
+    options.fallback_older_one_key = 8640;
+    const auto created{CreateMultisigDescriptor(*wallet, /*nrequired=*/2, specs, options)};
+    BOOST_REQUIRE_MESSAGE(created, util::ErrorString(created).original);
+    BOOST_REQUIRE(IsFixedStagedVault(*wallet));
+    const CScript spk{GetScriptForDestination(
+        *Assert(wallet->GetNewDestination(OutputType::BECH32M, "")))};
+
+    const std::string commitment{VaultPolicyCommitment(ExportWalletVaultPolicy(*wallet))};
+    BOOST_REQUIRE(wallet->SetVaultParticipantType(
+        MasterFpr(local), VaultParticipantType::LOCAL_SOFTWARE, commitment));
+    BOOST_REQUIRE(wallet->SetVaultParticipantType(
+        MasterFpr(connected_hardware), VaultParticipantType::HARDWARE, commitment));
+    BOOST_REQUIRE(wallet->SetVaultParticipantType(
+        MasterFpr(lost_hardware), VaultParticipantType::HARDWARE, commitment));
+    BOOST_REQUIRE(wallet->SetLostSigner(MasterFpr(lost_hardware), true, commitment));
+
+    // The one-key branch is complete after the trusted local manager signs.
+    // Keeping another authorized HWI connected must not cause an unnecessary
+    // disclosure or make its no-op response reject the local final witness.
+    ExpectScriptpath(SignSpk(*wallet, spk, 8640),
+                     "fixed one-key recovery must not contact unneeded hardware");
+}
+
+BOOST_AUTO_TEST_CASE(fixed_vault_rejects_lost_contribution_from_hardware_response)
+{
+    gArgs.ForceSetArg("-signer", "internal");
+    const CExtKey local{RandomMaster()};
+    const CExtKey hardware{UniqueMockMaster()};
+    const CExtKey lost_hardware{UniqueMockMaster()};
+    hwi::MockDeviceOptions malicious;
+    malicious.additional_signing_master = lost_hardware;
+    hwi::MockRegistration connected{hardware, ChainType::MAIN, malicious};
+    auto wallet{MakeMixedWallet()};
+
+    CScript spk;
+    {
+        LOCK(wallet->cs_wallet);
+        AddUnused(*wallet, local);
+        const std::vector<MultisigKeySpec> specs{
+            LocalSpec(local),
+            XpubSpec(hardware),
+            XpubSpec(lost_hardware),
+        };
+        MultisigOptions options;
+        options.type = OutputType::BECH32M;
+        options.fallback_older = 4320;
+        options.fallback_older_one_key = 8640;
+        const auto created{CreateMultisigDescriptor(*wallet, /*nrequired=*/2, specs, options)};
+        BOOST_REQUIRE_MESSAGE(created, util::ErrorString(created).original);
+        BOOST_REQUIRE(IsFixedStagedVault(*wallet));
+        spk = GetScriptForDestination(
+            *Assert(wallet->GetNewDestination(OutputType::BECH32M, "")));
+
+        const std::string commitment{VaultPolicyCommitment(ExportWalletVaultPolicy(*wallet))};
+        BOOST_REQUIRE(wallet->SetVaultParticipantType(
+            MasterFpr(local), VaultParticipantType::LOCAL_SOFTWARE, commitment));
+        BOOST_REQUIRE(wallet->SetVaultParticipantType(
+            MasterFpr(hardware), VaultParticipantType::HARDWARE, commitment));
+        BOOST_REQUIRE(wallet->SetVaultParticipantType(
+            MasterFpr(lost_hardware), VaultParticipantType::HARDWARE, commitment));
+        BOOST_REQUIRE(wallet->SetLostSigner(MasterFpr(lost_hardware), true, commitment));
+
+        // The connected, authorized identity maliciously contributes MuSig
+        // material for the participant deliberately marked lost. Validation
+        // runs on the isolated response before it can be finalized or
+        // published back into the caller's PSBT.
+        const SignOut signed_result{SignSpk(*wallet, spk, CTxIn::SEQUENCE_FINAL)};
+        BOOST_REQUIRE(signed_result.error);
+        BOOST_CHECK(*signed_result.error == PSBTError::EXTERNAL_SIGNER_FAILED);
+        BOOST_CHECK(!signed_result.complete);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

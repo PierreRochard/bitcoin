@@ -926,6 +926,13 @@ BOOST_AUTO_TEST_CASE(vault_policy_package_roundtrip)
     BOOST_CHECK(!ParseVaultPolicyPackage("{\"format\":\"bitcoin-core-vault-policy\",\"version\":2,\"descs\":[\"d\"]}"));
     BOOST_CHECK(!ParseVaultPolicyPackage("{\"format\":\"bitcoin-core-vault-policy\",\"fallback_older\":-1,\"descs\":[\"d\"]}"));
     BOOST_CHECK(!ParseVaultPolicyPackage("{\"format\":\"bitcoin-core-vault-policy\",\"recovery_stages\":[{\"nrequired\":1,\"fallback_older\":-1}],\"descs\":[\"d\"]}"));
+    // Malformed Recovery Kit field types are ordinary validation failures,
+    // never exceptions that can unwind through a Qt restore callback.
+    BOOST_CHECK(!ParseVaultPolicyPackage("{\"format\":3,\"descs\":[\"d\"]}"));
+    BOOST_CHECK(!ParseVaultPolicyPackage("{\"format\":\"bitcoin-core-vault-policy\",\"version\":\"one\",\"descs\":[\"d\"]}"));
+    BOOST_CHECK(!ParseVaultPolicyPackage("{\"format\":\"bitcoin-core-vault-policy\",\"fallback_older\":{},\"descs\":[\"d\"]}"));
+    BOOST_CHECK(!ParseVaultPolicyPackage("{\"format\":\"bitcoin-core-vault-policy\",\"recovery_stages\":[{\"nrequired\":[],\"fallback_older\":1}],\"descs\":[\"d\"]}"));
+    BOOST_CHECK(!ParseVaultPolicyPackage("{\"format\":\"bitcoin-core-vault-policy\",\"descs\":[7]}"));
     BOOST_CHECK(!ParseVaultPolicyPackage("{\"format\":\"bitcoin-core-vault-policy\",\"descs\":[\"tr(musig(a,b),and_v(v:older(65536),multi_a(1,a,b)))\"]}"));
     BOOST_CHECK(!ParseVaultPolicyPackage("{\"format\":\"bitcoin-core-vault-policy\",\"fallback_older\":1,\"fallback_after\":2,\"descs\":[\"x\"]}"));
     VaultPolicyPackage bad_net = *parsed;

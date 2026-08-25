@@ -284,6 +284,9 @@ util::Result<CoinsResult> FetchSelectedInputs(const CWallet& wallet, const CCoin
     const bool can_grind_r = wallet.CanGrindR();
     std::map<COutPoint, CAmount> map_of_bump_fees = wallet.chain().calculateIndividualBumpFees(coin_control.ListSelected(), coin_selection_params.m_effective_feerate);
     for (const COutPoint& outpoint : coin_control.ListSelected()) {
+        if (coin_control.m_allowed_inputs && !coin_control.m_allowed_inputs->contains(outpoint)) {
+            return util::Error{strprintf(_("Pre-selected input %s is outside the permitted coin set"), outpoint.ToString())};
+        }
         int64_t input_bytes = coin_control.GetInputWeight(outpoint).value_or(-1);
         if (input_bytes != -1) {
             input_bytes = GetVirtualTransactionSize(input_bytes, 0, 0);
@@ -365,6 +368,9 @@ CoinsResult AvailableCoins(const CWallet& wallet,
     // Cache for whether each tx passes the tx level checks (first bool), and whether the transaction is "safe" (second bool)
     std::unordered_map<Txid, std::pair<bool, bool>, SaltedTxidHasher> tx_safe_cache;
     for (const auto& [outpoint, txo] : wallet.GetTXOs()) {
+        if (coinControl && coinControl->m_allowed_inputs && !coinControl->m_allowed_inputs->contains(outpoint)) {
+            continue;
+        }
         const CWalletTx& wtx = txo.GetWalletTx();
         const CTxOut& output = txo.GetTxOut();
 

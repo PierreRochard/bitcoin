@@ -13,6 +13,7 @@
 #include <script/descriptor.h>
 #include <script/script.h>
 #include <test/util/setup_common.h>
+#include <tinyformat.h>
 #include <util/bip32.h>
 #include <util/check.h>
 #include <util/strencodings.h>
@@ -278,16 +279,75 @@ BOOST_FIXTURE_TEST_CASE(fixed_staged_policy_validation, BasicTestingSetup)
         return ExportWalletVaultPolicy(*wallet);
     };
 
-    const VaultPolicyPackage fixed{make_package("fixed_policy", 4320, 8640, /*recovery_only=*/false)};
-    const auto valid{ValidateFixedStagedVaultPolicy(fixed)};
-    BOOST_REQUIRE_MESSAGE(valid, util::ErrorString(valid).original);
+    const VaultPolicyPackage current{make_package(
+        "current_fixed_policy", FIXED_VAULT_CURRENT_PRIMARY_DELAY,
+        FIXED_VAULT_CURRENT_FINAL_DELAY, /*recovery_only=*/false)};
+    const auto current_valid{ValidateFixedStagedVaultPolicy(current)};
+    BOOST_REQUIRE_MESSAGE(current_valid, util::ErrorString(current_valid).original);
+    BOOST_CHECK_EQUAL(static_cast<int>(ClassifyFixedVaultSchedule(current)),
+                      static_cast<int>(FixedVaultSchedule::CURRENT_90_180));
+    BOOST_CHECK_EQUAL(static_cast<int>(ClassifyFixedVaultSchedule(InferVaultPolicy(current.descs.front()))),
+                      static_cast<int>(FixedVaultSchedule::CURRENT_90_180));
+
+    VaultPolicyPackage mismatched_fields{current};
+    mismatched_fields.fallback_older = FIXED_VAULT_LEGACY_PRIMARY_DELAY;
+    BOOST_CHECK_EQUAL(static_cast<int>(ClassifyFixedVaultSchedule(mismatched_fields)),
+                      static_cast<int>(FixedVaultSchedule::CUSTOM));
+
+    VaultPolicyPackage mismatched_descriptor{current};
+    mismatched_descriptor.fallback_older = FIXED_VAULT_LEGACY_PRIMARY_DELAY;
+    mismatched_descriptor.fallback_older_one_key = FIXED_VAULT_LEGACY_FINAL_DELAY;
+    mismatched_descriptor.recovery_stages = {
+        {2, FIXED_VAULT_LEGACY_PRIMARY_DELAY, {}},
+        {1, FIXED_VAULT_LEGACY_FINAL_DELAY, {}},
+    };
+    BOOST_CHECK_EQUAL(static_cast<int>(ClassifyFixedVaultSchedule(mismatched_descriptor)),
+                      static_cast<int>(FixedVaultSchedule::CUSTOM));
+
+    // Re-encode the otherwise identical participants under the legacy
+    // schedule so the commitment comparison below isolates timing alone.
+    VaultPolicyPackage legacy{current};
+    for (std::string& descriptor : legacy.descs) {
+        const size_t checksum_marker{descriptor.find('#')};
+        BOOST_REQUIRE_NE(checksum_marker, std::string::npos);
+        descriptor.resize(checksum_marker);
+        const auto replace_delay = [&](uint32_t from, uint32_t to) {
+            const std::string old_lock{strprintf("older(%u)", from)};
+            const size_t position{descriptor.find(old_lock)};
+            BOOST_REQUIRE_NE(position, std::string::npos);
+            descriptor.replace(position, old_lock.size(), strprintf("older(%u)", to));
+        };
+        replace_delay(FIXED_VAULT_CURRENT_PRIMARY_DELAY, FIXED_VAULT_LEGACY_PRIMARY_DELAY);
+        replace_delay(FIXED_VAULT_CURRENT_FINAL_DELAY, FIXED_VAULT_LEGACY_FINAL_DELAY);
+        const std::string checksum{GetDescriptorChecksum(descriptor)};
+        BOOST_REQUIRE(!checksum.empty());
+        descriptor += "#" + checksum;
+    }
+    legacy.policy_id = VaultPolicyId(legacy.descs.front());
+    legacy.fallback_older = FIXED_VAULT_LEGACY_PRIMARY_DELAY;
+    legacy.fallback_older_one_key = FIXED_VAULT_LEGACY_FINAL_DELAY;
+    legacy.recovery_stages = {
+        {2, FIXED_VAULT_LEGACY_PRIMARY_DELAY, {}},
+        {1, FIXED_VAULT_LEGACY_FINAL_DELAY, {}},
+    };
+    const auto legacy_valid{ValidateFixedStagedVaultPolicy(legacy)};
+    BOOST_REQUIRE_MESSAGE(legacy_valid, util::ErrorString(legacy_valid).original);
+    BOOST_CHECK_EQUAL(static_cast<int>(ClassifyFixedVaultSchedule(legacy)),
+                      static_cast<int>(FixedVaultSchedule::LEGACY_30_60));
+    BOOST_CHECK_EQUAL(static_cast<int>(ClassifyFixedVaultSchedule(InferVaultPolicy(legacy.descs.front()))),
+                      static_cast<int>(FixedVaultSchedule::LEGACY_30_60));
+    BOOST_CHECK_NE(VaultPolicyCommitment(current), VaultPolicyCommitment(legacy));
 
     const VaultPolicyPackage wrong_delays{make_package("wrong_delays", 2, 4, /*recovery_only=*/false)};
     const auto invalid_delays{ValidateFixedStagedVaultPolicy(wrong_delays)};
     BOOST_REQUIRE(!invalid_delays);
-    BOOST_CHECK(util::ErrorString(invalid_delays).original.find("4,320") != std::string::npos);
+    BOOST_CHECK_EQUAL(static_cast<int>(ClassifyFixedVaultSchedule(wrong_delays)),
+                      static_cast<int>(FixedVaultSchedule::CUSTOM));
+    BOOST_CHECK(util::ErrorString(invalid_delays).original.find("supported fixed") != std::string::npos);
 
-    const VaultPolicyPackage recovery_only{make_package("recovery_only", 4320, 8640, /*recovery_only=*/true)};
+    const VaultPolicyPackage recovery_only{make_package(
+        "recovery_only", FIXED_VAULT_CURRENT_PRIMARY_DELAY,
+        FIXED_VAULT_CURRENT_FINAL_DELAY, /*recovery_only=*/true)};
     const auto invalid_roster{ValidateFixedStagedVaultPolicy(recovery_only)};
     BOOST_REQUIRE(!invalid_roster);
     BOOST_CHECK(util::ErrorString(invalid_roster).original.find("same three participants") != std::string::npos);
@@ -295,12 +355,12 @@ BOOST_FIXTURE_TEST_CASE(fixed_staged_policy_validation, BasicTestingSetup)
     // Preserve every participant's aggregate occurrence count while omitting
     // one from the 2-of-3 stage and moving it into a third Taproot leaf. This
     // must not pass as the canonical two-stage fixed policy.
-    VaultPolicyPackage extra_leaf{fixed};
+    VaultPolicyPackage extra_leaf{legacy};
     for (std::string& descriptor : extra_leaf.descs) {
         const size_t checksum_marker{descriptor.find('#')};
         BOOST_REQUIRE_NE(checksum_marker, std::string::npos);
         descriptor.resize(checksum_marker);
-        static constexpr std::string_view PRIMARY{"and_v(v:older(4320),multi_a(2,"};
+        const std::string PRIMARY{strprintf("and_v(v:older(%u),multi_a(2,", FIXED_VAULT_LEGACY_PRIMARY_DELAY)};
         const size_t primary_keys{descriptor.find(PRIMARY)};
         BOOST_REQUIRE_NE(primary_keys, std::string::npos);
         const size_t primary_end{descriptor.find("))", primary_keys + PRIMARY.size())};
@@ -310,7 +370,7 @@ BOOST_FIXTURE_TEST_CASE(fixed_staged_policy_validation, BasicTestingSetup)
         const std::string omitted_key{descriptor.substr(omitted_key_begin + 1, primary_end - omitted_key_begin - 1)};
         descriptor.erase(omitted_key_begin, primary_end - omitted_key_begin);
 
-        static constexpr std::string_view FINAL_SEPARATOR{",and_v(v:older(8640),multi_a(1,"};
+        const std::string FINAL_SEPARATOR{strprintf(",and_v(v:older(%u),multi_a(1,", FIXED_VAULT_LEGACY_FINAL_DELAY)};
         const size_t final_separator{descriptor.find(FINAL_SEPARATOR, primary_keys)};
         BOOST_REQUIRE_NE(final_separator, std::string::npos);
         descriptor.replace(final_separator, 1, ",{");
@@ -327,7 +387,7 @@ BOOST_FIXTURE_TEST_CASE(fixed_staged_policy_validation, BasicTestingSetup)
     BOOST_REQUIRE(!invalid_shape);
     BOOST_CHECK(util::ErrorString(invalid_shape).original.find("canonical fixed staged vault construction") != std::string::npos);
 
-    VaultPolicyPackage missing_change{fixed};
+    VaultPolicyPackage missing_change{current};
     missing_change.descs.resize(1);
     const auto invalid_pair{ValidateFixedStagedVaultPolicy(missing_change)};
     BOOST_REQUIRE(!invalid_pair);
@@ -340,8 +400,8 @@ BOOST_FIXTURE_TEST_CASE(multisig_candidate_prepared_before_wallet_commit, BasicT
     for (auto& spec : candidate_specs) spec.generate_local = true;
     MultisigOptions options;
     options.type = OutputType::BECH32M;
-    options.fallback_older = 4320;
-    options.fallback_older_one_key = 8640;
+    options.fallback_older = FIXED_VAULT_CURRENT_PRIMARY_DELAY;
+    options.fallback_older_one_key = FIXED_VAULT_CURRENT_FINAL_DELAY;
 
     auto prepared{PrepareMultisigDescriptor(/*nrequired=*/2, candidate_specs, options)};
     BOOST_REQUIRE_MESSAGE(prepared, util::ErrorString(prepared).original);
@@ -359,9 +419,12 @@ BOOST_FIXTURE_TEST_CASE(multisig_candidate_prepared_before_wallet_commit, BasicT
     VaultPolicyPackage package;
     package.network = Params().GetChainTypeString();
     package.nrequired = 2;
-    package.fallback_older = 4320;
-    package.fallback_older_one_key = 8640;
-    package.recovery_stages = {{2, 4320, {}}, {1, 8640, {}}};
+    package.fallback_older = FIXED_VAULT_CURRENT_PRIMARY_DELAY;
+    package.fallback_older_one_key = FIXED_VAULT_CURRENT_FINAL_DELAY;
+    package.recovery_stages = {
+        {2, FIXED_VAULT_CURRENT_PRIMARY_DELAY, {}},
+        {1, FIXED_VAULT_CURRENT_FINAL_DELAY, {}},
+    };
     package.descs = prepared->descs;
     package.policy_id = prepared->policy_id;
     const auto fixed{ValidateFixedStagedVaultPolicy(package)};

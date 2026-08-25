@@ -13,6 +13,7 @@ add_library(bitcoin_wallet STATIC EXCLUDE_FROM_ALL
   dump.cpp
   export.cpp
   external_signer_scriptpubkeyman.cpp
+  fixed_vault_wallet.cpp
   feebumper.cpp
   fees.cpp
   interfaces.cpp
@@ -20,6 +21,7 @@ add_library(bitcoin_wallet STATIC EXCLUDE_FROM_ALL
   migrate.cpp
   multisig.cpp
   receive.cpp
+  recovery_vault_kit.cpp
   rpc/addresses.cpp
   rpc/backup.cpp
   rpc/coins.cpp
@@ -34,6 +36,7 @@ add_library(bitcoin_wallet STATIC EXCLUDE_FROM_ALL
   sqlite.cpp
   transaction.cpp
   vault_policy_qr.cpp
+  vault_renewal.cpp
   wallet.cpp
   walletdb.cpp
   walletutil.cpp

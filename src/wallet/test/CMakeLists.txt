@@ -17,6 +17,7 @@ target_sources(test_bitcoin
     init_tests.cpp
     ismine_tests.cpp
     psbt_wallet_tests.cpp
+    recovery_vault_kit_tests.cpp
     scriptpubkeyman_tests.cpp
     spend_tests.cpp
     wallet_crypto_tests.cpp
@@ -32,5 +33,6 @@ target_sources(test_bitcoin
     taproot_vault_send_tests.cpp
     taproot_scale_tests.cpp
     vault_policy_qr_tests.cpp
+    vault_renewal_tests.cpp
 )
 target_link_libraries(test_bitcoin bitcoin_wallet)

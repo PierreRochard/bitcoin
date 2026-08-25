@@ -2,18 +2,6 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <wallet/wallet.h>
-
-#include <algorithm>
-#include <cstdint>
-#include <future>
-#include <memory>
-#include <stdexcept>
-#include <string>
-#include <system_error>
-#include <utility>
-#include <vector>
-
 #include <addresstype.h>
 #include <chainparams.h>
 #include <interfaces/chain.h>
@@ -22,12 +10,15 @@
 #include <node/blockstorage.h>
 #include <node/types.h>
 #include <policy/policy.h>
+#include <psbt.h>
 #include <rpc/server.h>
 #include <script/solver.h>
 #include <test/util/common.h>
 #include <test/util/logging.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
+#include <univalue.h>
+#include <util/readwritefile.h>
 #include <util/translation.h>
 #include <validation.h>
 #include <validationinterface.h>
@@ -39,10 +30,21 @@
 #include <wallet/spend.h>
 #include <wallet/test/util.h>
 #include <wallet/test/wallet_test_fixture.h>
+#include <wallet/wallet.h>
+#include <wallet/walletdb.h>
 #include <wallet/walletutil.h>
 
 #include <boost/test/unit_test.hpp>
-#include <univalue.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <future>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
 
 using node::MAX_BLOCKFILE_SIZE;
 
@@ -68,17 +70,20 @@ static FixedVaultCandidate PrepareFixedVaultCandidate()
     for (auto& spec : specs) spec.generate_local = true;
     MultisigOptions options;
     options.type = OutputType::BECH32M;
-    options.fallback_older = 4320;
-    options.fallback_older_one_key = 8640;
+    options.fallback_older = FIXED_VAULT_LEGACY_PRIMARY_DELAY;
+    options.fallback_older_one_key = FIXED_VAULT_LEGACY_FINAL_DELAY;
     auto prepared{PrepareMultisigDescriptor(/*nrequired=*/2, specs, options)};
     BOOST_REQUIRE_MESSAGE(prepared, util::ErrorString(prepared).original);
 
     VaultPolicyPackage policy;
     policy.network = Params().GetChainTypeString();
     policy.nrequired = 2;
-    policy.fallback_older = 4320;
-    policy.fallback_older_one_key = 8640;
-    policy.recovery_stages = {{2, 4320, {}}, {1, 8640, {}}};
+    policy.fallback_older = FIXED_VAULT_LEGACY_PRIMARY_DELAY;
+    policy.fallback_older_one_key = FIXED_VAULT_LEGACY_FINAL_DELAY;
+    policy.recovery_stages = {
+        {2, FIXED_VAULT_LEGACY_PRIMARY_DELAY, {}},
+        {1, FIXED_VAULT_LEGACY_FINAL_DELAY, {}},
+    };
     policy.descs = prepared->descs;
     policy.policy_id = prepared->policy_id;
 
@@ -128,6 +133,59 @@ static CScript FirstFixedVaultScript(const FixedVaultCandidate& candidate)
     return scripts.front();
 }
 
+class FailingWriteBatch final : public MockableSQLiteBatch
+{
+public:
+    FailingWriteBatch(SQLiteDatabase& database, bool& fail_writes)
+        : MockableSQLiteBatch(database), m_fail_writes(fail_writes)
+    {
+    }
+
+protected:
+    bool WriteKey(DataStream&& key, DataStream&& value, bool overwrite = true) override
+    {
+        if (m_fail_writes) return false;
+        return MockableSQLiteBatch::WriteKey(std::move(key), std::move(value), overwrite);
+    }
+
+private:
+    bool& m_fail_writes;
+};
+
+class FailingWriteDatabase final : public MockableSQLiteDatabase
+{
+public:
+    bool fail_writes{false};
+
+    std::unique_ptr<DatabaseBatch> MakeBatch() override
+    {
+        return std::make_unique<FailingWriteBatch>(*this, fail_writes);
+    }
+};
+
+BOOST_AUTO_TEST_CASE(wallet_flag_write_failure_never_changes_live_safety_state)
+{
+    auto database{std::make_unique<FailingWriteDatabase>()};
+    auto* const failure_control{database.get()};
+    CWallet wallet{/*chain=*/nullptr, "wallet_flag_atomicity", std::move(database)};
+
+    wallet.SetWalletFlag(WALLET_FLAG_GENESIS_RESCAN_REQUIRED);
+    BOOST_REQUIRE(wallet.IsWalletFlagSet(WALLET_FLAG_GENESIS_RESCAN_REQUIRED));
+
+    failure_control->fail_writes = true;
+    BOOST_CHECK_THROW(wallet.UnsetWalletFlag(WALLET_FLAG_GENESIS_RESCAN_REQUIRED), std::runtime_error);
+    BOOST_CHECK(wallet.IsWalletFlagSet(WALLET_FLAG_GENESIS_RESCAN_REQUIRED));
+
+    // The inverse operation is atomic too: a failed durable set must not
+    // publish an in-memory flag that disappears after restart.
+    failure_control->fail_writes = false;
+    wallet.UnsetWalletFlag(WALLET_FLAG_GENESIS_RESCAN_REQUIRED);
+    BOOST_REQUIRE(!wallet.IsWalletFlagSet(WALLET_FLAG_GENESIS_RESCAN_REQUIRED));
+    failure_control->fail_writes = true;
+    BOOST_CHECK_THROW(wallet.SetWalletFlag(WALLET_FLAG_GENESIS_RESCAN_REQUIRED), std::runtime_error);
+    BOOST_CHECK(!wallet.IsWalletFlagSet(WALLET_FLAG_GENESIS_RESCAN_REQUIRED));
+}
+
 BOOST_FIXTURE_TEST_CASE(check_rescan_from_genesis_rejects_missing_blocks_without_wallet_creation, TestChain100Setup)
 {
     auto loader{interfaces::MakeWalletLoader(*m_node.chain, *Assert(m_node.args))};
@@ -169,6 +227,8 @@ BOOST_FIXTURE_TEST_CASE(fixed_vault_public_only_restore_is_atomic_and_timestamp_
     const auto public_status{installed->wallet->getVaultStatus()};
     BOOST_CHECK_EQUAL(public_status.participants.size(), 3U);
     BOOST_CHECK_EQUAL(public_status.lost_signers.size(), 3U);
+    BOOST_CHECK(public_status.setup_state == interfaces::Wallet::VaultSetupState::RECOVERY_KIT_REQUIRED);
+    BOOST_CHECK(public_status.verification_state == interfaces::Wallet::VaultVerificationState::PENDING);
     BOOST_CHECK(public_status.genesis_rescan_required);
     BOOST_CHECK(fs::is_regular_file(final_path));
     CheckVaultDescriptorTimestamps(*installed->wallet, /*expected=*/0);
@@ -194,8 +254,19 @@ BOOST_FIXTURE_TEST_CASE(fixed_vault_public_only_restore_is_atomic_and_timestamp_
     BOOST_CHECK(!private_install->wallet->privateKeysDisabled());
     BOOST_CHECK(!private_install->wallet->hasExternalSigner());
     BOOST_CHECK_EQUAL(private_install->wallet->exportVaultPolicy(), candidate.package);
-    BOOST_CHECK(private_install->wallet->getVaultStatus().lost_signers.empty());
-    BOOST_CHECK(!private_install->wallet->getVaultStatus().genesis_rescan_required);
+    const auto private_status{private_install->wallet->getVaultStatus()};
+    BOOST_CHECK(private_status.lost_signers.empty());
+    BOOST_CHECK(!private_status.genesis_rescan_required);
+    BOOST_CHECK(private_status.setup_state == interfaces::Wallet::VaultSetupState::ADDRESS_VERIFICATION_REQUIRED);
+    BOOST_CHECK(private_status.verification_state == interfaces::Wallet::VaultVerificationState::PENDING);
+    {
+        CWallet* internal{Assert(private_install->wallet->wallet())};
+        LOCK(internal->cs_wallet);
+        const auto package{ParseVaultPolicyPackage(candidate.package)};
+        BOOST_REQUIRE(package);
+        BOOST_CHECK_EQUAL(internal->m_vault_metadata_policy_commitment,
+                          VaultPolicyCommitment(*package));
+    }
     CheckVaultDescriptorTimestamps(*private_install->wallet, CREATE_TIME);
     CheckNoFixedVaultStages(GetWalletDir());
 }
@@ -300,6 +371,26 @@ BOOST_FIXTURE_TEST_CASE(fixed_vault_incomplete_rescan_marker_survives_reload, Te
     BOOST_REQUIRE_MESSAGE(installed, util::ErrorString(installed).original);
     BOOST_REQUIRE(installed->wallet);
     BOOST_CHECK(installed->wallet->getVaultStatus().genesis_rescan_required);
+
+    // The resumable scan uses a vault-specific checkpoint rather than the
+    // ordinary best-block locator, which can advance independently from
+    // historical scan completeness.
+    {
+        CWallet& internal{*Assert(installed->wallet->wallet())};
+        LOCK(internal.cs_wallet);
+        const uint256 checkpoint_hash{m_node.chain->getBlockHash(5)};
+        const std::string policy_commitment{VaultPolicyCommitment(ExportWalletVaultPolicy(internal))};
+        WalletBatch batch{internal.GetDatabase()};
+        BOOST_REQUIRE(batch.WriteVaultRescanProgress(5, checkpoint_hash, policy_commitment));
+        int checkpoint_height{-1};
+        uint256 reloaded_hash;
+        std::string reloaded_commitment;
+        BOOST_REQUIRE(batch.ReadVaultRescanProgress(checkpoint_height, reloaded_hash, reloaded_commitment));
+        BOOST_CHECK_EQUAL(checkpoint_height, 5);
+        BOOST_CHECK(reloaded_hash == checkpoint_hash);
+        BOOST_CHECK_EQUAL(reloaded_commitment, policy_commitment);
+        BOOST_REQUIRE(batch.EraseVaultRescanProgress());
+    }
     installed->wallet->remove();
     installed->wallet.reset();
 
@@ -333,6 +424,456 @@ BOOST_FIXTURE_TEST_CASE(fixed_vault_incomplete_rescan_marker_survives_reload, Te
     BOOST_REQUIRE_MESSAGE(completed, util::ErrorString(completed).original);
     BOOST_CHECK(!(*completed)->getVaultStatus().genesis_rescan_required);
     (*completed)->remove();
+}
+
+BOOST_FIXTURE_TEST_CASE(fixed_vault_setup_truth_and_manual_loss_survive_reload, TestChain100Setup)
+{
+    using ParticipantType = interfaces::Wallet::VaultParticipantType;
+    using SetupState = interfaces::Wallet::VaultSetupState;
+    using VerificationState = interfaces::Wallet::VaultVerificationState;
+
+    auto loader{interfaces::MakeWalletLoader(*m_node.chain, *Assert(m_node.args))};
+    FixedVaultCandidate candidate{PrepareFixedVaultCandidate()};
+    const std::string name{"fixed_vault_setup_truth"};
+    std::vector<bilingual_str> warnings;
+    auto installed{loader->installFixedVault(
+        name, candidate.package, candidate.mnemonics,
+        interfaces::FixedVaultInstallMode::CREATE, warnings)};
+    BOOST_REQUIRE_MESSAGE(installed, util::ErrorString(installed).original);
+    BOOST_REQUIRE(installed->wallet);
+
+    // The fixed installer publishes only after binding a truthful incomplete
+    // state to the exact policy. Participant sources may be recorded later,
+    // but a new wallet can never be mistaken for a pristine legacy wallet.
+    auto status{installed->wallet->getVaultStatus()};
+    BOOST_CHECK(status.setup_state == SetupState::ADDRESS_VERIFICATION_REQUIRED);
+    BOOST_CHECK(status.verification_state == VerificationState::PENDING);
+    BOOST_REQUIRE_EQUAL(status.participants.size(), 3U);
+    for (const auto& participant : status.participants) {
+        BOOST_CHECK(participant.type == ParticipantType::LOCAL_SOFTWARE);
+        BOOST_CHECK(participant.availability == interfaces::Wallet::VaultSignerAvailability::AVAILABLE);
+        BOOST_CHECK(!participant.is_lost);
+    }
+
+    // Inconsistent combinations are rejected atomically and leave the prior
+    // state untouched.
+    BOOST_CHECK(!installed->wallet->setVaultSetupState(
+        SetupState::COMPLETE, VerificationState::PENDING));
+    status = installed->wallet->getVaultStatus();
+    BOOST_CHECK(status.setup_state == SetupState::ADDRESS_VERIFICATION_REQUIRED);
+    BOOST_CHECK(status.verification_state == VerificationState::PENDING);
+
+    BOOST_REQUIRE(installed->wallet->setVaultSetupState(
+        SetupState::RECOVERY_KIT_REQUIRED, VerificationState::PENDING));
+    BOOST_REQUIRE(installed->wallet->setVaultSetupState(
+        SetupState::ADDRESS_VERIFICATION_REQUIRED, VerificationState::PENDING));
+    BOOST_REQUIRE(installed->wallet->setVaultSetupState(
+        SetupState::ADDRESS_VERIFICATION_REQUIRED, VerificationState::RECOVERY_KIT_MATCHED));
+    BOOST_REQUIRE(installed->wallet->setVaultSetupState(
+        SetupState::COMPLETE, VerificationState::INDEPENDENTLY_VERIFIED));
+    status = installed->wallet->getVaultStatus();
+    BOOST_CHECK(status.setup_state == SetupState::COMPLETE);
+    BOOST_CHECK(status.verification_state == VerificationState::INDEPENDENTLY_VERIFIED);
+
+    // Exercise the explicit-unverified terminal state as a separate durable
+    // truth, not a synonym for independent verification.
+    BOOST_REQUIRE(installed->wallet->setVaultSetupState(
+        SetupState::COMPLETE, VerificationState::FINISHED_UNVERIFIED));
+    const std::string fingerprint{status.participants.front().fingerprint};
+    BOOST_REQUIRE(installed->wallet->setVaultParticipantType(fingerprint, ParticipantType::HARDWARE));
+
+    // A fresh exact discovery may clear only automatically inferred loss.
+    // Once the user or RPC marks the signer lost, the same operation must
+    // fail atomically and preserve that deliberate decision.
+    {
+        auto* internal_wallet{Assert(installed->wallet->wallet())};
+        LOCK(internal_wallet->cs_wallet);
+        BOOST_REQUIRE(internal_wallet->SetLostSigners({fingerprint}));
+    }
+    BOOST_REQUIRE(installed->wallet->clearAutomaticallyLostSigner(fingerprint));
+    status = installed->wallet->getVaultStatus();
+    BOOST_CHECK(!status.participants.front().is_lost);
+    BOOST_CHECK(status.manually_lost_signers.empty());
+
+    BOOST_REQUIRE(installed->wallet->setLostSigner(fingerprint, /*lost=*/true));
+    BOOST_CHECK(!installed->wallet->clearAutomaticallyLostSigner(fingerprint));
+    status = installed->wallet->getVaultStatus();
+    BOOST_CHECK(status.participants.front().type == ParticipantType::HARDWARE);
+    BOOST_CHECK(status.participants.front().is_lost);
+    BOOST_CHECK(std::ranges::find(status.manually_lost_signers, fingerprint) != status.manually_lost_signers.end());
+
+    installed->wallet->remove();
+    installed->wallet.reset();
+    warnings.clear();
+    auto reloaded{loader->loadWallet(name, warnings)};
+    BOOST_REQUIRE_MESSAGE(reloaded, util::ErrorString(reloaded).original);
+    status = (*reloaded)->getVaultStatus();
+    BOOST_CHECK(status.setup_state == SetupState::COMPLETE);
+    BOOST_CHECK(status.verification_state == VerificationState::FINISHED_UNVERIFIED);
+    BOOST_REQUIRE_EQUAL(status.participants.size(), 3U);
+    BOOST_CHECK(status.participants.front().type == ParticipantType::HARDWARE);
+    BOOST_CHECK(status.participants.front().is_lost);
+    BOOST_CHECK(std::ranges::find(status.manually_lost_signers, fingerprint) != status.manually_lost_signers.end());
+
+    BOOST_REQUIRE((*reloaded)->setLostSigner(fingerprint, /*lost=*/false));
+    BOOST_REQUIRE((*reloaded)->setVaultParticipantType(fingerprint, ParticipantType::UNKNOWN));
+    BOOST_REQUIRE((*reloaded)->setVaultSetupState(
+        SetupState::NOT_RECORDED, VerificationState::NOT_RECORDED));
+    status = (*reloaded)->getVaultStatus();
+    BOOST_CHECK(status.setup_state == SetupState::NOT_RECORDED);
+    BOOST_CHECK(status.verification_state == VerificationState::NOT_RECORDED);
+    BOOST_CHECK(status.manually_lost_signers.empty());
+    BOOST_CHECK(status.participants.front().type == ParticipantType::LOCAL_SOFTWARE);
+    (*reloaded)->remove();
+}
+
+BOOST_FIXTURE_TEST_CASE(fixed_vault_metadata_never_crosses_policy_identity, TestChain100Setup)
+{
+    using ParticipantType = interfaces::Wallet::VaultParticipantType;
+    using SetupState = interfaces::Wallet::VaultSetupState;
+    using VerificationState = interfaces::Wallet::VaultVerificationState;
+
+    auto loader{interfaces::MakeWalletLoader(*m_node.chain, *Assert(m_node.args))};
+    FixedVaultCandidate first{PrepareFixedVaultCandidate()};
+    FixedVaultCandidate replacement{PrepareFixedVaultCandidate()};
+    const auto first_package{ParseVaultPolicyPackage(first.package)};
+    const auto replacement_package{ParseVaultPolicyPackage(replacement.package)};
+    BOOST_REQUIRE(first_package);
+    BOOST_REQUIRE(replacement_package);
+    BOOST_REQUIRE_NE(first_package->policy_id, replacement_package->policy_id);
+    const std::string first_commitment{VaultPolicyCommitment(*first_package)};
+    const std::string replacement_commitment{VaultPolicyCommitment(*replacement_package)};
+    BOOST_REQUIRE_NE(first_commitment, replacement_commitment);
+
+    const std::string name{"fixed_vault_policy_bound_truth"};
+    std::vector<bilingual_str> warnings;
+    auto installed{loader->installFixedVault(
+        name, first.package, first.mnemonics,
+        interfaces::FixedVaultInstallMode::CREATE, warnings)};
+    BOOST_REQUIRE_MESSAGE(installed, util::ErrorString(installed).original);
+    BOOST_REQUIRE(installed->wallet);
+
+    auto status{installed->wallet->getVaultStatus()};
+    BOOST_REQUIRE_EQUAL(status.participants.size(), 3U);
+    const std::string old_fingerprint{status.participants.front().fingerprint};
+    BOOST_REQUIRE(installed->wallet->setVaultSetupState(
+        SetupState::COMPLETE, VerificationState::INDEPENDENTLY_VERIFIED));
+    BOOST_REQUIRE(installed->wallet->setVaultParticipantType(old_fingerprint, ParticipantType::HARDWARE));
+    BOOST_REQUIRE(installed->wallet->setLostSigner(old_fingerprint, /*lost=*/true));
+
+    // Put replacement-policy history below a deliberately stale checkpoint.
+    // The replacement is not active yet, so normal notifications cannot add
+    // this transaction to the wallet.
+    const CMutableTransaction replacement_funding{TestSimpleSpend(
+        *m_coinbase_txns.at(0), /*index=*/0, coinbaseKey,
+        FirstFixedVaultScript(replacement))};
+    CreateAndProcessBlock({replacement_funding}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    {
+        CWallet* internal{Assert(installed->wallet->wallet())};
+        LOCK(internal->cs_wallet);
+        const int checkpoint_height{internal->GetLastBlockHeight()};
+        BOOST_REQUIRE_GT(checkpoint_height, 0);
+        const uint256 checkpoint_hash{internal->GetLastBlockHash()};
+        BOOST_CHECK_EQUAL(VaultPolicyCommitment(ExportWalletVaultPolicy(*internal)), first_commitment);
+        BOOST_REQUIRE(WalletBatch{internal->GetDatabase()}.WriteVaultRescanProgress(
+            checkpoint_height, checkpoint_hash, first_commitment));
+    }
+
+    // Advanced/RPC policy import can replace the active Taproot descriptors.
+    // The new address must not inherit verification, loss, or a participant
+    // source merely because an old 32-bit fingerprint happens to collide.
+    {
+        CWallet* internal{Assert(installed->wallet->wallet())};
+        LOCK(internal->cs_wallet);
+        const auto imported{ImportWalletVaultPolicy(*internal, *replacement_package)};
+        BOOST_REQUIRE_MESSAGE(imported, util::ErrorString(imported).original);
+    }
+    status = installed->wallet->getVaultStatus();
+    BOOST_CHECK(status.is_fixed_staged_vault);
+    BOOST_CHECK(status.setup_state == SetupState::NOT_RECORDED);
+    BOOST_CHECK(status.verification_state == VerificationState::NOT_RECORDED);
+    BOOST_CHECK(status.lost_signers.empty());
+    BOOST_CHECK(status.manually_lost_signers.empty());
+    for (const auto& participant : status.participants) {
+        BOOST_CHECK(participant.type == ParticipantType::UNKNOWN);
+        BOOST_CHECK(!participant.is_lost);
+    }
+
+    // Transaction construction and PSBT filling carry the same immutable
+    // full-policy token as setup state. A draft captured for policy A must be
+    // rejected under cs_wallet after policy B becomes active, before coin
+    // selection, PSBT enrichment, or signing can use B's managers.
+    CCoinControl stale_coin_control;
+    const auto stale_create{installed->wallet->createTransaction(
+        {}, stale_coin_control, /*sign=*/false, /*change_pos=*/std::nullopt,
+        first_commitment)};
+    BOOST_CHECK(!stale_create);
+    PartiallySignedTransaction stale_psbt{CMutableTransaction{}};
+    bool stale_complete{false};
+    const auto stale_fill{installed->wallet->fillPSBT(
+        {.sign = false, .expected_vault_policy_commitment = first_commitment},
+        /*n_signed=*/nullptr, stale_psbt, stale_complete)};
+    BOOST_REQUIRE(stale_fill);
+    BOOST_CHECK(*stale_fill == common::PSBTError::VAULT_POLICY_MISMATCH);
+    BOOST_CHECK(!stale_complete);
+
+    // A device callback or Recovery Kit comparison that started for policy A
+    // must not bind or write its stale evidence after policy B becomes active.
+    // Both mutations compare the complete package commitment under cs_wallet,
+    // before BindVaultMetadataToActivePolicy can change any durable metadata.
+    BOOST_REQUIRE(!status.participants.empty());
+    const std::string replacement_fingerprint{status.participants.front().fingerprint};
+    BOOST_CHECK(!installed->wallet->setVaultSetupState(
+        SetupState::COMPLETE, VerificationState::INDEPENDENTLY_VERIFIED,
+        first_commitment));
+    BOOST_CHECK(!installed->wallet->setVaultParticipantType(
+        replacement_fingerprint, ParticipantType::HARDWARE,
+        first_commitment));
+    status = installed->wallet->getVaultStatus();
+    BOOST_CHECK(status.setup_state == SetupState::NOT_RECORDED);
+    BOOST_CHECK(status.verification_state == VerificationState::NOT_RECORDED);
+    BOOST_CHECK(status.participants.front().type == ParticipantType::UNKNOWN);
+    {
+        CWallet* internal{Assert(installed->wallet->wallet())};
+        LOCK(internal->cs_wallet);
+        BOOST_CHECK_EQUAL(internal->m_vault_metadata_policy_commitment, first_commitment);
+    }
+
+    // A checkpoint for policy A is never reused for policy B. The rescan must
+    // restart at genesis and discover B's transaction below that checkpoint.
+    const auto rescanned{installed->wallet->rescanFromGenesis()};
+    BOOST_REQUIRE_MESSAGE(rescanned, util::ErrorString(rescanned).original);
+    {
+        CWallet* internal{Assert(installed->wallet->wallet())};
+        LOCK(internal->cs_wallet);
+        BOOST_CHECK(internal->mapWallet.contains(replacement_funding.GetHash()));
+    }
+
+    // The next explicit state write atomically rebinds all metadata to the
+    // replacement policy. That safe result survives reload.
+    BOOST_REQUIRE(installed->wallet->setVaultSetupState(
+        SetupState::ADDRESS_VERIFICATION_REQUIRED, VerificationState::PENDING,
+        replacement_commitment));
+    BOOST_REQUIRE(installed->wallet->setLostSigner(
+        replacement_fingerprint, /*lost=*/true, replacement_commitment));
+    BOOST_CHECK(!installed->wallet->setLostSigner(
+        replacement_fingerprint, /*lost=*/false, first_commitment));
+    status = installed->wallet->getVaultStatus();
+    BOOST_CHECK(std::ranges::find(status.manually_lost_signers,
+                                  replacement_fingerprint) !=
+                status.manually_lost_signers.end());
+    BOOST_REQUIRE(installed->wallet->setLostSigner(
+        replacement_fingerprint, /*lost=*/false, replacement_commitment));
+    installed->wallet->remove();
+    installed->wallet.reset();
+    warnings.clear();
+    auto reloaded{loader->loadWallet(name, warnings)};
+    BOOST_REQUIRE_MESSAGE(reloaded, util::ErrorString(reloaded).original);
+    status = (*reloaded)->getVaultStatus();
+    BOOST_CHECK(status.setup_state == SetupState::ADDRESS_VERIFICATION_REQUIRED);
+    BOOST_CHECK(status.verification_state == VerificationState::PENDING);
+    BOOST_CHECK(status.lost_signers.empty());
+    BOOST_CHECK(status.manually_lost_signers.empty());
+    (*reloaded)->remove();
+}
+
+BOOST_FIXTURE_TEST_CASE(legacy_lost_signer_is_conservatively_bound_to_active_policy, TestChain100Setup)
+{
+    auto loader{interfaces::MakeWalletLoader(*m_node.chain, *Assert(m_node.args))};
+    FixedVaultCandidate candidate{PrepareFixedVaultCandidate()};
+    const std::string name{"fixed_vault_legacy_lost_binding"};
+    std::vector<bilingual_str> warnings;
+    auto installed{loader->installFixedVault(
+        name, candidate.package, candidate.mnemonics,
+        interfaces::FixedVaultInstallMode::CREATE, warnings)};
+    BOOST_REQUIRE_MESSAGE(installed, util::ErrorString(installed).original);
+    auto status{installed->wallet->getVaultStatus()};
+    BOOST_REQUIRE_EQUAL(status.participants.size(), 3U);
+    const std::string fingerprint{status.participants.front().fingerprint};
+    std::string unrelated{"deadbeef"};
+    if (std::ranges::any_of(status.participants, [&](const auto& participant) {
+            return participant.fingerprint == unrelated;
+        })) {
+        unrelated = "cafebabe";
+    }
+
+    // Simulate a pre-migration wallet: `lostsigner` existed before policy
+    // commitments and explicit/manual provenance did.
+    {
+        CWallet* internal{Assert(installed->wallet->wallet())};
+        LOCK(internal->cs_wallet);
+        BOOST_REQUIRE(WalletBatch{internal->GetDatabase()}.WriteLostSigner(fingerprint));
+        BOOST_REQUIRE(WalletBatch{internal->GetDatabase()}.WriteLostSigner(unrelated));
+        BOOST_REQUIRE(WalletBatch{internal->GetDatabase()}.EraseVaultState());
+        BOOST_REQUIRE(WalletBatch{internal->GetDatabase()}.EraseVaultMetadataPolicy());
+    }
+    installed->wallet->remove();
+    installed->wallet.reset();
+
+    warnings.clear();
+    auto migrated{loader->loadWallet(name, warnings)};
+    BOOST_REQUIRE_MESSAGE(migrated, util::ErrorString(migrated).original);
+    status = (*migrated)->getVaultStatus();
+    BOOST_CHECK(status.setup_state == interfaces::Wallet::VaultSetupState::NOT_RECORDED);
+    BOOST_CHECK(status.verification_state == interfaces::Wallet::VaultVerificationState::NOT_RECORDED);
+    BOOST_CHECK(std::ranges::find(status.lost_signers, fingerprint) != status.lost_signers.end());
+    BOOST_CHECK(std::ranges::find(status.manually_lost_signers, fingerprint) != status.manually_lost_signers.end());
+    BOOST_CHECK(std::ranges::find(status.lost_signers, unrelated) == status.lost_signers.end());
+    BOOST_CHECK(std::ranges::find(status.manually_lost_signers, unrelated) == status.manually_lost_signers.end());
+    BOOST_CHECK(std::ranges::any_of(status.participants, [&](const auto& participant) {
+        return participant.fingerprint == fingerprint && participant.is_lost;
+    }));
+    {
+        CWallet* internal{Assert((*migrated)->wallet())};
+        LOCK(internal->cs_wallet);
+        BOOST_CHECK_EQUAL(internal->m_vault_metadata_policy_commitment.size(), 64U);
+    }
+    (*migrated)->remove();
+}
+
+BOOST_FIXTURE_TEST_CASE(ordinary_legacy_lost_marker_remains_loadable, TestChain100Setup)
+{
+    auto loader{interfaces::MakeWalletLoader(*m_node.chain, *Assert(m_node.args))};
+    const std::string name{"ordinary_legacy_lost_marker"};
+    std::vector<bilingual_str> warnings;
+    auto created{loader->createWallet(
+        name, SecureString{}, WALLET_FLAG_DESCRIPTORS | WALLET_FLAG_BLANK_WALLET,
+        warnings)};
+    BOOST_REQUIRE_MESSAGE(created, util::ErrorString(created).original);
+    auto ordinary_wallet{std::move(*created)};
+    const std::string fingerprint{"deadbeef"};
+    BOOST_REQUIRE(ordinary_wallet->setLostSigner(fingerprint, /*lost=*/true));
+    ordinary_wallet->remove();
+    ordinary_wallet.reset();
+
+    warnings.clear();
+    auto reloaded{loader->loadWallet(name, warnings)};
+    BOOST_REQUIRE_MESSAGE(reloaded, util::ErrorString(reloaded).original);
+    {
+        CWallet* internal{Assert((*reloaded)->wallet())};
+        LOCK(internal->cs_wallet);
+        BOOST_CHECK(internal->m_lost_signers.contains(fingerprint));
+        BOOST_CHECK(internal->m_manually_lost_signers.empty());
+        BOOST_CHECK(internal->m_vault_metadata_policy_commitment.empty());
+    }
+    BOOST_REQUIRE((*reloaded)->setLostSigner(fingerprint, /*lost=*/false));
+    (*reloaded)->remove();
+}
+
+BOOST_FIXTURE_TEST_CASE(custom_vault_legacy_loss_is_not_discarded, TestChain100Setup)
+{
+    std::vector<MultisigKeySpec> specs(3);
+    for (auto& spec : specs)
+        spec.generate_local = true;
+    MultisigOptions options;
+    options.type = OutputType::BECH32M;
+    options.fallback_older = 2;
+    auto prepared{PrepareMultisigDescriptor(/*nrequired=*/2, specs, options)};
+    BOOST_REQUIRE_MESSAGE(prepared, util::ErrorString(prepared).original);
+    BOOST_REQUIRE_EQUAL(prepared->recovery.size(), 3U);
+
+    VaultPolicyPackage policy;
+    policy.network = Params().GetChainTypeString();
+    policy.nrequired = 2;
+    policy.fallback_older = 2;
+    policy.recovery_stages = {{2, 2, {}}};
+    policy.descs = prepared->descs;
+    policy.policy_id = prepared->policy_id;
+
+    auto loader{interfaces::MakeWalletLoader(*m_node.chain, *Assert(m_node.args))};
+    const std::string name{"custom_vault_legacy_loss"};
+    std::vector<bilingual_str> warnings;
+    auto created{loader->createWallet(
+        name, SecureString{},
+        WALLET_FLAG_DESCRIPTORS | WALLET_FLAG_DISABLE_PRIVATE_KEYS |
+            WALLET_FLAG_BLANK_WALLET,
+        warnings)};
+    BOOST_REQUIRE_MESSAGE(created, util::ErrorString(created).original);
+    auto custom_wallet{std::move(*created)};
+    BOOST_REQUIRE(custom_wallet->importVaultPolicy(FormatVaultPolicyPackage(policy)));
+    const std::string fingerprint{prepared->recovery.front().fingerprint};
+    {
+        CWallet* internal{Assert(custom_wallet->wallet())};
+        LOCK(internal->cs_wallet);
+        BOOST_REQUIRE(WalletBatch{internal->GetDatabase()}.WriteLostSigner(fingerprint));
+    }
+    custom_wallet->remove();
+    custom_wallet.reset();
+
+    warnings.clear();
+    auto migrated{loader->loadWallet(name, warnings)};
+    BOOST_REQUIRE_MESSAGE(migrated, util::ErrorString(migrated).original);
+    const auto status{(*migrated)->getVaultStatus()};
+    BOOST_CHECK(status.is_vault);
+    BOOST_CHECK(std::ranges::find(status.lost_signers, fingerprint) !=
+                status.lost_signers.end());
+    BOOST_CHECK(std::ranges::find(status.manually_lost_signers, fingerprint) !=
+                status.manually_lost_signers.end());
+    (*migrated)->remove();
+}
+
+BOOST_FIXTURE_TEST_CASE(corrupt_manual_lost_provenance_aborts_wallet_load, TestChain100Setup)
+{
+    auto loader{interfaces::MakeWalletLoader(*m_node.chain, *Assert(m_node.args))};
+    FixedVaultCandidate candidate{PrepareFixedVaultCandidate()};
+    const std::string name{"fixed_vault_corrupt_manual_loss"};
+    std::vector<bilingual_str> warnings;
+    auto installed{loader->installFixedVault(
+        name, candidate.package, candidate.mnemonics,
+        interfaces::FixedVaultInstallMode::CREATE, warnings)};
+    BOOST_REQUIRE_MESSAGE(installed, util::ErrorString(installed).original);
+    auto status{installed->wallet->getVaultStatus()};
+    BOOST_REQUIRE_EQUAL(status.participants.size(), 3U);
+    const std::string fingerprint{status.participants.front().fingerprint};
+    BOOST_REQUIRE(installed->wallet->setLostSigner(fingerprint, /*lost=*/true));
+
+    // A valid manual marker is always paired atomically with LOST_SIGNER.
+    // Simulate database corruption that removes only that required partner.
+    {
+        CWallet* internal{Assert(installed->wallet->wallet())};
+        LOCK(internal->cs_wallet);
+        BOOST_REQUIRE(WalletBatch{internal->GetDatabase()}.EraseLostSigner(fingerprint));
+    }
+    installed->wallet->remove();
+    installed->wallet.reset();
+
+    warnings.clear();
+    const auto corrupted{loader->loadWallet(name, warnings)};
+    BOOST_CHECK(!corrupted);
+    BOOST_CHECK(loader->getWallets().empty());
+}
+
+BOOST_FIXTURE_TEST_CASE(manual_loss_without_policy_binding_aborts_wallet_load, TestChain100Setup)
+{
+    auto loader{interfaces::MakeWalletLoader(*m_node.chain, *Assert(m_node.args))};
+    FixedVaultCandidate candidate{PrepareFixedVaultCandidate()};
+    const std::string name{"fixed_vault_missing_loss_binding"};
+    std::vector<bilingual_str> warnings;
+    auto installed{loader->installFixedVault(
+        name, candidate.package, candidate.mnemonics,
+        interfaces::FixedVaultInstallMode::CREATE, warnings)};
+    BOOST_REQUIRE_MESSAGE(installed, util::ErrorString(installed).original);
+    const auto status{installed->wallet->getVaultStatus()};
+    BOOST_REQUIRE_EQUAL(status.participants.size(), 3U);
+    BOOST_REQUIRE(installed->wallet->setLostSigner(
+        status.participants.front().fingerprint, /*lost=*/true));
+
+    // A manual marker without its full active-policy trust anchor is neither
+    // valid current metadata nor a legacy LOST_SIGNER-only wallet.
+    {
+        CWallet* internal{Assert(installed->wallet->wallet())};
+        LOCK(internal->cs_wallet);
+        BOOST_REQUIRE(WalletBatch{internal->GetDatabase()}.EraseVaultMetadataPolicy());
+    }
+    installed->wallet->remove();
+    installed->wallet.reset();
+
+    warnings.clear();
+    const auto corrupted{loader->loadWallet(name, warnings)};
+    BOOST_CHECK(!corrupted);
+    BOOST_CHECK(loader->getWallets().empty());
 }
 
 BOOST_FIXTURE_TEST_CASE(fixed_vault_install_failures_never_publish_final_name, TestChain100Setup)
@@ -469,6 +1010,44 @@ BOOST_FIXTURE_TEST_CASE(fixed_vault_rollback_refuses_replaced_final_path, TestCh
     BOOST_CHECK(install_error.find("final-name publication rollback failed") != std::string::npos);
     BOOST_CHECK(install_error.find("refusing to remove it") != std::string::npos);
     BOOST_CHECK(fs::is_directory(final_path));
+    BOOST_CHECK(loader->getWallets().empty());
+    CheckNoFixedVaultStages(GetWalletDir());
+
+    load_handler.reset();
+    std::error_code cleanup_error;
+    BOOST_CHECK(fs::remove(final_path, cleanup_error));
+    BOOST_CHECK(!cleanup_error);
+}
+
+BOOST_FIXTURE_TEST_CASE(fixed_vault_rollback_refuses_replaced_regular_file, TestChain100Setup)
+{
+    auto loader{interfaces::MakeWalletLoader(*m_node.chain, *Assert(m_node.args))};
+    FixedVaultCandidate candidate{PrepareFixedVaultCandidate()};
+    const std::string name{"fixed_vault_regular_replacement"};
+    const fs::path final_path{GetWalletDir() / fs::PathFromString(name)};
+    const std::string replacement_contents{"unrelated replacement file\n"};
+
+    auto load_handler{loader->handleLoadWallet([&](std::unique_ptr<interfaces::Wallet>) {
+        std::error_code error;
+        if (!fs::remove(final_path, error) || error) {
+            throw std::runtime_error{strprintf("unable to inject final-path replacement: %s", error.message())};
+        }
+        if (!WriteBinaryFile(final_path, replacement_contents)) {
+            throw std::runtime_error{"unable to inject replacement regular file"};
+        }
+        throw std::runtime_error{"injected fixed vault load failure after regular-file replacement"};
+    })};
+    std::vector<bilingual_str> warnings;
+    auto installed{loader->installFixedVault(
+        name, candidate.package, candidate.mnemonics,
+        interfaces::FixedVaultInstallMode::RESTORE, warnings)};
+    BOOST_REQUIRE(!installed);
+    const std::string install_error{util::ErrorString(installed).original};
+    BOOST_CHECK(install_error.find("final-name publication rollback failed") != std::string::npos);
+    BOOST_CHECK(install_error.find("different regular file") != std::string::npos);
+    const auto [read_ok, contents]{ReadBinaryFile(final_path)};
+    BOOST_REQUIRE(read_ok);
+    BOOST_CHECK_EQUAL(contents, replacement_contents);
     BOOST_CHECK(loader->getWallets().empty());
     CheckNoFixedVaultStages(GetWalletDir());
 

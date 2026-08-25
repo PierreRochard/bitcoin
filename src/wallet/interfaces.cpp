@@ -2,12 +2,12 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <interfaces/wallet.h>
-
 #include <common/args.h>
 #include <consensus/amount.h>
 #include <interfaces/chain.h>
 #include <interfaces/handler.h>
+#include <interfaces/wallet.h>
+#include <key_io.h>
 #include <node/types.h>
 #include <policy/fees/block_policy_estimator.h>
 #include <primitives/transaction.h>
@@ -18,14 +18,16 @@
 #include <sync.h>
 #include <uint256.h>
 #include <util/check.h>
-#include <util/translation.h>
+#include <util/strencodings.h>
 #include <util/time.h>
+#include <util/translation.h>
 #include <util/ui_change_type.h>
 #include <wallet/coincontrol.h>
 #include <wallet/context.h>
 #include <wallet/export.h>
 #include <wallet/feebumper.h>
 #include <wallet/fees.h>
+#include <wallet/fixed_vault_wallet.h>
 #include <wallet/load.h>
 #include <wallet/multisig.h>
 #include <wallet/receive.h>
@@ -296,17 +298,40 @@ public:
         return m_wallet->ListLockedCoins(outputs);
     }
     util::Result<wallet::CreatedTransactionResult> createTransaction(const std::vector<CRecipient>& recipients,
-        const CCoinControl& coin_control,
-        bool sign,
-        std::optional<unsigned int> change_pos) override
+                                                                     const CCoinControl& coin_control,
+                                                                     bool sign,
+                                                                     std::optional<unsigned int> change_pos,
+                                                                     std::optional<std::string> expected_vault_policy_commitment) override
     {
         LOCK(m_wallet->cs_wallet);
-        return CreateTransaction(*m_wallet, recipients, change_pos, coin_control, sign);
+        if (expected_vault_policy_commitment) {
+            const VaultPolicyPackage active_package{ExportWalletVaultPolicy(*m_wallet)};
+            if (active_package.policy_id.empty() ||
+                VaultPolicyCommitment(active_package) != *expected_vault_policy_commitment) {
+                return util::Error{_("The active Recovery Vault policy changed while the transaction was being prepared. Review a new transaction.")};
+            }
+        }
+        CCoinControl scoped_coin_control{coin_control};
+        if (scoped_coin_control.m_script_path && InferWalletVaultPolicy(*m_wallet).is_vault) {
+            auto scoped{ApplyVaultRecoveryToCoinControl(
+                *m_wallet, scoped_coin_control,
+                scoped_coin_control.m_nSequence,
+                scoped_coin_control.m_locktime,
+                scoped_coin_control.m_vault_recovery_sweep)};
+            if (!scoped) return util::Error{util::ErrorString(scoped)};
+        }
+        return CreateTransaction(*m_wallet, recipients, change_pos, scoped_coin_control, sign);
     }
-    void commitTransaction(CTransactionRef tx, const std::vector<std::string>& messages) override
+    bool commitTransaction(
+        CTransactionRef tx,
+        const std::vector<std::string>& messages,
+        const std::optional<VaultCommitState>& expected_vault_state) override
     {
         LOCK(m_wallet->cs_wallet);
-        m_wallet->CommitTransaction(std::move(tx), /*replaces_txid=*/std::nullopt, /*comment=*/std::nullopt, /*comment_to=*/std::nullopt, messages);
+        return m_wallet->CommitTransaction(
+            std::move(tx), /*replaces_txid=*/std::nullopt,
+            /*comment=*/std::nullopt, /*comment_to=*/std::nullopt,
+            messages, /*payment_requests=*/{}, expected_vault_state);
     }
     bool transactionCanBeAbandoned(const Txid& txid) override { return m_wallet->TransactionCanBeAbandoned(txid); }
     bool abandonTransaction(const Txid& txid) override
@@ -328,13 +353,21 @@ public:
         std::vector<CTxOut> outputs; // just an empty list of new recipients for now
         return feebumper::CreateRateBumpTransaction(*m_wallet.get(), txid, coin_control, errors, old_fee, new_fee, mtx, /* require_mine= */ true, outputs) == feebumper::Result::OK;
     }
-    bool signBumpTransaction(CMutableTransaction& mtx) override { return feebumper::SignTransaction(*m_wallet.get(), mtx); }
-    bool commitBumpTransaction(const Txid& txid,
-        CMutableTransaction&& mtx,
-        std::vector<bilingual_str>& errors,
-        Txid& bumped_txid) override
+    bool signBumpTransaction(
+        CMutableTransaction& mtx,
+        std::optional<VaultCommitState>* signed_vault_state) override
     {
-        return feebumper::CommitTransaction(*m_wallet.get(), txid, std::move(mtx), errors, bumped_txid) ==
+        return feebumper::SignTransaction(*m_wallet.get(), mtx, signed_vault_state);
+    }
+    bool commitBumpTransaction(const Txid& txid,
+                               CMutableTransaction&& mtx,
+                               std::vector<bilingual_str>& errors,
+                               Txid& bumped_txid,
+                               const std::optional<VaultCommitState>& expected_vault_state) override
+    {
+        return feebumper::CommitTransaction(
+                   *m_wallet.get(), txid, std::move(mtx), errors, bumped_txid,
+                   expected_vault_state) ==
                feebumper::Result::OK;
     }
     CTransactionRef getTx(const Txid& txid) override
@@ -403,11 +436,13 @@ public:
         return {};
     }
     std::optional<PSBTError> fillPSBT(const common::PSBTFillOptions& options,
-        size_t* n_signed,
-        PartiallySignedTransaction& psbtx,
-        bool& complete) override
+                                      size_t* n_signed,
+                                      PartiallySignedTransaction& psbtx,
+                                      bool& complete,
+                                      std::optional<VaultCommitState>* signed_vault_state) override
     {
-        return m_wallet->FillPSBT(psbtx, options, complete, n_signed);
+        return m_wallet->FillPSBT(
+            psbtx, options, complete, n_signed, signed_vault_state);
     }
     WalletBalances getBalances() override
     {
@@ -443,20 +478,29 @@ public:
     CAmount getAvailableBalance(const CCoinControl& coin_control) override
     {
         LOCK(m_wallet->cs_wallet);
+        CCoinControl scoped_coin_control{coin_control};
+        if (scoped_coin_control.m_script_path && InferWalletVaultPolicy(*m_wallet).is_vault) {
+            auto scoped{ApplyVaultRecoveryToCoinControl(
+                *m_wallet, scoped_coin_control,
+                scoped_coin_control.m_nSequence,
+                scoped_coin_control.m_locktime,
+                scoped_coin_control.m_vault_recovery_sweep)};
+            if (!scoped) return 0;
+        }
         CAmount total_amount = 0;
         // Fetch selected coins total amount
-        if (coin_control.HasSelected()) {
+        if (scoped_coin_control.HasSelected()) {
             FastRandomContext rng{};
             CoinSelectionParams params(rng);
             // Note: for now, swallow any error.
-            if (auto res = FetchSelectedInputs(*m_wallet, coin_control, params)) {
+            if (auto res = FetchSelectedInputs(*m_wallet, scoped_coin_control, params)) {
                 total_amount += res->GetTotalAmount();
             }
         }
 
         // And fetch the wallet available coins
-        if (coin_control.m_allow_other_inputs) {
-            total_amount += AvailableCoins(*m_wallet, &coin_control).GetTotalAmount();
+        if (scoped_coin_control.m_allow_other_inputs) {
+            total_amount += AvailableCoins(*m_wallet, &scoped_coin_control).GetTotalAmount();
         }
 
         return total_amount;
@@ -546,24 +590,74 @@ public:
     }
     VaultStatus getVaultStatus() override {
         LOCK(m_wallet->cs_wallet);
-        const auto br = GetVaultBalanceBreakdown(*m_wallet);
+        const auto br = GetVaultBalanceBreakdown(*m_wallet, /*require_available_signers=*/false);
+        const VaultPolicyPackage package{ExportWalletVaultPolicy(*m_wallet)};
+        const bool metadata_matches_policy{
+            !package.policy_id.empty() &&
+            m_wallet->m_vault_metadata_policy_commitment == VaultPolicyCommitment(package)};
         VaultStatus st;
         st.is_vault = br.is_vault;
-        st.is_fixed_staged_vault = IsFixedStagedVault(*m_wallet);
+        st.is_fixed_staged_vault = bool(ValidateFixedStagedVaultPolicy(package));
+        if (!package.policy_id.empty()) st.policy_commitment = VaultPolicyCommitment(package);
         st.genesis_rescan_required = m_wallet->IsWalletFlagSet(WALLET_FLAG_GENESIS_RESCAN_REQUIRED);
+        // Setup truth and signer metadata are scoped to the exact active
+        // policy. Activating another descriptor must never inherit a previous
+        // address verification or a colliding fingerprint's source/loss.
+        if (metadata_matches_policy) {
+            st.setup_state = m_wallet->m_vault_setup_state;
+            st.verification_state = m_wallet->m_vault_verification_state;
+        }
         st.older = br.policy.older;
         st.after = br.policy.after;
         st.recovery_m = br.policy.recovery_m;
+        st.immediate = br.immediate;
         st.recoverable_now = br.recoverable_now;
         st.awaiting_maturity = br.awaiting;
         st.earliest_blocks_remaining = br.earliest_blocks_remaining;
-        st.lost_signers.assign(m_wallet->m_lost_signers.begin(), m_wallet->m_lost_signers.end());
-        const VaultPolicyPackage package{ExportWalletVaultPolicy(*m_wallet)};
+        if (metadata_matches_policy) {
+            st.lost_signers.assign(m_wallet->m_lost_signers.begin(), m_wallet->m_lost_signers.end());
+            st.manually_lost_signers.assign(m_wallet->m_manually_lost_signers.begin(), m_wallet->m_manually_lost_signers.end());
+        }
         if (auto participants{FixedVaultParticipants(package)}) {
+            auto* const descriptor_manager = dynamic_cast<DescriptorScriptPubKeyMan*>(
+                m_wallet->GetScriptPubKeyMan(OutputType::BECH32M, /*internal=*/false));
             for (auto& participant : *participants) {
+                const bool is_lost{metadata_matches_policy &&
+                                   m_wallet->m_lost_signers.contains(participant.fingerprint)};
+                VaultParticipantType type{VaultParticipantType::UNKNOWN};
+                if (metadata_matches_policy) {
+                    if (const auto it = m_wallet->m_vault_participant_types.find(participant.fingerprint);
+                        it != m_wallet->m_vault_participant_types.end()) {
+                        type = it->second;
+                    }
+                }
+
+                // Old wallets have no participant-source metadata. Local
+                // software ownership can still be established exactly from
+                // the private account key stored for the participant;
+                // external source kinds intentionally remain unknown.
+                if (type == VaultParticipantType::UNKNOWN && descriptor_manager) {
+                    const CExtPubKey account{DecodeExtPubKey(participant.xpub)};
+                    if (account.pubkey.IsValid()) {
+                        LOCK(descriptor_manager->cs_desc_man);
+                        if (descriptor_manager->HasPrivKey(account.pubkey.GetID())) {
+                            type = VaultParticipantType::LOCAL_SOFTWARE;
+                        }
+                    }
+                }
+
+                VaultSignerAvailability availability{VaultSignerAvailability::UNKNOWN};
+                if (type == VaultParticipantType::LOCAL_SOFTWARE && !is_lost) {
+                    availability = VaultSignerAvailability::AVAILABLE;
+                } else if (type == VaultParticipantType::AIR_GAPPED || is_lost) {
+                    availability = VaultSignerAvailability::UNAVAILABLE;
+                }
                 st.participants.push_back({std::move(participant.fingerprint),
                                            std::move(participant.path),
-                                           std::move(participant.xpub)});
+                                           std::move(participant.xpub),
+                                           type,
+                                           availability,
+                                           is_lost});
             }
         }
         for (const auto& stage : br.recovery_stages) {
@@ -578,11 +672,59 @@ public:
         }
         return st;
     }
-    void setLostSigner(const std::string& fingerprint, bool lost) override {
+    VaultRenewalStatus getVaultRenewalStatus() override
+    {
+        return wallet::GetVaultRenewalStatus(*m_wallet);
+    }
+    util::Result<VaultRenewalPlan> planVaultRenewal(
+        const VaultRenewalRequest& request) override
+    {
+        return wallet::PlanVaultRenewal(*m_wallet, request);
+    }
+    util::Result<VaultRenewalBatch> createVaultRenewalBatch(
+        const VaultRenewalPlan& plan, const CCoinControl& fee_control) override
+    {
+        return wallet::CreateVaultRenewalBatch(*m_wallet, plan, fee_control);
+    }
+    util::Result<void> signVaultRenewalTransaction(
+        VaultRenewalBatch& batch, size_t transaction_index) override
+    {
+        return wallet::SignVaultRenewalTransaction(*m_wallet, batch, transaction_index);
+    }
+    util::Result<VaultRenewalCommitResult> commitVaultRenewalBatch(
+        const VaultRenewalBatch& batch) override
+    {
+        return wallet::CommitVaultRenewalBatch(*m_wallet, batch);
+    }
+    bool setLostSigner(
+        const std::string& fingerprint, bool lost,
+        const std::optional<std::string>& expected_policy_commitment) override
+    {
         LOCK(m_wallet->cs_wallet);
-        if (!m_wallet->SetLostSigner(fingerprint, lost)) {
+        if (!m_wallet->SetLostSigner(fingerprint, lost, expected_policy_commitment)) {
             m_wallet->WalletLogPrintf("Unable to persist unavailable vault signer %s\n", fingerprint);
+            return false;
         }
+        return true;
+    }
+    bool clearAutomaticallyLostSigner(
+        const std::string& fingerprint,
+        const std::optional<std::string>& expected_policy_commitment) override
+    {
+        LOCK(m_wallet->cs_wallet);
+        return m_wallet->ClearAutomaticallyLostSigner(fingerprint, expected_policy_commitment);
+    }
+    bool setVaultSetupState(VaultSetupState setup, VaultVerificationState verification,
+                            const std::optional<std::string>& expected_policy_commitment) override
+    {
+        LOCK(m_wallet->cs_wallet);
+        return m_wallet->SetVaultSetupState(setup, verification, expected_policy_commitment);
+    }
+    bool setVaultParticipantType(const std::string& fingerprint, VaultParticipantType type,
+                                 const std::optional<std::string>& expected_policy_commitment) override
+    {
+        LOCK(m_wallet->cs_wallet);
+        return m_wallet->SetVaultParticipantType(fingerprint, type, expected_policy_commitment);
     }
     std::string exportVaultPolicy() override {
         LOCK(m_wallet->cs_wallet);
@@ -656,29 +798,83 @@ public:
             return util::Error{Untranslated("Wallet is currently rescanning. Abort it or wait before retrying the vault rescan.")};
         }
 
-        uint256 genesis;
+        uint256 start_block;
+        int start_height{0};
+        std::string scan_policy_commitment;
         {
             LOCK(m_wallet->cs_wallet);
             const int tip_height = m_wallet->GetLastBlockHeight();
+            const uint256 tip_hash{m_wallet->GetLastBlockHash()};
             if (tip_height < 0 ||
-                !m_wallet->chain().hasBlocks(m_wallet->GetLastBlockHash(), /*min_height=*/0, /*max_height=*/{})) {
-                return util::Error{Untranslated("A complete vault restore requires unpruned block data back to genesis")};
-            }
-            if (!m_wallet->chain().findAncestorByHeight(m_wallet->GetLastBlockHash(), /*ancestor_height=*/0,
-                                                        FoundBlock().hash(genesis))) {
+                !m_wallet->chain().findAncestorByHeight(tip_hash, /*ancestor_height=*/0,
+                                                        FoundBlock().hash(start_block))) {
                 return util::Error{Untranslated("Unable to locate the genesis block for the vault rescan")};
+            }
+            const VaultPolicyPackage active_package{ExportWalletVaultPolicy(*m_wallet)};
+            if (!ValidateFixedStagedVaultPolicy(active_package)) {
+                return util::Error{Untranslated("The active wallet policy is not a valid fixed Recovery Vault")};
+            }
+            scan_policy_commitment = VaultPolicyCommitment(active_package);
+
+            // A user-requested pause or orderly shutdown stores the last
+            // contiguous block scanned under a vault-specific key. Never use
+            // the ordinary best-block locator here: tip notifications can
+            // advance it independently of historical scan completeness.
+            WalletBatch batch{m_wallet->GetDatabase()};
+            int checkpoint_height{-1};
+            uint256 checkpoint_hash;
+            std::string checkpoint_policy_commitment;
+            if (batch.ReadVaultRescanProgress(checkpoint_height, checkpoint_hash,
+                                              checkpoint_policy_commitment)) {
+                uint256 active_hash;
+                const bool valid_checkpoint = checkpoint_height >= 0 && checkpoint_height <= tip_height &&
+                                              checkpoint_policy_commitment == scan_policy_commitment &&
+                                              m_wallet->chain().findAncestorByHeight(
+                                                  tip_hash, checkpoint_height, FoundBlock().hash(active_hash)) &&
+                                              active_hash == checkpoint_hash;
+                if (valid_checkpoint) {
+                    start_height = checkpoint_height;
+                    start_block = checkpoint_hash;
+                } else if (!batch.EraseVaultRescanProgress()) {
+                    return util::Error{Untranslated("The saved Recovery Vault scan checkpoint was invalid and could not be cleared")};
+                }
+            }
+            if (!m_wallet->chain().hasBlocks(tip_hash, /*min_height=*/start_height, /*max_height=*/{})) {
+                return util::Error{Untranslated(start_height == 0 ? "A complete vault restore requires unpruned block data back to genesis" : strprintf("Resuming this vault restore requires block data from saved height %d", start_height))};
             }
         }
         const CWallet::ScanResult scan = m_wallet->ScanForWalletTransactions(
-            genesis, /*start_height=*/0, /*max_height=*/{}, reserver, /*save_progress=*/true);
+            start_block, start_height, /*max_height=*/{}, reserver, /*save_progress=*/true);
         if (scan.status == CWallet::ScanResult::FAILURE) {
-            return util::Error{Untranslated("The vault is installed, but its historical blockchain rescan failed. Retry the rescan from genesis.")};
+            return util::Error{Untranslated("The vault is installed, but its historical blockchain rescan failed. Retry the scan after complete block data is available.")};
         }
         if (scan.status == CWallet::ScanResult::USER_ABORT) {
-            return util::Error{Untranslated("The vault is installed, but its historical blockchain rescan was aborted. Retry the rescan from genesis.")};
+            bool checkpoint_saved{false};
+            if (scan.last_scanned_height && scan.last_failed_block.IsNull()) {
+                LOCK(m_wallet->cs_wallet);
+                const VaultPolicyPackage current_package{ExportWalletVaultPolicy(*m_wallet)};
+                if (VaultPolicyCommitment(current_package) == scan_policy_commitment) {
+                    checkpoint_saved = WalletBatch{m_wallet->GetDatabase()}.WriteVaultRescanProgress(
+                        *scan.last_scanned_height, scan.last_scanned_block,
+                        scan_policy_commitment);
+                }
+            }
+            return util::Error{Untranslated(checkpoint_saved ? strprintf("The vault scan was paused after height %d. Resume it from the Recovery Vault dashboard.", *scan.last_scanned_height) : "The vault scan was interrupted before a safe checkpoint could be saved. Retry it from the Recovery Vault dashboard.")};
+        }
+        if (!scan.last_scanned_height) {
+            return util::Error{Untranslated("The vault scan returned without a last scanned block; sending remains blocked")};
         }
         {
             LOCK(m_wallet->cs_wallet);
+            WalletBatch batch{m_wallet->GetDatabase()};
+            const VaultPolicyPackage current_package{ExportWalletVaultPolicy(*m_wallet)};
+            if (VaultPolicyCommitment(current_package) != scan_policy_commitment) {
+                batch.EraseVaultRescanProgress();
+                return util::Error{Untranslated("The active Recovery Vault policy changed during its scan. Restart the scan from genesis for the new policy")};
+            }
+            if (!batch.EraseVaultRescanProgress()) {
+                return util::Error{Untranslated("The genesis rescan completed, but its saved checkpoint could not be cleared")};
+            }
             m_wallet->SetLastBlockProcessed(*scan.last_scanned_height, scan.last_scanned_block);
             try {
                 m_wallet->UnsetWalletFlag(WALLET_FLAG_GENESIS_RESCAN_REQUIRED);
@@ -794,105 +990,26 @@ public:
         const std::string& canonical_package,
         const std::vector<SecureString>& mnemonics,
         interfaces::FixedVaultInstallMode mode,
-        std::vector<bilingual_str>& warnings) override
+        std::vector<bilingual_str>& warnings,
+        interfaces::FixedVaultExternalSigning external_signing) override
     {
-        VaultPolicyPackage package;
-        try {
-            auto parsed{ParseVaultPolicyPackage(canonical_package)};
-            if (!parsed) return util::Error{util::ErrorString(parsed)};
-            package = std::move(*parsed);
-        } catch (const std::exception& e) {
-            return util::Error{Untranslated(strprintf("Invalid fixed vault policy package: %s", e.what()))};
-        }
-        if (FormatVaultPolicyPackage(package) != canonical_package) {
-            return util::Error{Untranslated("Fixed vault installation requires the exact canonical public policy package")};
-        }
-        if (auto fixed{ValidateFixedStagedVaultPolicy(package)}; !fixed) {
-            return util::Error{util::ErrorString(fixed)};
-        }
-
-        const fs::path name_path{fs::PathFromString(name)};
-        if (name.empty() || name_path.has_parent_path() || name_path.filename() != name_path) {
-            return util::Error{Untranslated("Fixed vault installation requires a simple wallet name without path components")};
-        }
-        const fs::path wallet_dir{GetWalletDir()};
-        const std::string stage_name{".bitcoin-fixed-vault-stage-" + GetRandHash().GetHex()};
-        const fs::path stage_dir{fsbridge::AbsPathJoin(wallet_dir, fs::PathFromString(stage_name))};
-        struct StageCleanup {
-            fs::path path;
-            ~StageCleanup()
-            {
-                std::error_code error;
-                fs::remove_all(path, error);
-            }
-        } stage_cleanup{stage_dir};
-
-        uint64_t flags{WALLET_FLAG_DESCRIPTORS | WALLET_FLAG_BLANK_WALLET};
-        if (mnemonics.size() < 3) flags |= WALLET_FLAG_EXTERNAL_SIGNER;
-        if (mnemonics.empty()) flags |= WALLET_FLAG_DISABLE_PRIVATE_KEYS;
-
-        DatabaseOptions options;
-        ReadDatabaseArgs(*Assert(m_context.args), options);
-        options.require_create = true;
-        options.require_format = DatabaseFormat::SQLITE;
-        options.create_flags = flags;
-        DatabaseStatus status;
-        bilingual_str error;
-        std::unique_ptr<WalletDatabase> database{MakeWalletDatabase(stage_name, options, status, error)};
-        if (!database) {
-            return util::Error{Untranslated("Unable to create fixed vault staging database: ") + error};
-        }
-        const fs::path stage_database{fs::PathFromString(database->Filename())};
-        // The staged wallet must stay detached: registering validation
-        // callbacks would retain a shared pointer and keep SQLite's exclusive
-        // lock alive across publication.
-        WalletContext staging_context;
-        staging_context.args = m_context.args;
-        std::shared_ptr<CWallet> staged{CWallet::CreateNew(
-            staging_context, stage_name, std::move(database), flags, /*born_encrypted=*/false,
-            error, warnings)};
-        if (!staged) {
-            return util::Error{Untranslated("Unable to initialize fixed vault staging wallet: ") + error};
-        }
-
-        const uint64_t creation_time{mode == interfaces::FixedVaultInstallMode::RESTORE
-            ? uint64_t{0}
-            : static_cast<uint64_t>(GetTime())};
-        auto installed = [&] {
-            LOCK(staged->cs_wallet);
-            auto result{InstallFixedVaultPolicy(
-                *staged, package, mnemonics, creation_time,
-                /*persist_unavailable_as_lost=*/mode == interfaces::FixedVaultInstallMode::RESTORE)};
-            if (result && mode == interfaces::FixedVaultInstallMode::RESTORE) {
-                staged->SetWalletFlag(WALLET_FLAG_GENESIS_RESCAN_REQUIRED);
-            }
-            return result;
-        }();
+        auto installed{InstallFixedVaultWallet(
+            m_context, name, canonical_package, mnemonics,
+            mode == interfaces::FixedVaultInstallMode::CREATE
+                ? FixedVaultWalletInstallMode::CREATE
+                : FixedVaultWalletInstallMode::RESTORE,
+            warnings,
+            external_signing == interfaces::FixedVaultExternalSigning::ENABLED)};
         if (!installed) return util::Error{util::ErrorString(installed)};
-        if (installed->size() != mnemonics.size()) {
-            return util::Error{Untranslated("Fixed vault staging wallet did not install every validated recovery key")};
-        }
-        {
-            LOCK(staged->cs_wallet);
-            if (FormatVaultPolicyPackage(ExportWalletVaultPolicy(*staged)) != canonical_package) {
-                return util::Error{Untranslated("Fixed vault staging wallet does not reproduce the canonical recovery policy")};
-            }
-        }
-        staged.reset();
-
-        std::shared_ptr<CWallet> published{PublishStagedVaultWallet(
-            m_context, stage_dir, stage_database, name, /*load_on_start=*/true,
-            status, error, warnings)};
-        if (!published) return util::Error{error};
 
         std::vector<interfaces::Wallet::VaultMnemonicMatch> matches;
-        matches.reserve(installed->size());
-        for (auto& match : *installed) {
+        matches.reserve(installed->mnemonic_matches.size());
+        for (auto& match : installed->mnemonic_matches) {
             matches.push_back({match.mnemonic_index, std::move(match.fingerprint),
                                std::move(match.path), std::move(match.xpub)});
         }
         return interfaces::FixedVaultInstallResult{
-            MakeWallet(m_context, std::move(published)),
+            MakeWallet(m_context, std::move(installed->wallet)),
             std::move(matches),
         };
     }

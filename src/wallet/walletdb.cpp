@@ -45,6 +45,7 @@ const std::string KEYMETA{"keymeta"};
 const std::string KEY{"key"};
 const std::string LOCKED_UTXO{"lockedutxo"};
 const std::string LOST_SIGNER{"lostsigner"};
+const std::string MANUAL_LOST_SIGNER{"manuallostsigner"};
 const std::string MASTER_KEY{"mkey"};
 const std::string MINVERSION{"minversion"};
 const std::string NAME{"name"};
@@ -54,6 +55,10 @@ const std::string POOL{"pool"};
 const std::string PURPOSE{"purpose"};
 const std::string SETTINGS{"settings"};
 const std::string TX{"tx"};
+const std::string VAULT_METADATA_POLICY{"vaultmetadatapolicy"};
+const std::string VAULT_PARTICIPANT_TYPE{"vaultparticipanttype"};
+const std::string VAULT_RESCAN_PROGRESS{"vaultrescanprogress"};
+const std::string VAULT_STATE{"vaultstate"};
 const std::string WTX_VARIANT{"wtxvariant"};
 const std::string VERSION{"version"};
 const std::string WALLETDESCRIPTOR{"walletdescriptor"};
@@ -304,6 +309,70 @@ bool WalletBatch::WriteLostSigner(const std::string& fingerprint)
 bool WalletBatch::EraseLostSigner(const std::string& fingerprint)
 {
     return EraseIC(std::make_pair(DBKeys::LOST_SIGNER, fingerprint));
+}
+
+bool WalletBatch::WriteManualLostSigner(const std::string& fingerprint)
+{
+    return WriteIC(std::make_pair(DBKeys::MANUAL_LOST_SIGNER, fingerprint), uint8_t{'1'});
+}
+
+bool WalletBatch::EraseManualLostSigner(const std::string& fingerprint)
+{
+    return EraseIC(std::make_pair(DBKeys::MANUAL_LOST_SIGNER, fingerprint));
+}
+
+bool WalletBatch::WriteVaultState(VaultSetupState setup, VaultVerificationState verification)
+{
+    return WriteIC(DBKeys::VAULT_STATE,
+                   std::pair{static_cast<uint8_t>(setup), static_cast<uint8_t>(verification)});
+}
+
+bool WalletBatch::EraseVaultState()
+{
+    return EraseIC(DBKeys::VAULT_STATE);
+}
+
+bool WalletBatch::WriteVaultParticipantType(const std::string& fingerprint, VaultParticipantType type)
+{
+    return WriteIC(std::make_pair(DBKeys::VAULT_PARTICIPANT_TYPE, fingerprint), static_cast<uint8_t>(type));
+}
+
+bool WalletBatch::EraseVaultParticipantType(const std::string& fingerprint)
+{
+    return EraseIC(std::make_pair(DBKeys::VAULT_PARTICIPANT_TYPE, fingerprint));
+}
+
+bool WalletBatch::WriteVaultMetadataPolicy(const std::string& policy_commitment)
+{
+    return WriteIC(DBKeys::VAULT_METADATA_POLICY, policy_commitment);
+}
+
+bool WalletBatch::EraseVaultMetadataPolicy()
+{
+    return EraseIC(DBKeys::VAULT_METADATA_POLICY);
+}
+
+bool WalletBatch::WriteVaultRescanProgress(int height, const uint256& block_hash,
+                                           const std::string& policy_commitment)
+{
+    return WriteIC(DBKeys::VAULT_RESCAN_PROGRESS,
+                   std::pair{std::pair{height, block_hash}, policy_commitment});
+}
+
+bool WalletBatch::ReadVaultRescanProgress(int& height, uint256& block_hash,
+                                          std::string& policy_commitment)
+{
+    std::pair<std::pair<int, uint256>, std::string> progress;
+    if (!m_batch->Read(DBKeys::VAULT_RESCAN_PROGRESS, progress)) return false;
+    height = progress.first.first;
+    block_hash = progress.first.second;
+    policy_commitment = std::move(progress.second);
+    return true;
+}
+
+bool WalletBatch::EraseVaultRescanProgress()
+{
+    return EraseIC(DBKeys::VAULT_RESCAN_PROGRESS);
 }
 
 bool LoadKey(CWallet* pwallet, DataStream& ssKey, DataStream& ssValue, std::string& strErr)
@@ -1123,6 +1192,109 @@ static DBErrors LoadLostSignerRecords(CWallet* pwallet, DatabaseBatch& batch) EX
     return result.m_result;
 }
 
+static DBErrors LoadManualLostSignerRecords(CWallet* pwallet, DatabaseBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
+{
+    AssertLockHeld(pwallet->cs_wallet);
+    const LoadResult result = LoadRecords(pwallet, batch, DBKeys::MANUAL_LOST_SIGNER,
+                                          [](CWallet* pwallet, DataStream& key, DataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
+                                              try {
+                                                  std::string fingerprint;
+                                                  uint8_t marker;
+                                                  key >> fingerprint;
+                                                  value >> marker;
+                                                  fingerprint = ToLower(fingerprint);
+                                                  if (!key.empty() || !value.empty() || fingerprint.size() != 8 || !IsHex(fingerprint) ||
+                                                      marker != uint8_t{'1'} || !pwallet->m_lost_signers.contains(fingerprint)) {
+                                                      err = "Error reading wallet database: invalid manually lost signer record";
+                                                      return DBErrors::CORRUPT;
+                                                  }
+                                                  pwallet->m_manually_lost_signers.insert(std::move(fingerprint));
+                                              } catch (const std::exception& e) {
+                                                  err = strprintf("Error reading wallet database: invalid manually lost signer record: %s", e.what());
+                                                  return DBErrors::CORRUPT;
+                                              }
+                                              return DBErrors::LOAD_OK;
+                                          });
+    return result.m_result;
+}
+
+static DBErrors LoadVaultMetadataPolicyRecords(CWallet* pwallet, DatabaseBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
+{
+    AssertLockHeld(pwallet->cs_wallet);
+    const LoadResult result = LoadRecords(pwallet, batch, DBKeys::VAULT_METADATA_POLICY,
+                                          [](CWallet* pwallet, DataStream& key, DataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
+                                              try {
+                                                  std::string policy_commitment;
+                                                  value >> policy_commitment;
+                                                  if (!key.empty() || !value.empty() || policy_commitment.size() != 64 || !IsHex(policy_commitment)) {
+                                                      err = "Error reading wallet database: invalid Recovery Vault metadata policy binding";
+                                                      return DBErrors::CORRUPT;
+                                                  }
+                                                  pwallet->m_vault_metadata_policy_commitment = ToLower(policy_commitment);
+                                              } catch (const std::exception& e) {
+                                                  err = strprintf("Error reading wallet database: invalid Recovery Vault metadata policy binding: %s", e.what());
+                                                  return DBErrors::CORRUPT;
+                                              }
+                                              return DBErrors::LOAD_OK;
+                                          });
+    return result.m_result;
+}
+
+static DBErrors LoadVaultStateRecords(CWallet* pwallet, DatabaseBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
+{
+    AssertLockHeld(pwallet->cs_wallet);
+    const LoadResult result = LoadRecords(pwallet, batch, DBKeys::VAULT_STATE,
+                                          [](CWallet* pwallet, DataStream& key, DataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
+                                              try {
+                                                  uint8_t setup_raw;
+                                                  uint8_t verification_raw;
+                                                  value >> setup_raw;
+                                                  value >> verification_raw;
+                                                  const auto setup = static_cast<VaultSetupState>(setup_raw);
+                                                  const auto verification = static_cast<VaultVerificationState>(verification_raw);
+                                                  if (!key.empty() || !value.empty() || !IsValidVaultSetupState(setup) ||
+                                                      !IsValidVaultVerificationState(verification) || !IsConsistentVaultState(setup, verification)) {
+                                                      err = "Error reading wallet database: invalid Recovery Vault setup state";
+                                                      return DBErrors::NONCRITICAL_ERROR;
+                                                  }
+                                                  pwallet->m_vault_setup_state = setup;
+                                                  pwallet->m_vault_verification_state = verification;
+                                              } catch (const std::exception& e) {
+                                                  err = strprintf("Error reading wallet database: invalid Recovery Vault setup state: %s", e.what());
+                                                  return DBErrors::NONCRITICAL_ERROR;
+                                              }
+                                              return DBErrors::LOAD_OK;
+                                          });
+    return result.m_result;
+}
+
+static DBErrors LoadVaultParticipantTypeRecords(CWallet* pwallet, DatabaseBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
+{
+    AssertLockHeld(pwallet->cs_wallet);
+    const LoadResult result = LoadRecords(pwallet, batch, DBKeys::VAULT_PARTICIPANT_TYPE,
+                                          [](CWallet* pwallet, DataStream& key, DataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
+                                              try {
+                                                  std::string fingerprint;
+                                                  uint8_t type_raw;
+                                                  key >> fingerprint;
+                                                  value >> type_raw;
+                                                  const auto type = static_cast<VaultParticipantType>(type_raw);
+                                                  fingerprint = ToLower(fingerprint);
+                                                  if (!key.empty() || !value.empty() || fingerprint.size() != 8 || !IsHex(fingerprint) ||
+                                                      !IsValidVaultParticipantType(type) || type == VaultParticipantType::UNKNOWN) {
+                                                      err = "Error reading wallet database: invalid Recovery Vault participant type";
+                                                      return DBErrors::NONCRITICAL_ERROR;
+                                                  }
+                                                  pwallet->m_vault_participant_types.emplace(std::move(fingerprint), type);
+                                              } catch (const std::exception& e) {
+                                                  err = strprintf("Error reading wallet database: invalid Recovery Vault participant type: %s", e.what());
+                                                  return DBErrors::NONCRITICAL_ERROR;
+                                              }
+                                              return DBErrors::LOAD_OK;
+                                          });
+    return result.m_result;
+}
+
 static DBErrors LoadActiveSPKMs(CWallet* pwallet, DatabaseBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
 {
     AssertLockHeld(pwallet->cs_wallet);
@@ -1215,6 +1387,21 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
 
         // Load persistent local metadata for unavailable vault signers.
         result = std::max(LoadLostSignerRecords(pwallet, *m_batch), result);
+        result = std::max(LoadManualLostSignerRecords(pwallet, *m_batch), result);
+
+        // Recovery Vault setup truth and participant source metadata are
+        // optional. Their absence is intentionally represented as unknown.
+        result = std::max(LoadVaultMetadataPolicyRecords(pwallet, *m_batch), result);
+        result = std::max(LoadVaultStateRecords(pwallet, *m_batch), result);
+        result = std::max(LoadVaultParticipantTypeRecords(pwallet, *m_batch), result);
+        // Manual loss provenance is policy-scoped security metadata. A valid
+        // writer always stores its full policy commitment in the same wallet;
+        // without that trust anchor the marker must never be reinterpreted as
+        // legacy automatic loss and silently cleared during migration.
+        if (!pwallet->m_manually_lost_signers.empty() &&
+            pwallet->m_vault_metadata_policy_commitment.empty()) {
+            result = DBErrors::CORRUPT;
+        }
     } catch (std::runtime_error& e) {
         // Exceptions that can be ignored or treated as non-critical are handled by the individual loading functions.
         // Any uncaught exceptions will be caught here and treated as critical.

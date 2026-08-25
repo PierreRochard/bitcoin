@@ -17,6 +17,8 @@
 #include <util/fs.h>
 #include <util/result.h>
 #include <util/ui_change_type.h>
+#include <wallet/vault_state.h>
+#include <wallet/vault_renewal.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -65,6 +67,11 @@ struct WalletMigrationResult;
 class Wallet
 {
 public:
+    using VaultSetupState = wallet::VaultSetupState;
+    using VaultVerificationState = wallet::VaultVerificationState;
+    using VaultParticipantType = wallet::VaultParticipantType;
+    using VaultSignerAvailability = wallet::VaultSignerAvailability;
+
     virtual ~Wallet() = default;
 
     //! Encrypt wallet.
@@ -187,12 +194,17 @@ public:
 
     //! Create transaction.
     virtual util::Result<wallet::CreatedTransactionResult> createTransaction(const std::vector<wallet::CRecipient>& recipients,
-        const wallet::CCoinControl& coin_control,
-        bool sign,
-        std::optional<unsigned int> change_pos) = 0;
+                                                                             const wallet::CCoinControl& coin_control,
+                                                                             bool sign,
+                                                                             std::optional<unsigned int> change_pos,
+                                                                             std::optional<std::string> expected_vault_policy_commitment = std::nullopt) = 0;
 
-    //! Commit transaction.
-    virtual void commitTransaction(CTransactionRef tx, const std::vector<std::string>& messages) = 0;
+    //! Commit transaction. If supplied, expected_vault_state is compared under
+    //! the wallet lock before the transaction is added or broadcast.
+    virtual bool commitTransaction(
+        CTransactionRef tx,
+        const std::vector<std::string>& messages,
+        const std::optional<wallet::VaultCommitState>& expected_vault_state = std::nullopt) = 0;
 
     //! Return whether transaction can be abandoned.
     virtual bool transactionCanBeAbandoned(const Txid& txid) = 0;
@@ -212,13 +224,16 @@ public:
         CMutableTransaction& mtx) = 0;
 
     //! Sign bump transaction.
-    virtual bool signBumpTransaction(CMutableTransaction& mtx) = 0;
+    virtual bool signBumpTransaction(
+        CMutableTransaction& mtx,
+        std::optional<wallet::VaultCommitState>* signed_vault_state = nullptr) = 0;
 
     //! Commit bump transaction.
     virtual bool commitBumpTransaction(const Txid& txid,
-        CMutableTransaction&& mtx,
-        std::vector<bilingual_str>& errors,
-        Txid& bumped_txid) = 0;
+                                       CMutableTransaction&& mtx,
+                                       std::vector<bilingual_str>& errors,
+                                       Txid& bumped_txid,
+                                       const std::optional<wallet::VaultCommitState>& expected_vault_state = std::nullopt) = 0;
 
     //! Get a transaction.
     virtual CTransactionRef getTx(const Txid& txid) = 0;
@@ -245,9 +260,10 @@ public:
 
     //! Fill PSBT.
     virtual std::optional<common::PSBTError> fillPSBT(const common::PSBTFillOptions& options,
-        size_t* n_signed,
-        PartiallySignedTransaction& psbtx,
-        bool& complete) = 0;
+                                                      size_t* n_signed,
+                                                      PartiallySignedTransaction& psbtx,
+                                                      bool& complete,
+                                                      std::optional<wallet::VaultCommitState>* signed_vault_state = nullptr) = 0;
 
     //! Get balances.
     virtual WalletBalances getBalances() = 0;
@@ -316,6 +332,9 @@ public:
             std::string fingerprint;
             std::string path;
             std::string xpub;
+            VaultParticipantType type{VaultParticipantType::UNKNOWN};
+            VaultSignerAvailability availability{VaultSignerAvailability::UNKNOWN};
+            bool is_lost{false};
         };
         struct VaultRecoveryStage {
             int nrequired{0};
@@ -327,19 +346,70 @@ public:
         };
         bool is_vault{false};
         bool is_fixed_staged_vault{false};
+        //! Full commitment to the active policy, used as an internal
+        //! compare-and-set token rather than as a user-facing identifier.
+        std::string policy_commitment;
         bool genesis_rescan_required{false};
+        VaultSetupState setup_state{VaultSetupState::NOT_RECORDED};
+        VaultVerificationState verification_state{VaultVerificationState::NOT_RECORDED};
+        bool signer_discovery_complete{false};
         std::optional<uint32_t> older;
         std::optional<uint32_t> after;
         int recovery_m{0};
+        //! Confirmed value eligible for the immediate policy path. Signer
+        //! availability is reported separately and never erases this amount.
+        CAmount immediate{0};
         CAmount recoverable_now{0};
         CAmount awaiting_maturity{0};
         std::optional<int> earliest_blocks_remaining;
         std::vector<std::string> lost_signers;
+        std::vector<std::string> manually_lost_signers;
         std::vector<VaultParticipant> participants;
         std::vector<VaultRecoveryStage> recovery_stages;
     };
     virtual VaultStatus getVaultStatus() = 0;
-    virtual void setLostSigner(const std::string& fingerprint, bool lost) = 0;
+    //! Read the current 90/180-day protection-renewal state. Unsupported or
+    //! legacy schedules return a truthful status with supported=false.
+    virtual wallet::VaultRenewalStatus getVaultRenewalStatus() = 0;
+    //! Select whole privacy clusters without reserving a destination.
+    virtual util::Result<wallet::VaultRenewalPlan> planVaultRenewal(
+        const wallet::VaultRenewalRequest& request) = 0;
+    //! Create exact unsigned transactions, one fresh internal output per
+    //! cluster (split only when required by transaction weight).
+    virtual util::Result<wallet::VaultRenewalBatch> createVaultRenewalBatch(
+        const wallet::VaultRenewalPlan& plan,
+        const wallet::CCoinControl& fee_control) = 0;
+    //! Directly sign one item through the immediate all-participant key path.
+    virtual util::Result<void> signVaultRenewalTransaction(
+        wallet::VaultRenewalBatch& batch, size_t transaction_index) = 0;
+    //! Refuse to commit any item until the whole batch is signed and
+    //! revalidated, then report immediate relay truth per transaction.
+    virtual util::Result<wallet::VaultRenewalCommitResult> commitVaultRenewalBatch(
+        const wallet::VaultRenewalBatch& batch) = 0;
+    //! Persist an explicit user decision that a signer is lost. This is local
+    //! metadata only and never changes the on-chain policy.
+    virtual bool setLostSigner(
+        const std::string& fingerprint, bool lost,
+        const std::optional<std::string>& expected_policy_commitment = std::nullopt) = 0;
+    //! Clear discovery-created unavailable metadata only when the signer has
+    //! not subsequently been marked lost by the user or RPC. The check and
+    //! mutation are atomic under the wallet lock.
+    virtual bool clearAutomaticallyLostSigner(
+        const std::string& fingerprint,
+        const std::optional<std::string>& expected_policy_commitment = std::nullopt) = 0;
+    //! Atomically persist setup progress and address-verification truth. When
+    //! supplied, expected_policy_commitment makes this a compare-and-set
+    //! against the complete active public policy.
+    virtual bool setVaultSetupState(
+        VaultSetupState setup, VaultVerificationState verification,
+        const std::optional<std::string>& expected_policy_commitment = std::nullopt) = 0;
+    //! Persist how a participant is expected to sign. Availability remains a
+    //! fresh runtime observation and is never written to the wallet database.
+    //! The optional commitment provides the same policy compare-and-set as
+    //! setup-state writes.
+    virtual bool setVaultParticipantType(
+        const std::string& fingerprint, VaultParticipantType type,
+        const std::optional<std::string>& expected_policy_commitment = std::nullopt) = 0;
     virtual std::string exportVaultPolicy() = 0;
     virtual util::Result<void> importVaultPolicy(const std::string& json) = 0;
     //! Restore private vault participants from BIP39 phrases and a public
@@ -404,6 +474,14 @@ enum class FixedVaultInstallMode {
     RESTORE,
 };
 
+//! Whether an installed fixed vault may dispatch signing operations to HWI.
+//! Restore authority is an explicit user choice; the number of supplied local
+//! mnemonics must never silently enable connected devices.
+enum class FixedVaultExternalSigning {
+    DISABLED,
+    ENABLED,
+};
+
 struct FixedVaultInstallResult {
     std::unique_ptr<Wallet> wallet;
     std::vector<Wallet::VaultMnemonicMatch> matches;
@@ -420,17 +498,21 @@ public:
     //! preflight; callers must still handle the chain changing afterward.
     virtual util::Result<void> checkRescanFromGenesis() = 0;
 
-    //! Atomically publish a complete fixed 30/60-day vault. The package must
-    //! be the exact canonical public JSON and phrases may be empty. CREATE
-    //! timestamps descriptors at installation time; RESTORE uses timestamp
-    //! zero. The final wallet name is not created until a complete SQLite
+    //! Atomically publish a complete supported fixed Recovery Vault. New
+    //! creation uses the current schedule; restore also accepts the legacy
+    //! fixed schedule. The package must be exact canonical public JSON and
+    //! phrases may be empty. CREATE timestamps descriptors at installation
+    //! time; RESTORE uses timestamp zero. Before publication, the staged
+    //! database is durably bound to the exact policy with an incomplete setup
+    //! state. The final wallet name is not created until that complete SQLite
     //! staging wallet has been closed and is ready for atomic publication.
     virtual util::Result<FixedVaultInstallResult> installFixedVault(
         const std::string& name,
         const std::string& canonical_package,
         const std::vector<SecureString>& mnemonics,
         FixedVaultInstallMode mode,
-        std::vector<bilingual_str>& warnings) = 0;
+        std::vector<bilingual_str>& warnings,
+        FixedVaultExternalSigning external_signing = FixedVaultExternalSigning::ENABLED) = 0;
 
     //! Create new wallet.
     virtual util::Result<std::unique_ptr<Wallet>> createWallet(const std::string& name, const SecureString& passphrase, uint64_t wallet_creation_flags, std::vector<bilingual_str>& warnings) = 0;
