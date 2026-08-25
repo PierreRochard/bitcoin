@@ -56,6 +56,7 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMimeData>
+#include <QPointer>
 #include <QProgressDialog>
 #include <QScreen>
 #include <QSettings>
@@ -355,9 +356,15 @@ void BitcoinGUI::createActions()
     m_create_wallet_action->setEnabled(false);
     m_create_wallet_action->setStatusTip(tr("Create a new wallet"));
 
-    m_create_multisig_action = new QAction(tr("Create Multisig Wallet…"), this);
+    m_create_multisig_action = new QAction(tr("Create Recovery Vault…"), this);
+    m_create_multisig_action->setObjectName(QStringLiteral("createRecoveryVaultAction"));
     m_create_multisig_action->setEnabled(false);
-    m_create_multisig_action->setStatusTip(tr("Create an m-of-n vault with hardware, local, and air-gapped keys"));
+    m_create_multisig_action->setStatusTip(tr("Create a Recovery Vault with a delayed 3 → 2 → 1 recovery timeline"));
+
+    m_restore_recovery_vault_action = new QAction(tr("Restore Recovery Vault…"), this);
+    m_restore_recovery_vault_action->setObjectName(QStringLiteral("restoreRecoveryVaultAction"));
+    m_restore_recovery_vault_action->setEnabled(false);
+    m_restore_recovery_vault_action->setStatusTip(tr("Restore a Recovery Vault from a printed Recovery Kit"));
 
     //: Name of the menu item that restores wallet from a backup file.
     m_restore_wallet_action = new QAction(tr("Restore Wallet…"), this);
@@ -477,6 +484,7 @@ void BitcoinGUI::createActions()
         });
         connect(m_create_wallet_action, &QAction::triggered, this, &BitcoinGUI::createWallet);
         connect(m_create_multisig_action, &QAction::triggered, this, &BitcoinGUI::createMultisigWallet);
+        connect(m_restore_recovery_vault_action, &QAction::triggered, this, &BitcoinGUI::restoreRecoveryVault);
         connect(m_close_all_wallets_action, &QAction::triggered, [this] {
             m_wallet_controller->closeAllWallets(this);
         });
@@ -567,6 +575,7 @@ void BitcoinGUI::createMenuBar()
     {
         file->addAction(m_create_wallet_action);
         file->addAction(m_create_multisig_action);
+        file->addAction(m_restore_recovery_vault_action);
         file->addAction(m_open_wallet_action);
         file->addAction(m_close_wallet_action);
         file->addAction(m_close_all_wallets_action);
@@ -779,6 +788,7 @@ void BitcoinGUI::setWalletController(WalletController* wallet_controller, bool s
 
     m_create_wallet_action->setEnabled(true);
     m_create_multisig_action->setEnabled(true);
+    m_restore_recovery_vault_action->setEnabled(true);
     m_open_wallet_action->setEnabled(true);
     m_open_wallet_action->setMenu(m_open_wallet_menu);
     m_restore_wallet_action->setEnabled(true);
@@ -824,6 +834,8 @@ void BitcoinGUI::addWallet(WalletModel* walletModel)
     });
     connect(wallet_view, &WalletView::encryptionStatusChanged, this, &BitcoinGUI::updateWalletStatus);
     connect(wallet_view, &WalletView::incomingTransaction, this, &BitcoinGUI::incomingTransaction);
+    connect(wallet_view, &WalletView::finishVaultSetupRequested, this, &BitcoinGUI::finishRecoveryVaultSetup);
+    connect(wallet_view, &WalletView::retryVaultRescanRequested, this, &BitcoinGUI::retryRecoveryVaultRescan);
     connect(this, &BitcoinGUI::setPrivacy, wallet_view, &WalletView::setPrivacy);
     wallet_view->setPrivacy(isPrivacyModeActivated());
     const QString display_name = walletModel->getDisplayName();
@@ -1305,6 +1317,65 @@ void BitcoinGUI::createMultisigWallet()
         if (walletFrame) walletFrame->showReceiveRequest(address);
     });
     wizard->open();
+#endif // ENABLE_WALLET
+}
+
+void BitcoinGUI::restoreRecoveryVault()
+{
+#ifdef ENABLE_WALLET
+    if (!clientModel || !getWalletController()) return;
+    auto* wizard = new MultisigWizard(clientModel->node(), getWalletController(), this);
+    wizard->setAttribute(Qt::WA_DeleteOnClose);
+    connect(wizard, &MultisigWizard::created, this, &BitcoinGUI::setCurrentWallet);
+    connect(wizard, &MultisigWizard::created, rpcConsole, &RPCConsole::setCurrentWallet);
+    wizard->open();
+    wizard->startRestore(/*standalone=*/true);
+#endif // ENABLE_WALLET
+}
+
+void BitcoinGUI::finishRecoveryVaultSetup(WalletModel* wallet_model)
+{
+#ifdef ENABLE_WALLET
+    if (!wallet_model || !clientModel || !getWalletController()) return;
+    auto* wizard = new MultisigWizard(clientModel->node(), getWalletController(), this);
+    wizard->setAttribute(Qt::WA_DeleteOnClose);
+    connect(wizard, &MultisigWizard::created, this, &BitcoinGUI::setCurrentWallet);
+    connect(wizard, &MultisigWizard::created, rpcConsole, &RPCConsole::setCurrentWallet);
+    connect(wizard, &MultisigWizard::receiveRequested, this, [this](WalletModel* model, const QString& address) {
+        setCurrentWallet(model);
+        gotoReceiveCoinsPage();
+        if (walletFrame) walletFrame->showReceiveRequest(address);
+    });
+    if (!wizard->resumeSetup(wallet_model)) {
+        QMessageBox::warning(this, tr("Finish Recovery Vault Setup"),
+                             tr("This wallet does not have a resumable Recovery Vault setup state."));
+        wizard->deleteLater();
+        return;
+    }
+    wizard->open();
+#else
+    Q_UNUSED(wallet_model);
+#endif // ENABLE_WALLET
+}
+
+void BitcoinGUI::retryRecoveryVaultRescan(WalletModel* wallet_model)
+{
+#ifdef ENABLE_WALLET
+    if (!wallet_model || !getWalletController()) return;
+    auto* activity = new MnemonicRestoreActivity(getWalletController(), this);
+    const QPointer<WalletModel> wallet_guard{wallet_model};
+    const auto refresh = [this, wallet_guard](WalletModel*) {
+        if (!wallet_guard) return;
+        wallet_guard->pollBalanceChanged();
+        wallet_guard->refreshVaultSignerStatus();
+        setCurrentWallet(wallet_guard);
+    };
+    connect(activity, &MnemonicRestoreActivity::restored, this, refresh);
+    connect(activity, &MnemonicRestoreActivity::rescanFailed, this,
+            [refresh](WalletModel* model, const QString&) { refresh(model); });
+    activity->rescan(wallet_model);
+#else
+    Q_UNUSED(wallet_model);
 #endif // ENABLE_WALLET
 }
 

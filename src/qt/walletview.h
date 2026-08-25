@@ -9,6 +9,9 @@
 #include <qt/bitcoinunits.h>
 
 #include <QStackedWidget>
+#include <QStringList>
+
+#include <memory>
 
 class ClientModel;
 class OverviewPage;
@@ -19,6 +22,7 @@ class SendCoinsRecipient;
 class TransactionView;
 class WalletModel;
 class AddressBookPage;
+class VaultRenewalCoordinator;
 
 QT_BEGIN_NAMESPACE
 class QModelIndex;
@@ -70,6 +74,8 @@ private:
 
     QProgressDialog* progressDialog{nullptr};
     const PlatformStyle *platformStyle;
+    std::unique_ptr<VaultRenewalCoordinator> m_vault_renewal;
+    bool m_privacy{false};
 
 public Q_SLOTS:
     /** Switch to overview (home) page */
@@ -106,10 +112,19 @@ public Q_SLOTS:
     void usedReceivingAddresses();
 
     /** Show progress dialog e.g. for rescan */
-    void showProgress(const QString &title, int nProgress);
+    void showProgress(const QString& title, int nProgress);
 
 private Q_SLOTS:
     void disableTransactionView(bool disable);
+    void showRecoveryKit();
+
+private:
+    void showVaultRenewal(bool due);
+    void requestVaultRenewalPlan(const QStringList& cluster_ids);
+    void createVaultRenewalBatch(const QString& plan_token);
+    void startVaultRenewalSigning(const QString& batch_token);
+    void beginVaultRenewalSigning(const QString& batch_token);
+    void retryVaultRenewalCommit();
 
 Q_SIGNALS:
     void setPrivacy(bool privacy);
@@ -123,6 +138,9 @@ Q_SIGNALS:
     void incomingTransaction(const QString& date, BitcoinUnit unit, const CAmount& amount, const QString& type, const QString& address, const QString& label, const QString& walletName);
     /** Notify that the out of sync warning icon has been pressed */
     void outOfSyncWarningClicked();
+    /** Recovery Vault actions requiring the top-level wallet controller. */
+    void finishVaultSetupRequested(WalletModel* wallet_model);
+    void retryVaultRescanRequested(WalletModel* wallet_model);
 };
 
 #endif // BITCOIN_QT_WALLETVIEW_H

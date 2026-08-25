@@ -34,6 +34,7 @@ if(ENABLE_WALLET)
       wallettests.cpp
       multisigwizardtests.cpp
       vaulthardwaretests.cpp
+      vaultrenewaltests.cpp
       ../../wallet/test/wallet_test_fixture.cpp
   )
 endif()

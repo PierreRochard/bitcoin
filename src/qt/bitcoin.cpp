@@ -45,9 +45,6 @@
 #include <wallet/types.h>
 #endif // ENABLE_WALLET
 
-#include <chrono>
-#include <memory>
-
 #include <QApplication>
 #include <QDebug>
 #include <QLatin1String>
@@ -56,9 +53,13 @@
 #include <QMessageBox>
 #include <QSettings>
 #include <QThread>
+#include <QThreadPool>
 #include <QTimer>
 #include <QTranslator>
 #include <QWindow>
+
+#include <chrono>
+#include <memory>
 
 // Declare meta types used for QMetaObject::invokeMethod
 Q_DECLARE_METATYPE(bool*)
@@ -220,6 +221,11 @@ void BitcoinApplication::setupPlatformStyle()
 
 BitcoinApplication::~BitcoinApplication()
 {
+    // Recovery Vault hardware discovery and exact address verification use
+    // the global pool with a live Node reference. Drain those workers before
+    // member destruction reaches m_node; QPointer guards only protect their
+    // GUI callbacks, not the backend reference used inside the runnable.
+    QThreadPool::globalInstance()->waitForDone();
     m_executor.reset();
 
     delete window;

@@ -19,6 +19,7 @@
 #include <qt/test/addressbooktests.h>
 #include <qt/test/multisigwizardtests.h>
 #include <qt/test/vaulthardwaretests.h>
+#include <qt/test/vaultrenewaltests.h>
 #include <qt/test/wallettests.h>
 #endif // ENABLE_WALLET
 
@@ -108,6 +109,9 @@ int main(int argc, char* argv[])
 
         VaultHardwareTests test8(app.node());
         num_test_failures += QTest::qExec(&test8);
+
+        VaultRenewalTests test9;
+        num_test_failures += QTest::qExec(&test9);
 #endif
 
         if (num_test_failures) {

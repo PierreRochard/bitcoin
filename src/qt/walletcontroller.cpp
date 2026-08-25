@@ -4,33 +4,36 @@
 
 #include <qt/walletcontroller.h>
 
+#include <external_signer.h>
+#include <interfaces/handler.h>
+#include <interfaces/node.h>
 #include <qt/askpassphrasedialog.h>
 #include <qt/clientmodel.h>
 #include <qt/createwalletdialog.h>
 #include <qt/guiconstants.h>
 #include <qt/guiutil.h>
 #include <qt/walletmodel.h>
-
-#include <external_signer.h>
-#include <interfaces/handler.h>
-#include <interfaces/node.h>
 #include <support/cleanse.h>
 #include <util/string.h>
 #include <util/threadnames.h>
 #include <util/translation.h>
+#include <wallet/multisig.h>
 #include <wallet/wallet.h>
-
-#include <algorithm>
-#include <chrono>
 
 #include <QApplication>
 #include <QCheckBox>
+#include <QFile>
+#include <QFileInfo>
 #include <QMessageBox>
 #include <QMetaObject>
 #include <QMutexLocker>
 #include <QThread>
 #include <QTimer>
 #include <QWindow>
+
+#include <algorithm>
+#include <chrono>
+#include <exception>
 
 using util::Join;
 using wallet::WALLET_FLAG_BLANK_WALLET;
@@ -47,6 +50,9 @@ WalletController::WalletController(ClientModel& client_model, const PlatformStyl
     , m_platform_style(platform_style)
     , m_options_model(client_model.getOptionsModel())
 {
+    m_recovery_kit_cleanup_timer.setInterval(5000);
+    connect(&m_recovery_kit_cleanup_timer, &QTimer::timeout,
+            this, &WalletController::retryPendingRecoveryKitCleanup);
     m_handler_load_wallet = m_node.walletLoader().handleLoadWallet([this](std::unique_ptr<interfaces::Wallet> wallet) {
         getOrCreateWallet(std::move(wallet));
     });
@@ -62,9 +68,35 @@ WalletController::WalletController(ClientModel& client_model, const PlatformStyl
 // available in the header, just forward declared.
 WalletController::~WalletController()
 {
+    retryPendingRecoveryKitCleanup();
     m_activity_thread->quit();
     m_activity_thread->wait();
     delete m_activity_worker;
+}
+
+void WalletController::retainRecoveryKitCleanup(QString path, std::unique_ptr<QLockFile> lock)
+{
+    if (path.isEmpty()) return;
+    const auto existing{std::find_if(
+        m_recovery_kit_cleanup.begin(), m_recovery_kit_cleanup.end(),
+        [&](const auto& pending) { return pending.path == path; })};
+    if (existing == m_recovery_kit_cleanup.end()) {
+        m_recovery_kit_cleanup.push_back({std::move(path), std::move(lock)});
+    }
+    if (!m_recovery_kit_cleanup_timer.isActive()) m_recovery_kit_cleanup_timer.start();
+}
+
+void WalletController::retryPendingRecoveryKitCleanup()
+{
+    std::erase_if(m_recovery_kit_cleanup, [](RecoveryKitCleanup& pending) {
+        if (QFileInfo::exists(pending.path) && !QFile::remove(pending.path)) return false;
+        // Releasing the adjacent live-owner lock only after deletion lets
+        // another setup safely scavenge the artifact if the process exits
+        // before a viewer releases it.
+        pending.lock.reset();
+        return !QFileInfo::exists(pending.path);
+    });
+    if (m_recovery_kit_cleanup.empty()) m_recovery_kit_cleanup_timer.stop();
 }
 
 std::map<std::string, std::pair<bool, std::string>> WalletController::listWalletDir() const
@@ -199,7 +231,9 @@ WalletControllerActivity::WalletControllerActivity(WalletController* wallet_cont
 
 void WalletControllerActivity::showProgressDialog(const QString& title_text, const QString& label_text, bool show_minimized)
 {
-    auto progress_dialog = new QProgressDialog(m_parent_widget);
+    closeProgressDialog();
+    auto progress_dialog = new QProgressDialog(m_parent_widget.data());
+    m_progress_dialog = progress_dialog;
     progress_dialog->setAttribute(Qt::WA_DeleteOnClose);
     connect(this, &WalletControllerActivity::finished, progress_dialog, &QWidget::close);
 
@@ -214,6 +248,13 @@ void WalletControllerActivity::showProgressDialog(const QString& title_text, con
     progress_dialog->setValue(0);
     // When requested, launch dialog minimized
     if (show_minimized) progress_dialog->showMinimized();
+}
+
+void WalletControllerActivity::closeProgressDialog()
+{
+    if (!m_progress_dialog) return;
+    m_progress_dialog->close();
+    m_progress_dialog = nullptr;
 }
 
 CreateWalletActivity::CreateWalletActivity(WalletController* wallet_controller, QWidget* parent_widget)
@@ -457,48 +498,234 @@ MnemonicRestoreActivity::~MnemonicRestoreActivity()
 }
 
 void MnemonicRestoreActivity::restore(const std::string& wallet_name, const std::string& policy_json,
-                                      std::vector<SecureString> mnemonics)
+                                      std::vector<SecureString> mnemonics,
+                                      std::set<std::string> local_fingerprints,
+                                      std::set<std::string> hardware_fingerprints,
+                                      bool enable_external_signing)
 {
+    const auto package{wallet::ParseVaultPolicyPackage(policy_json)};
+    if (!package) {
+        m_error_message = util::ErrorString(package);
+        QTimer::singleShot(0, this, &MnemonicRestoreActivity::finish);
+        return;
+    }
+    if (const auto fixed{wallet::ValidateFixedStagedVaultPolicy(*package)}; !fixed) {
+        m_error_message = util::ErrorString(fixed);
+        QTimer::singleShot(0, this, &MnemonicRestoreActivity::finish);
+        return;
+    }
+    m_expected_policy_commitment = wallet::VaultPolicyCommitment(*package);
+
+    // Restore authority is an explicit boundary. A watch-only or
+    // printed-phrases restore must never acquire hardware signing merely
+    // because a matching device happens to be connected.
+    if (!enable_external_signing && !hardware_fingerprints.empty()) {
+        m_error_message = Untranslated(
+            "Hardware participant provenance was supplied for a restore that explicitly disabled external signing");
+        QTimer::singleShot(0, this, &MnemonicRestoreActivity::finish);
+        return;
+    }
+    if (enable_external_signing && (!local_fingerprints.empty() || !mnemonics.empty())) {
+        m_error_message = Untranslated(
+            "Local software-key provenance was supplied for an exact-hardware restore");
+        QTimer::singleShot(0, this, &MnemonicRestoreActivity::finish);
+        return;
+    }
+    if (enable_external_signing && hardware_fingerprints.empty()) {
+        m_error_message = Untranslated(
+            "Exact-hardware restore was selected without any freshly matched hardware participant");
+        QTimer::singleShot(0, this, &MnemonicRestoreActivity::finish);
+        return;
+    }
+    if (!enable_external_signing && local_fingerprints.size() != mnemonics.size()) {
+        m_error_message = Untranslated(
+            "The restored software-key provenance does not match the explicitly supplied printed phrases");
+        QTimer::singleShot(0, this, &MnemonicRestoreActivity::finish);
+        return;
+    }
+    const auto authoritative_matches{
+        wallet::ValidateFixedVaultMnemonics(*package, mnemonics)};
+    if (!authoritative_matches) {
+        m_error_message = util::ErrorString(authoritative_matches);
+        for (SecureString& mnemonic : mnemonics) {
+            if (!mnemonic.empty()) memory_cleanse(mnemonic.data(), mnemonic.size());
+        }
+        QTimer::singleShot(0, this, &MnemonicRestoreActivity::finish);
+        return;
+    }
+    std::set<std::string> authoritative_local_fingerprints;
+    for (const auto& match : *authoritative_matches) {
+        authoritative_local_fingerprints.insert(match.fingerprint);
+    }
+    if (authoritative_local_fingerprints.size() != authoritative_matches->size() ||
+        authoritative_local_fingerprints != local_fingerprints) {
+        m_error_message = Untranslated(
+            "The reviewed software-key participants do not match the supplied Recovery Kit phrases");
+        for (SecureString& mnemonic : mnemonics) {
+            if (!mnemonic.empty()) memory_cleanse(mnemonic.data(), mnemonic.size());
+        }
+        QTimer::singleShot(0, this, &MnemonicRestoreActivity::finish);
+        return;
+    }
     m_wallet_name = wallet_name;
     m_policy_json = policy_json;
     m_mnemonics = std::move(mnemonics);
+    m_local_fingerprints = std::move(local_fingerprints);
+    m_hardware_fingerprints = std::move(hardware_fingerprints);
+    m_enable_external_signing = enable_external_signing;
+    m_participant_provenance_valid = true;
     showProgressDialog(
-        tr("Restore Scrooge Vault"),
-        tr("Restoring <b>%1</b> and rescanning the blockchain from genesis…")
+        tr("Restore Recovery Vault"),
+        tr("Installing <b>%1</b> from its Recovery Kit…")
             .arg(QString::fromStdString(wallet_name).toHtmlEscaped()));
 
     QTimer::singleShot(0, worker(), [this] {
-        auto rescan_ready{node().walletLoader().checkRescanFromGenesis()};
-        if (!rescan_ready) {
-            m_error_message = util::ErrorString(rescan_ready);
+        // Secret cleanup must not depend on a backend returning normally.
+        // installFixedVault implementations are permitted to throw, and this
+        // activity must still report a retryable failure on the GUI thread.
+        auto cleanse = interfaces::MakeCleanupHandler([this] {
             for (SecureString& mnemonic : m_mnemonics) {
                 if (!mnemonic.empty()) memory_cleanse(mnemonic.data(), mnemonic.size());
             }
-            m_mnemonics.clear();
+            std::vector<SecureString>{}.swap(m_mnemonics);
             m_policy_json.clear();
-            QTimer::singleShot(0, this, &MnemonicRestoreActivity::finish);
-            return;
+        });
+        try {
+            auto installed{node().walletLoader().installFixedVault(
+                m_wallet_name, m_policy_json, m_mnemonics,
+                interfaces::FixedVaultInstallMode::RESTORE, m_warning_message,
+                m_enable_external_signing ? interfaces::FixedVaultExternalSigning::ENABLED : interfaces::FixedVaultExternalSigning::DISABLED)};
+            if (!installed) {
+                m_error_message = util::ErrorString(installed);
+            } else {
+                std::set<std::string> backend_local_fingerprints;
+                for (const auto& match : installed->matches) {
+                    backend_local_fingerprints.insert(match.fingerprint);
+                }
+                const bool authoritative_match{
+                    backend_local_fingerprints.size() == installed->matches.size() &&
+                    backend_local_fingerprints == m_local_fingerprints};
+                if (!authoritative_match) {
+                    // Preflight above makes this unreachable unless the
+                    // backend violates its own validation contract. Keep the
+                    // safely installed wallet visible but with setup marked
+                    // incomplete; `remove()` only unloads and must never be
+                    // misrepresented as deleting the published database.
+                    m_participant_provenance_valid = false;
+                    m_local_fingerprints.clear();
+                    m_warning_message.push_back(Untranslated(
+                        "The installed Recovery Vault reported different software-key authority than preflight. Participant provenance was not trusted; setup remains not recorded."));
+                    m_installed_wallet = std::move(installed->wallet);
+                } else {
+                    m_local_fingerprints = std::move(backend_local_fingerprints);
+                    m_installed_wallet = std::move(installed->wallet);
+                }
+            }
+        } catch (const std::exception& e) {
+            m_error_message = Untranslated(strprintf("Recovery Vault installation failed: %s", e.what()));
+        } catch (...) {
+            m_error_message = Untranslated("Recovery Vault installation failed with an unknown backend error");
         }
-        auto installed{node().walletLoader().installFixedVault(
-            m_wallet_name, m_policy_json, m_mnemonics,
-            interfaces::FixedVaultInstallMode::RESTORE, m_warning_message)};
-        for (SecureString& mnemonic : m_mnemonics) {
-            if (!mnemonic.empty()) memory_cleanse(mnemonic.data(), mnemonic.size());
+        QTimer::singleShot(0, this, &MnemonicRestoreActivity::beginInstalledRescan);
+    });
+}
+
+void MnemonicRestoreActivity::beginInstalledRescan()
+{
+    closeProgressDialog();
+    if (!m_error_message.empty() || !m_installed_wallet) {
+        finish();
+        return;
+    }
+
+    // Publish the wallet before scanning. Its durable genesis-rescan flag
+    // keeps sending disabled, while WalletModel can now relay actual scan
+    // progress and the operation can continue if the restore surface closes.
+    m_wallet_model = m_wallet_controller->getOrCreateWallet(std::move(m_installed_wallet));
+    m_active_wallet_model = m_wallet_model;
+    // Provenance belongs to the durable restore operation, not to the surface
+    // that launched it. Persist it before emitting installed so closing or
+    // destroying the wizard cannot strand exact participants as UNKNOWN.
+    bool participant_sources_saved{m_participant_provenance_valid};
+    for (const std::string& fingerprint : m_local_fingerprints) {
+        if (!m_active_wallet_model->setVaultParticipantType(
+                fingerprint, interfaces::Wallet::VaultParticipantType::LOCAL_SOFTWARE,
+                m_expected_policy_commitment)) {
+            participant_sources_saved = false;
+            m_warning_message.push_back(Untranslated(
+                "The restored local software-key source for participant " + fingerprint +
+                " could not be saved for the exact restored policy. Its authority remains Unknown and direct signing stays unavailable. Finish setup for the current policy and retry."));
         }
-        m_mnemonics.clear();
-        if (!installed) {
-            m_error_message = util::ErrorString(installed);
-        } else {
-            auto rescanned{m_rescan_override ? m_rescan_override(*installed->wallet)
-                                             : installed->wallet->rescanFromGenesis()};
+    }
+    for (const std::string& fingerprint : m_hardware_fingerprints) {
+        if (!m_active_wallet_model->setVaultParticipantType(
+                fingerprint, interfaces::Wallet::VaultParticipantType::HARDWARE,
+                m_expected_policy_commitment)) {
+            participant_sources_saved = false;
+            m_warning_message.push_back(Untranslated(
+                "The restored exact hardware source for participant " + fingerprint +
+                " could not be saved for the exact restored policy. Its authority remains Unknown and direct signing stays unavailable. Finish setup for the current policy and retry."));
+        }
+    }
+    m_local_fingerprints.clear();
+    m_hardware_fingerprints.clear();
+    // Successful installation proves that the canonical public policy copy
+    // reproduced the vault. It does not prove independent address
+    // verification, and a failed metadata write deliberately remains the
+    // actionable NOT_RECORDED legacy state.
+    if (!participant_sources_saved) {
+        // Do not let a later address-display check turn a partially recorded
+        // authority roster into Ready. The exact wallet is safely installed,
+        // but setup remains explicitly NOT_RECORDED until every requested
+        // source has been durably reconciled for the current policy.
+        if (!m_active_wallet_model->setVaultSetupState(
+                interfaces::Wallet::VaultSetupState::NOT_RECORDED,
+                interfaces::Wallet::VaultVerificationState::NOT_RECORDED,
+                m_expected_policy_commitment)) {
+            m_warning_message.push_back(Untranslated(
+                "The incomplete restore state could not be saved for the wallet's current policy. The dashboard will still fail closed because no completed setup record exists."));
+        }
+        m_warning_message.push_back(Untranslated(
+            "Restore setup remains incomplete because not every requested signer source was saved. Use Finish Setup for the current policy; the vault will not be shown as Ready."));
+    } else if (!m_active_wallet_model->setVaultSetupState(
+                   interfaces::Wallet::VaultSetupState::ADDRESS_VERIFICATION_REQUIRED,
+                   interfaces::Wallet::VaultVerificationState::RECOVERY_KIT_MATCHED,
+                   m_expected_policy_commitment)) {
+        m_warning_message.push_back(Untranslated(
+            "The Recovery Kit policy matched, but that setup result could not be saved for the wallet's current policy. The vault will show verification status not recorded; use Finish Setup for the current policy."));
+    }
+    Q_EMIT installed(m_active_wallet_model);
+    startRescanWorker();
+}
+
+void MnemonicRestoreActivity::startRescanWorker()
+{
+    if (!m_active_wallet_model) {
+        m_error_message = Untranslated("The restored Recovery Vault could not be opened");
+        finish();
+        return;
+    }
+
+    // Capture a shared interface handle before leaving the GUI thread. This
+    // prevents a wallet unload from deleting the object beneath the worker;
+    // the backend can then abort/unwind safely while the GUI model disappears.
+    const std::shared_ptr<interfaces::Wallet> wallet{m_active_wallet_model->walletShared()};
+    Q_EMIT rescanStarted(m_active_wallet_model);
+    QTimer::singleShot(0, worker(), [this, wallet] {
+        try {
+            auto rescanned{m_rescan_override ? m_rescan_override(*wallet) : wallet->rescanFromGenesis()};
             if (!rescanned) {
                 m_rescan_error = QString::fromStdString(
-                    "The vault policy and available keys were restored, but the genesis rescan did not complete. "
-                    "Retry the scan from height 0: " + util::ErrorString(rescanned).original);
+                    "The Recovery Vault is installed, but its blockchain history is incomplete. "
+                    "Sending remains blocked. Resume the scan when the required block history is available: " +
+                    util::ErrorString(rescanned).original);
             }
-            m_wallet_model = m_wallet_controller->getOrCreateWallet(std::move(installed->wallet));
+        } catch (const std::exception& e) {
+            m_rescan_error = tr("The Recovery Vault is installed, but its blockchain scan failed unexpectedly. Sending remains blocked; retry the scan. %1")
+                                 .arg(QString::fromLocal8Bit(e.what()));
+        } catch (...) {
+            m_rescan_error = tr("The Recovery Vault is installed, but its blockchain scan failed with an unknown backend error. Sending remains blocked; retry the scan.");
         }
-        m_policy_json.clear();
         QTimer::singleShot(0, this, &MnemonicRestoreActivity::finish);
     });
 }
@@ -506,38 +733,38 @@ void MnemonicRestoreActivity::restore(const std::string& wallet_name, const std:
 void MnemonicRestoreActivity::rescan(WalletModel* wallet_model)
 {
     m_wallet_model = wallet_model;
+    m_active_wallet_model = wallet_model;
     m_rescan_error.clear();
-    showProgressDialog(
-        tr("Retry Scrooge Vault Rescan"),
-        tr("Rescanning <b>%1</b> from genesis…")
-            .arg(wallet_model->getDisplayName().toHtmlEscaped()));
-
-    QTimer::singleShot(0, worker(), [this] {
-        auto rescanned{m_rescan_override ? m_rescan_override(m_wallet_model->wallet())
-                                         : m_wallet_model->wallet().rescanFromGenesis()};
-        if (!rescanned) {
-            m_rescan_error = QString::fromStdString(
-                "The genesis rescan did not complete. Retry when the complete block history is available: " +
-                util::ErrorString(rescanned).original);
-        }
-        QTimer::singleShot(0, this, &MnemonicRestoreActivity::finish);
-    });
+    startRescanWorker();
 }
 
 void MnemonicRestoreActivity::finish()
 {
+    // The setup surface may already be closed. Refresh the durable scan flag
+    // here so the surviving dashboard never remains blocked on stale cache
+    // state merely because its wizard receiver was destroyed.
+    if (m_active_wallet_model) {
+        m_active_wallet_model->pollBalanceChanged();
+        m_active_wallet_model->refreshVaultSignerStatus();
+    }
     if (!m_error_message.empty()) {
-        QMessageBox::critical(m_parent_widget, tr("Restore vault failed"),
-                              QString::fromStdString(m_error_message.translated));
+        if (m_parent_widget && m_parent_widget->isVisible()) {
+            QMessageBox::critical(m_parent_widget.data(), tr("Restore Recovery Vault failed"),
+                                  QString::fromStdString(m_error_message.translated));
+        }
         Q_EMIT failed(QString::fromStdString(m_error_message.translated));
     } else if (!m_rescan_error.isEmpty()) {
-        QMessageBox::warning(m_parent_widget, tr("Vault rescan incomplete"), m_rescan_error);
-        Q_EMIT rescanFailed(m_wallet_model, m_rescan_error);
+        if (m_parent_widget && m_parent_widget->isVisible()) {
+            QMessageBox::warning(m_parent_widget.data(), tr("Recovery Vault scan incomplete"), m_rescan_error);
+        }
+        Q_EMIT rescanFailed(m_active_wallet_model, m_rescan_error);
     } else if (!m_warning_message.empty()) {
-        QMessageBox::warning(m_parent_widget, tr("Restore vault warning"),
-                             QString::fromStdString(Join(m_warning_message, Untranslated("\n")).translated));
+        if (m_parent_widget && m_parent_widget->isVisible()) {
+            QMessageBox::warning(m_parent_widget.data(), tr("Restore Recovery Vault warning"),
+                                 QString::fromStdString(Join(m_warning_message, Untranslated("\n")).translated));
+        }
     }
-    if (m_wallet_model && m_error_message.empty() && m_rescan_error.isEmpty()) Q_EMIT restored(m_wallet_model);
+    if (m_active_wallet_model && m_error_message.empty() && m_rescan_error.isEmpty()) Q_EMIT restored(m_active_wallet_model);
     Q_EMIT finished();
 }
 

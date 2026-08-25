@@ -35,6 +35,10 @@ private Q_SLOTS:
     void grabPages();
     void wizardTemplates();
     void createWalletWithController();
+    void verificationIdentityBinding();
+    void advancedPolicyCommitmentBinding();
+    void restoreRejectsWrongTypedKit();
+    void legacyFixedVaultCompatibility();
     void automaticPolicyBackup();
     void mnemonicPrintBackup();
     void wizardEdges();

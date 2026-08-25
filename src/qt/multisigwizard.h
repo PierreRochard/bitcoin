@@ -6,19 +6,22 @@
 #define BITCOIN_QT_MULTISIGWIZARD_H
 
 #include <addresstype.h>
-#include <cstdint>
-#include <optional>
+#include <interfaces/external_signer.h>
 #include <outputtype.h>
 #include <util/result.h>
 #include <util/translation.h>
 #include <wallet/multisig.h>
+#include <wallet/vault_state.h>
 
+#include <QPointer>
 #include <QString>
 #include <QWizard>
 
+#include <cstdint>
 #include <functional>
 #include <map>
-#include <functional>
+#include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
@@ -28,6 +31,7 @@ class WalletController;
 class WalletModel;
 class MultisigWizardTests;
 class QCloseEvent;
+class QLockFile;
 
 namespace interfaces {
 class Node;
@@ -66,11 +70,10 @@ public:
         Custom,
     };
 
-    //! ~90 days at 10-minute blocks. Calendar dates derived from this are estimates.
-    static constexpr uint32_t kDefaultVaultDelay{12960};
-    //! Approximate 30/60-day relative-delay stages at 144 blocks per day.
-    static constexpr uint32_t kThirtyDayVaultDelay{4320};
-    static constexpr uint32_t kSixtyDayVaultDelay{8640};
+    //! Calendar dates derived from block delays are estimates.
+    static constexpr uint32_t kDefaultVaultDelay{wallet::FIXED_VAULT_CURRENT_PRIMARY_DELAY};
+    static constexpr uint32_t kCurrentPrimaryVaultDelay{wallet::FIXED_VAULT_CURRENT_PRIMARY_DELAY};
+    static constexpr uint32_t kCurrentFinalVaultDelay{wallet::FIXED_VAULT_CURRENT_FINAL_DELAY};
     static constexpr int kStagedVaultKeyCount{3};
     static constexpr int kMaxLocalSoftwareKeys{3};
 
@@ -90,7 +93,16 @@ public:
     int localKeyCount() const { return m_local_key_count; }
     bool includeLocalKey() const { return m_local_key_count > 0; }
     bool advancedFlow() const { return m_advanced_flow; }
-    WalletModel* createdWallet() const { return m_wallet_model; }
+    WalletModel* createdWallet() const { return m_wallet_model.data(); }
+
+    /** Open the Recovery Kit restore journey. A first-class File-menu launch
+     * closes this otherwise unused setup host when the nested journey ends;
+     * callers never need to enter the creation journey first. */
+    void startRestore(bool standalone = false);
+    //! Continue the non-destructive verification/finish portion of setup for
+    //! an already-created Recovery Vault. This never recreates the wallet or
+    //! changes its descriptors.
+    bool resumeSetup(WalletModel* wallet_model);
 
     void setWalletName(const QString& name);
     void setLocalKeyCount(int count);
@@ -118,7 +130,9 @@ public:
     //! after Secure Recovery has deleted its managed temporary PDF.
     bool commitWalletCandidate();
     bool restoreFromRecoverySheets(const QString& wallet_name, const QString& policy_json,
-                                   const std::vector<SecureString>& mnemonics, QString& error);
+                                   const std::vector<SecureString>& mnemonics, QString& error,
+                                   std::set<std::string> matched_hardware = {},
+                                   bool enable_external_signing = false);
     bool retryRecoveryRescan(WalletModel* wallet_model, QString& error);
     //! Validate a proposed wallet name without creating or loading anything.
     QString walletNameError(const QString& name) const;
@@ -132,6 +146,8 @@ Q_SIGNALS:
     void created(WalletModel* wallet_model);
     void receiveRequested(WalletModel* wallet_model, const QString& address);
     void restoreCompleted();
+    void restoreInstalled(WalletModel* wallet_model);
+    void restoreRescanStarted(WalletModel* wallet_model);
     void restoreAttemptFailed(const QString& error);
     void restoreRescanRetryRequired(WalletModel* wallet_model, const QString& error);
 
@@ -154,8 +170,16 @@ private:
     friend class MultisigWizardTests;
 
     void refreshSidebar();
+    void cleanupPrivatePrintOnClose();
+    void retainPrivatePrintCleanup(QString path, std::unique_ptr<QLockFile> lock);
+    void verifyOnDeviceAsync(
+        const std::string& fingerprint,
+        std::function<void(util::Result<interfaces::ExternalSignerAddressVerification>)> callback);
     void enableAdvancedFlow();
     void lockCommittedJourney();
+    void configureNavigation(int page_id);
+    bool persistSetupState(int setup_state, int verification_state);
+    bool persistParticipantTypes();
     void publishCreatedWallet();
     void clearSoftwareRecovery();
     void completeRecoveryRestore(WalletModel* wallet_model);
@@ -190,25 +214,45 @@ private:
     std::vector<wallet::MultisigKeySpec> m_airgapped;
     std::vector<wallet::MultisigKeySpec> m_keys;
     int m_nrequired{2};
-    std::optional<uint32_t> m_fallback_older{kThirtyDayVaultDelay};
-    std::optional<uint32_t> m_fallback_older_one_key{kSixtyDayVaultDelay};
+    std::optional<uint32_t> m_fallback_older{kCurrentPrimaryVaultDelay};
+    std::optional<uint32_t> m_fallback_older_one_key{kCurrentFinalVaultDelay};
     std::optional<uint32_t> m_fallback_after;
     std::vector<std::string> m_public_descs;
     //! Fully resolved public key sources for the fixed in-memory candidate.
     //! Generated software slots remain marked generate_local until commit,
     //! when their already printed mnemonics are supplied instead.
     std::vector<wallet::MultisigKeySpec> m_candidate_keys;
-    WalletModel* m_wallet_model{nullptr};
+    QPointer<WalletModel> m_wallet_model;
     QString m_create_error;
     QString m_receive_address;
     QString m_policy_id;
     QString m_policy_package;
+    //! Full canonical public-policy commitment captured before any
+    //! asynchronous verification or installation work. Durable state writes
+    //! compare-and-set against it under the wallet lock.
+    std::optional<std::string> m_expected_policy_commitment;
+    //! Whether the policy prepared and reviewed by this wizard is a Recovery
+    //! Vault. Ordinary advanced multisig policies have no vault setup metadata
+    //! to persist, while a prepared vault must still fail closed if the active
+    //! wallet policy is replaced with an ordinary descriptor.
+    bool m_prepared_policy_is_vault{false};
+    //! Source records that still need durable persistence after the wallet is
+    //! committed. Partial failures keep setup incomplete and can be retried
+    //! without retaining mnemonic material.
+    std::map<std::string, wallet::VaultParticipantType> m_pending_participant_types;
     //! One locked-memory BIP39 phrase for every generated software-key slot.
     //! These never enter the public package, transcript, clipboard, or logs.
     std::vector<wallet::GeneratedMnemonic> m_software_recovery;
     bool m_setup_committed{false};
     bool m_created_emitted{false};
     bool m_address_independently_verified{false};
+    bool m_recovery_kit_matched{false};
+    bool m_finished_without_verification{false};
+    bool m_previously_finished_unverified{false};
+    bool m_resuming_setup{false};
+    bool m_setup_status_not_recorded{false};
+    bool m_recovery_kit_status_missing{false};
+    bool m_participant_sources_incomplete{false};
     bool m_advanced_flow{false};
     //! Injectable filesystem boundary used by deterministic private-PDF
     //! cleanup tests. Production removal uses QFile::remove().

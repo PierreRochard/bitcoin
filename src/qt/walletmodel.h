@@ -5,17 +5,18 @@
 #ifndef BITCOIN_QT_WALLETMODEL_H
 #define BITCOIN_QT_WALLETMODEL_H
 
-#include <key.h>
-
-#include <qt/walletmodeltransaction.h>
-
 #include <interfaces/wallet.h>
+#include <key.h>
 #include <primitives/transaction_identifier.h>
+#include <qt/walletmodeltransaction.h>
 #include <support/allocators/secure.h>
 
-#include <vector>
-
 #include <QObject>
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <vector>
 
 enum class OutputType;
 
@@ -26,6 +27,7 @@ class PlatformStyle;
 class RecentRequestsTableModel;
 class SendCoinsRecipient;
 class TransactionTableModel;
+class MultisigWizardTests;
 class WalletModelTransaction;
 
 class CKeyID;
@@ -34,6 +36,7 @@ class CPubKey;
 class uint256;
 
 namespace interfaces {
+struct ExternalSignerDiscovery;
 class Node;
 } // namespace interfaces
 namespace wallet {
@@ -41,6 +44,7 @@ class CCoinControl;
 } // namespace wallet
 
 QT_BEGIN_NAMESPACE
+class QThreadPool;
 class QTimer;
 QT_END_NAMESPACE
 
@@ -48,6 +52,8 @@ QT_END_NAMESPACE
 class WalletModel : public QObject
 {
     Q_OBJECT
+
+    friend class MultisigWizardTests;
 
 public:
     explicit WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel& client_model, const PlatformStyle *platformStyle, QObject *parent = nullptr);
@@ -95,10 +101,16 @@ public:
     };
 
     // prepare transaction for getting txfee before sending coins
-    SendCoinsReturn prepareTransaction(WalletModelTransaction &transaction, const wallet::CCoinControl& coinControl);
+    SendCoinsReturn prepareTransaction(WalletModelTransaction& transaction,
+                                       const wallet::CCoinControl& coin_control,
+                                       bool sign_during_prepare = true,
+                                       std::optional<std::string> expected_vault_policy_commitment = std::nullopt);
 
-    // Send coins to a list of recipients
-    void sendCoins(WalletModelTransaction& transaction);
+    // Send coins to a list of recipients. Returns false if a Recovery Vault
+    // policy/loss compare-and-set rejects the signed transaction.
+    bool sendCoins(
+        WalletModelTransaction& transaction,
+        const std::optional<wallet::VaultCommitState>& expected_vault_state = std::nullopt);
 
     // Wallet encryption
     bool setWalletEncrypted(const SecureString& passphrase);
@@ -136,9 +148,27 @@ public:
 
     interfaces::Node& node() const { return m_node; }
     interfaces::Wallet& wallet() const { return *m_wallet; }
+    //! Keep the interface object alive for close-safe background work. The
+    //! wallet may be removed from the GUI while an already-started activity
+    //! is still unwinding or aborting.
+    std::shared_ptr<interfaces::Wallet> walletShared() const { return m_wallet; }
     //! Clear persisted restore-time unavailability only when raw HWI
     //! discovery reproduces the exact fixed-vault fingerprint, path, and xpub.
     interfaces::Wallet::VaultStatus reconcileVaultHardwareSigners();
+    //! Last signer status published on the GUI thread. External availability
+    //! is UNKNOWN until a fresh discovery completes.
+    interfaces::Wallet::VaultStatus vaultStatus() const { return m_cached_vault_status; }
+    //! Last protection-renewal summary published on the GUI thread.
+    wallet::VaultRenewalStatus vaultRenewalStatus() const { return m_cached_vault_renewal_status; }
+    bool setVaultSetupState(interfaces::Wallet::VaultSetupState setup,
+                            interfaces::Wallet::VaultVerificationState verification,
+                            const std::optional<std::string>& expected_policy_commitment = std::nullopt);
+    bool setVaultParticipantType(const std::string& fingerprint,
+                                 interfaces::Wallet::VaultParticipantType type,
+                                 const std::optional<std::string>& expected_policy_commitment = std::nullopt);
+    bool setVaultSignerLost(
+        const std::string& fingerprint, bool lost,
+        const std::optional<std::string>& expected_policy_commitment = std::nullopt);
     ClientModel& clientModel() const { return *m_client_model; }
     void setClientModel(ClientModel* client_model);
 
@@ -159,7 +189,7 @@ public:
     CAmount getAvailableBalance(const wallet::CCoinControl* control);
 
 private:
-    std::unique_ptr<interfaces::Wallet> m_wallet;
+    std::shared_ptr<interfaces::Wallet> m_wallet;
     std::unique_ptr<interfaces::Handler> m_handler_unload;
     std::unique_ptr<interfaces::Handler> m_handler_status_changed;
     std::unique_ptr<interfaces::Handler> m_handler_address_book_changed;
@@ -168,6 +198,7 @@ private:
     std::unique_ptr<interfaces::Handler> m_handler_can_get_addrs_changed;
     ClientModel* m_client_model;
     interfaces::Node& m_node;
+    std::unique_ptr<QThreadPool> m_background_tasks;
 
     bool fForceCheckBalanceChanged{false};
 
@@ -181,6 +212,14 @@ private:
 
     // Cache some values to be able to detect changes
     interfaces::WalletBalances m_cached_balances;
+    interfaces::Wallet::VaultStatus m_cached_vault_status;
+    wallet::VaultRenewalStatus m_cached_vault_renewal_status;
+    uint64_t m_vault_signer_refresh_generation{0};
+    bool m_vault_signer_refresh_running{false};
+    bool m_vault_signer_refresh_pending{false};
+    uint64_t m_vault_renewal_refresh_generation{0};
+    bool m_vault_renewal_refresh_running{false};
+    bool m_vault_renewal_refresh_pending{false};
     EncryptionStatus cachedEncryptionStatus{Unencrypted};
     QTimer* timer;
 
@@ -190,6 +229,9 @@ private:
     void subscribeToCoreSignals();
     void unsubscribeFromCoreSignals();
     void checkBalanceChanged(const interfaces::WalletBalances& new_balances);
+    interfaces::Wallet::VaultStatus applyVaultSignerDiscovery(
+        interfaces::Wallet::VaultStatus status,
+        const interfaces::ExternalSignerDiscovery& discovery);
 
 Q_SIGNALS:
     // Signal that balance in wallet changed
@@ -220,6 +262,15 @@ Q_SIGNALS:
 
     void timerTimeout();
 
+    //! Published after setup metadata, loss metadata, or fresh signer
+    //! availability changes.
+    void vaultSignerStatusChanged();
+    //! Published once the latest requested signer refresh has completed,
+    //! including a fail-closed discovery result.
+    void vaultSignerStatusRefreshFinished();
+    //! Published after a nonblocking protection-amount/cluster refresh.
+    void vaultRenewalStatusChanged();
+
 public Q_SLOTS:
     /* Starts a timer to periodically update the balance */
     void startPollBalance();
@@ -232,6 +283,12 @@ public Q_SLOTS:
     void updateAddressBook(const QString &address, const QString &label, bool isMine, wallet::AddressPurpose purpose, int status);
     /* Current, immature or unconfirmed balance might have changed - emit 'balanceChanged' if so */
     void pollBalanceChanged();
+    //! Discover external signers off the GUI thread. Repeated calls while a
+    //! refresh is running coalesce into one follow-up refresh.
+    void refreshVaultSignerStatus();
+    //! Recompute Recovery Vault protection amounts and due clusters without
+    //! blocking the GUI. Repeated calls coalesce into one follow-up refresh.
+    void refreshVaultRenewalStatus();
 };
 
 #endif // BITCOIN_QT_WALLETMODEL_H

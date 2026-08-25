@@ -27,9 +27,10 @@ namespace Ui {
 }
 
 QT_BEGIN_NAMESPACE
-class QComboBox;
+class QButtonGroup;
 class QLabel;
-class QRadioButton;
+class QPushButton;
+class QVBoxLayout;
 class QUrl;
 QT_END_NAMESPACE
 
@@ -55,8 +56,12 @@ public:
 
     // Only used for testing-purposes
     wallet::CCoinControl* getCoinControl() { return m_coin_control.get(); }
+    bool currentTransactionIsUnsignedForTest() const;
 
 public Q_SLOTS:
+    /** Open the deliberately separate delayed-recovery workflow. No recovery
+     * branch is selected until the user chooses one. */
+    void startDelayedRecovery();
     void clear();
     void reject() override;
     void accept() override;
@@ -76,13 +81,34 @@ private:
     bool fNewRecipientAllowed{true};
     bool fFeeMinimized{true};
     const PlatformStyle *platformStyle;
-    QWidget* m_vault_mode_box{nullptr};
-    QRadioButton* m_vault_normal{nullptr};
-    QRadioButton* m_vault_recovery{nullptr};
-    QComboBox* m_vault_recovery_stage{nullptr};
-    QLabel* m_vault_lost{nullptr};
+    QWidget* m_recovery_panel{nullptr};
+    QVBoxLayout* m_recovery_stages_layout{nullptr};
+    QButtonGroup* m_recovery_stage_group{nullptr};
+    QLabel* m_vault_notice{nullptr};
+    QWidget* m_vault_recovery_offer{nullptr};
+    QPushButton* m_vault_recovery_offer_button{nullptr};
+    QLabel* m_vault_recovery_offer_availability{nullptr};
+    QLabel* m_recovery_selection_detail{nullptr};
     QString m_vault_send_block_reason;
-    bool updateVaultSendState();
+    interfaces::Wallet::VaultStatus m_vault_status;
+    bool m_delayed_recovery{false};
+    bool m_recovery_amount_initialized{false};
+    bool m_vault_direct_send_available{true};
+    bool m_sign_during_prepare{true};
+    int m_selected_recovery_stage{-1};
+    std::optional<std::string> m_prepared_vault_policy_commitment;
+    bool m_prepared_delayed_recovery{false};
+    int m_prepared_recovery_stage{-1};
+    int m_prepared_recovery_nrequired{-1};
+    std::optional<uint32_t> m_prepared_recovery_older;
+    std::optional<uint32_t> m_prepared_recovery_after;
+    bool updateVaultSendState(bool fresh_persisted_state = false);
+    bool preparedVaultContextStillMatches() const;
+    void clearPreparedVaultContext();
+    void rebuildRecoveryStages();
+    const interfaces::Wallet::VaultStatus::VaultRecoveryStage* selectedRecoveryStage() const;
+    void selectRecoveryStage(int index);
+    void cancelDelayedRecovery();
 
     // Copy PSBT to clipboard and offer to save it.
     void presentPSBT(PartiallySignedTransaction& psbt);
@@ -98,10 +124,15 @@ private:
      * @param[in,out] psbtx the PSBT to sign
      * @param[in,out] mtx needed to attempt to finalize
      * @param[in,out] complete whether the PSBT is complete (a successfully signed multisig transaction may not be complete)
+     * @param[out] signed_vault_state policy/loss state captured atomically with vault signing
      *
      * @returns false if any failure occurred, which may include the user rejection of a transaction on the device.
      */
-    bool signWithExternalSigner(PartiallySignedTransaction& psbt, CMutableTransaction& mtx, bool& complete);
+    bool signWithExternalSigner(
+        PartiallySignedTransaction& psbt,
+        CMutableTransaction& mtx,
+        bool& complete,
+        std::optional<wallet::VaultCommitState>& signed_vault_state);
     void updateFeeMinimizedLabel();
     void updateCoinControlState();
 

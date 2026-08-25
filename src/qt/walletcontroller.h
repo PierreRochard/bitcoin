@@ -11,18 +11,21 @@
 #include <util/result.h>
 #include <util/translation.h>
 
-#include <map>
-#include <functional>
-#include <memory>
-#include <string>
-#include <vector>
-
+#include <QLockFile>
 #include <QMessageBox>
 #include <QMutex>
+#include <QPointer>
 #include <QProgressDialog>
+#include <QString>
 #include <QThread>
 #include <QTimer>
-#include <QString>
+
+#include <functional>
+#include <map>
+#include <memory>
+#include <set>
+#include <string>
+#include <vector>
 
 class ClientModel;
 class OptionsModel;
@@ -69,6 +72,13 @@ public:
     void closeWallet(WalletModel* wallet_model, QWidget* parent = nullptr);
     void closeAllWallets(QWidget* parent = nullptr);
 
+    //! Retain ownership of a private Recovery Kit PDF that could not be
+    //! deleted while its external viewer was still using it. The controller
+    //! retries without keeping the setup surface open.
+    void retainRecoveryKitCleanup(QString path, std::unique_ptr<QLockFile> lock);
+    void retryPendingRecoveryKitCleanup();
+    size_t pendingRecoveryKitCleanupCount() const { return m_recovery_kit_cleanup.size(); }
+
 Q_SIGNALS:
     void walletAdded(WalletModel* wallet_model);
     void walletRemoved(WalletModel* wallet_model);
@@ -85,6 +95,12 @@ private:
     mutable QMutex m_mutex;
     std::vector<WalletModel*> m_wallets;
     std::unique_ptr<interfaces::Handler> m_handler_load_wallet;
+    struct RecoveryKitCleanup {
+        QString path;
+        std::unique_ptr<QLockFile> lock;
+    };
+    std::vector<RecoveryKitCleanup> m_recovery_kit_cleanup;
+    QTimer m_recovery_kit_cleanup_timer;
 
     friend class WalletControllerActivity;
     friend class MigrateWalletActivity;
@@ -109,9 +125,11 @@ protected:
     QObject* worker() const { return m_wallet_controller->m_activity_worker; }
 
     void showProgressDialog(const QString& title_text, const QString& label_text, bool show_minimized=false);
+    void closeProgressDialog();
 
     WalletController* const m_wallet_controller;
-    QWidget* const m_parent_widget;
+    QPointer<QWidget> m_parent_widget;
+    QPointer<QProgressDialog> m_progress_dialog;
     WalletModel* m_wallet_model{nullptr};
     bilingual_str m_error_message;
     std::vector<bilingual_str> m_warning_message;
@@ -196,22 +214,39 @@ public:
     ~MnemonicRestoreActivity() override;
 
     void restore(const std::string& wallet_name, const std::string& policy_json,
-                 std::vector<SecureString> mnemonics);
-    //! Retry only the timestamp-zero genesis rescan of an already installed
-    //! vault. No mnemonic material is needed or retained for this operation.
+                 std::vector<SecureString> mnemonics,
+                 std::set<std::string> local_fingerprints,
+                 std::set<std::string> hardware_fingerprints,
+                 bool enable_external_signing);
+    //! Resume the timestamp-zero historical scan of an already installed
+    //! vault from a safe checkpoint when available. No mnemonic material is
+    //! needed or retained for this operation.
     void rescan(WalletModel* wallet_model);
 
 Q_SIGNALS:
+    /** The restored wallet is installed and safe to display, but remains
+     * blocked from sending until its required genesis rescan completes. */
+    void installed(WalletModel* wallet_model);
+    void rescanStarted(WalletModel* wallet_model);
     void restored(WalletModel* wallet_model);
     void failed(const QString& error);
     void rescanFailed(WalletModel* wallet_model, const QString& error);
 
 private:
+    void beginInstalledRescan();
+    void startRescanWorker();
     void finish();
 
     std::string m_wallet_name;
     std::string m_policy_json;
+    std::string m_expected_policy_commitment;
     std::vector<SecureString> m_mnemonics;
+    std::set<std::string> m_local_fingerprints;
+    std::set<std::string> m_hardware_fingerprints;
+    bool m_enable_external_signing{false};
+    bool m_participant_provenance_valid{true};
+    std::unique_ptr<interfaces::Wallet> m_installed_wallet;
+    QPointer<WalletModel> m_active_wallet_model;
     QString m_rescan_error;
     RescanFn m_rescan_override;
 };

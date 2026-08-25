@@ -4,16 +4,6 @@
 
 #include <qt/walletmodel.h>
 
-#include <qt/addresstablemodel.h>
-#include <qt/clientmodel.h>
-#include <qt/guiconstants.h>
-#include <qt/guiutil.h>
-#include <qt/optionsmodel.h>
-#include <qt/paymentserver.h>
-#include <qt/recentrequeststablemodel.h>
-#include <qt/sendcoinsdialog.h>
-#include <qt/transactiontablemodel.h>
-
 #include <common/args.h>
 #include <interfaces/external_signer.h>
 #include <interfaces/handler.h>
@@ -23,10 +13,27 @@
 #include <node/interface_ui.h>
 #include <node/types.h>
 #include <psbt.h>
+#include <qt/addresstablemodel.h>
+#include <qt/clientmodel.h>
+#include <qt/guiconstants.h>
+#include <qt/guiutil.h>
+#include <qt/optionsmodel.h>
+#include <qt/paymentserver.h>
+#include <qt/recentrequeststablemodel.h>
+#include <qt/sendcoinsdialog.h>
+#include <qt/transactiontablemodel.h>
 #include <util/translation.h>
 #include <wallet/coincontrol.h>
 #include <wallet/types.h>
 #include <wallet/wallet.h>
+
+#include <QDebug>
+#include <QMessageBox>
+#include <QMetaObject>
+#include <QPointer>
+#include <QSet>
+#include <QThreadPool>
+#include <QTimer>
 
 #include <algorithm>
 #include <cstdint>
@@ -35,11 +42,6 @@
 #include <memory>
 #include <vector>
 
-#include <QDebug>
-#include <QMessageBox>
-#include <QSet>
-#include <QTimer>
-
 using wallet::CCoinControl;
 using wallet::CRecipient;
 using wallet::DEFAULT_DISABLE_WALLET;
@@ -47,7 +49,7 @@ using wallet::DEFAULT_DISABLE_WALLET;
 interfaces::Wallet::VaultStatus WalletModel::reconcileVaultHardwareSigners()
 {
     auto status{m_wallet->getVaultStatus()};
-    if (!status.is_vault || status.lost_signers.empty() || status.participants.empty()) return status;
+    if (!status.is_vault || status.participants.empty() || !m_wallet->hasExternalSigner()) return status;
 
     const std::string account_path{status.participants.front().path};
     if (account_path.empty() || std::any_of(status.participants.begin(), status.participants.end(), [&](const auto& participant) {
@@ -66,26 +68,88 @@ interfaces::Wallet::VaultStatus WalletModel::reconcileVaultHardwareSigners()
     } catch (const std::exception&) {
         return status;
     }
-    if (discovery.status != interfaces::ExternalSignerDiscoveryStatus::SUCCESS ||
-        std::any_of(discovery.devices.begin(), discovery.devices.end(), [](const auto& device) {
-            return !device.IsUsableForStagedVault();
-        })) {
-        return status;
+    status = applyVaultSignerDiscovery(std::move(status), discovery);
+    m_cached_vault_status = status;
+    Q_EMIT vaultSignerStatusChanged();
+    return status;
+}
+
+interfaces::Wallet::VaultStatus WalletModel::applyVaultSignerDiscovery(
+    interfaces::Wallet::VaultStatus status,
+    const interfaces::ExternalSignerDiscovery& discovery)
+{
+    using Availability = interfaces::Wallet::VaultSignerAvailability;
+    using ParticipantType = interfaces::Wallet::VaultParticipantType;
+
+    status.signer_discovery_complete = false;
+    for (auto& participant : status.participants) {
+        participant.availability = Availability::UNKNOWN;
+        const bool manually_lost = std::ranges::find(status.manually_lost_signers, participant.fingerprint) !=
+                                   status.manually_lost_signers.end();
+        if (manually_lost || participant.type == ParticipantType::AIR_GAPPED) {
+            participant.availability = Availability::UNAVAILABLE;
+        } else if (participant.type == ParticipantType::LOCAL_SOFTWARE) {
+            participant.availability = Availability::AVAILABLE;
+        }
     }
+    if (discovery.status != interfaces::ExternalSignerDiscoveryStatus::SUCCESS) return status;
+    // SUCCESS means the enumeration command returned, not that every device
+    // was inspected conclusively. A locked, duplicated, or otherwise broken
+    // diagnostic can hide an expected signer, so only a clean enumeration may
+    // turn absence into authoritative UNAVAILABLE. Exact usable matches remain
+    // valid positive evidence even when another diagnostic is inconclusive.
+    const bool reliable_enumeration = std::ranges::all_of(discovery.devices, [](const auto& device) {
+        return !device.locked && !device.duplicate && !device.error && !device.account_xpub_error;
+    });
+    status.signer_discovery_complete = reliable_enumeration;
 
     bool changed{false};
     for (const auto& device : discovery.devices) {
+        if (!device.IsUsableForStagedVault()) continue;
         const auto participant = std::find_if(status.participants.begin(), status.participants.end(), [&](const auto& item) {
-            return item.fingerprint == device.fingerprint && item.path == account_path &&
+            return item.fingerprint == device.fingerprint && item.path == discovery.account_path &&
                    device.account_xpub && item.xpub == *device.account_xpub;
         });
         if (participant != status.participants.end() &&
-            std::ranges::find(status.lost_signers, device.fingerprint) != status.lost_signers.end()) {
-            m_wallet->setLostSigner(device.fingerprint, /*lost=*/false);
-            changed = true;
+            std::ranges::find(status.lost_signers, device.fingerprint) != status.lost_signers.end() &&
+            std::ranges::find(status.manually_lost_signers, device.fingerprint) == status.manually_lost_signers.end()) {
+            changed |= m_wallet->clearAutomaticallyLostSigner(
+                device.fingerprint,
+                status.policy_commitment.empty() ? std::nullopt : std::optional<std::string>{status.policy_commitment});
         }
     }
-    return changed ? m_wallet->getVaultStatus() : status;
+    if (changed) {
+        status = m_wallet->getVaultStatus();
+        status.signer_discovery_complete = reliable_enumeration;
+    }
+
+    for (auto& participant : status.participants) {
+        const bool manually_lost = std::ranges::find(status.manually_lost_signers, participant.fingerprint) !=
+                                   status.manually_lost_signers.end();
+        if (manually_lost || participant.type == ParticipantType::AIR_GAPPED) {
+            participant.availability = Availability::UNAVAILABLE;
+            continue;
+        }
+        if (participant.type == ParticipantType::LOCAL_SOFTWARE) {
+            participant.availability = Availability::AVAILABLE;
+            continue;
+        }
+        const bool connected{std::any_of(discovery.devices.begin(), discovery.devices.end(), [&](const auto& device) {
+            return device.IsUsableForStagedVault() && device.fingerprint == participant.fingerprint &&
+                   discovery.account_path == participant.path && device.account_xpub &&
+                   *device.account_xpub == participant.xpub;
+        })};
+        if (connected) {
+            // This is a fresh exact hardware-identity observation. Do not
+            // persist it: a newly connected device must be checked again after
+            // restart before the UI can claim availability.
+            participant.type = ParticipantType::HARDWARE;
+            participant.availability = participant.is_lost ? Availability::UNKNOWN : Availability::AVAILABLE;
+        } else if (participant.type == ParticipantType::HARDWARE) {
+            participant.availability = reliable_enumeration ? Availability::UNAVAILABLE : Availability::UNKNOWN;
+        }
+    }
+    return status;
 }
 
 WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel& client_model, const PlatformStyle *platformStyle, QObject *parent) :
@@ -93,19 +157,157 @@ WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel
     m_wallet(std::move(wallet)),
     m_client_model(&client_model),
     m_node(client_model.node()),
+    m_background_tasks(std::make_unique<QThreadPool>()),
     optionsModel(client_model.getOptionsModel()),
     timer(new QTimer(this))
 {
+    m_background_tasks->setMaxThreadCount(2);
     addressTableModel = new AddressTableModel(this);
     transactionTableModel = new TransactionTableModel(platformStyle, this);
     recentRequestsTableModel = new RecentRequestsTableModel(this);
 
+    m_cached_vault_status = m_wallet->getVaultStatus();
+    m_cached_vault_renewal_status = {};
+
     subscribeToCoreSignals();
+}
+
+bool WalletModel::setVaultSetupState(interfaces::Wallet::VaultSetupState setup,
+                                     interfaces::Wallet::VaultVerificationState verification,
+                                     const std::optional<std::string>& expected_policy_commitment)
+{
+    if (!m_wallet->setVaultSetupState(setup, verification, expected_policy_commitment)) return false;
+    m_cached_vault_status = m_wallet->getVaultStatus();
+    Q_EMIT vaultSignerStatusChanged();
+    return true;
+}
+
+bool WalletModel::setVaultParticipantType(const std::string& fingerprint,
+                                          interfaces::Wallet::VaultParticipantType type,
+                                          const std::optional<std::string>& expected_policy_commitment)
+{
+    if (!m_wallet->setVaultParticipantType(fingerprint, type, expected_policy_commitment)) return false;
+    refreshVaultSignerStatus();
+    return true;
+}
+
+bool WalletModel::setVaultSignerLost(
+    const std::string& fingerprint, bool lost,
+    const std::optional<std::string>& expected_policy_commitment)
+{
+    if (!m_wallet->setLostSigner(fingerprint, lost, expected_policy_commitment)) return false;
+    updateTransaction();
+    pollBalanceChanged();
+    refreshVaultSignerStatus();
+    return true;
+}
+
+void WalletModel::refreshVaultSignerStatus()
+{
+    m_cached_vault_status = m_wallet->getVaultStatus();
+    Q_EMIT vaultSignerStatusChanged();
+    if (!m_cached_vault_status.is_vault || m_cached_vault_status.participants.empty() || !m_wallet->hasExternalSigner()) {
+        Q_EMIT vaultSignerStatusRefreshFinished();
+        return;
+    }
+    if (m_vault_signer_refresh_running) {
+        m_vault_signer_refresh_pending = true;
+        return;
+    }
+
+    const std::string account_path{m_cached_vault_status.participants.front().path};
+    if (account_path.empty() || std::any_of(m_cached_vault_status.participants.begin(),
+                                            m_cached_vault_status.participants.end(),
+                                            [&](const auto& participant) { return participant.path != account_path; })) {
+        Q_EMIT vaultSignerStatusRefreshFinished();
+        return;
+    }
+    if (auto* ctx = m_node.context(); !ctx || !ctx->args) {
+        Q_EMIT vaultSignerStatusRefreshFinished();
+        return;
+    }
+
+    m_vault_signer_refresh_running = true;
+    const uint64_t generation{++m_vault_signer_refresh_generation};
+    interfaces::Node* const node{&m_node};
+    QPointer<WalletModel> guard{this};
+    m_background_tasks->start([guard, node, account_path, generation] {
+        interfaces::ExternalSignerDiscovery discovery;
+        try {
+            discovery = node->discoverExternalSigners(account_path);
+        } catch (const std::exception& e) {
+            discovery.status = interfaces::ExternalSignerDiscoveryStatus::FAILED;
+            discovery.account_path = account_path;
+            discovery.error = e.what();
+        } catch (...) {
+            discovery.status = interfaces::ExternalSignerDiscoveryStatus::FAILED;
+            discovery.account_path = account_path;
+            discovery.error = "Unknown external-signer discovery failure";
+        }
+        if (!guard) return;
+        QMetaObject::invokeMethod(guard, [guard, generation, discovery = std::move(discovery)] {
+            if (!guard || generation != guard->m_vault_signer_refresh_generation) return;
+            guard->m_vault_signer_refresh_running = false;
+            if (guard->m_vault_signer_refresh_pending) {
+                // Do not briefly publish a result superseded by a newer
+                // freshness request (especially at the signing boundary).
+                guard->m_vault_signer_refresh_pending = false;
+                guard->refreshVaultSignerStatus();
+                return;
+            }
+            guard->m_cached_vault_status = guard->applyVaultSignerDiscovery(
+                guard->m_wallet->getVaultStatus(), discovery);
+            Q_EMIT guard->vaultSignerStatusChanged();
+            Q_EMIT guard->vaultSignerStatusRefreshFinished();
+        }, Qt::QueuedConnection);
+    });
+}
+
+void WalletModel::refreshVaultRenewalStatus()
+{
+    if (m_vault_renewal_refresh_running) {
+        m_vault_renewal_refresh_pending = true;
+        return;
+    }
+    m_vault_renewal_refresh_running = true;
+    const uint64_t generation{++m_vault_renewal_refresh_generation};
+    const std::shared_ptr<interfaces::Wallet> wallet_interface{m_wallet};
+    QPointer<WalletModel> guard{this};
+    m_background_tasks->start([guard, wallet_interface, generation] {
+        wallet::VaultRenewalStatus status;
+        try {
+            status = wallet_interface->getVaultRenewalStatus();
+        } catch (...) {
+            // A read-only dashboard refresh is fail-closed. Keep the empty
+            // unsupported status rather than making a stale protection claim.
+        }
+        if (!guard) return;
+        QMetaObject::invokeMethod(guard, [guard, generation, status = std::move(status)] {
+            if (!guard || generation != guard->m_vault_renewal_refresh_generation) return;
+            guard->m_vault_renewal_refresh_running = false;
+            if (guard->m_vault_renewal_refresh_pending) {
+                // Block-tip and balance requests coalesce to the newest
+                // snapshot, preventing stale due-set reminders.
+                guard->m_vault_renewal_refresh_pending = false;
+                guard->refreshVaultRenewalStatus();
+                return;
+            }
+            guard->m_cached_vault_renewal_status = std::move(status);
+            Q_EMIT guard->vaultRenewalStatusChanged();
+        }, Qt::QueuedConnection);
+    });
 }
 
 WalletModel::~WalletModel()
 {
     unsubscribeFromCoreSignals();
+    ++m_vault_signer_refresh_generation;
+    ++m_vault_renewal_refresh_generation;
+    m_vault_signer_refresh_pending = false;
+    m_vault_renewal_refresh_pending = false;
+    // Both jobs can reach node/chain state through shared interfaces. Join
+    // before WalletModel's owning controller can tear those dependencies down.
+    m_background_tasks->waitForDone();
 }
 
 void WalletModel::startPollBalance()
@@ -196,7 +398,10 @@ bool WalletModel::validateAddress(const QString& address) const
     return IsValidDestinationString(address.toStdString());
 }
 
-WalletModel::SendCoinsReturn WalletModel::prepareTransaction(WalletModelTransaction &transaction, const CCoinControl& coinControl)
+WalletModel::SendCoinsReturn WalletModel::prepareTransaction(WalletModelTransaction& transaction,
+                                                             const CCoinControl& coinControl,
+                                                             bool sign_during_prepare,
+                                                             std::optional<std::string> expected_vault_policy_commitment)
 {
     transaction.getWtx() = nullptr; // reset tx output
 
@@ -251,7 +456,12 @@ WalletModel::SendCoinsReturn WalletModel::prepareTransaction(WalletModelTransact
 
     try {
         auto& newTx = transaction.getWtx();
-        const auto& res = m_wallet->createTransaction(vecSend, coinControl, /*sign=*/!wallet().privateKeysDisabled(), /*change_pos=*/std::nullopt);
+        const auto& res = m_wallet->createTransaction(
+            vecSend,
+            coinControl,
+            /*sign=*/sign_during_prepare && !wallet().privateKeysDisabled(),
+            /*change_pos=*/std::nullopt,
+            std::move(expected_vault_policy_commitment));
         if (!res) {
             Q_EMIT message(tr("Send Coins"), QString::fromStdString(util::ErrorString(res).translated),
                            CClientUIInterface::MSG_ERROR);
@@ -281,7 +491,9 @@ WalletModel::SendCoinsReturn WalletModel::prepareTransaction(WalletModelTransact
     return SendCoinsReturn(OK);
 }
 
-void WalletModel::sendCoins(WalletModelTransaction& transaction)
+bool WalletModel::sendCoins(
+    WalletModelTransaction& transaction,
+    const std::optional<wallet::VaultCommitState>& expected_vault_state)
 {
     QByteArray transaction_array; /* store serialized transaction */
 
@@ -295,7 +507,9 @@ void WalletModel::sendCoins(WalletModelTransaction& transaction)
         }
 
         auto& newTx = transaction.getWtx();
-        wallet().commitTransaction(newTx, messages);
+        if (!wallet().commitTransaction(newTx, messages, expected_vault_state)) {
+            return false;
+        }
 
         DataStream ssTx;
         ssTx << TX_WITH_WITNESS(*newTx);
@@ -328,6 +542,7 @@ void WalletModel::sendCoins(WalletModelTransaction& transaction)
     }
 
     checkBalanceChanged(m_wallet->getBalances()); // update balance immediately, otherwise there could be a short noticeable delay until pollBalanceChanged hits
+    return true;
 }
 
 OptionsModel* WalletModel::getOptionsModel() const
@@ -586,12 +801,14 @@ bool WalletModel::bumpFee(Txid hash, Txid& new_hash)
     assert(!m_wallet->privateKeysDisabled() || wallet().hasExternalSigner());
 
     // sign bumped transaction
-    if (!m_wallet->signBumpTransaction(mtx)) {
+    std::optional<wallet::VaultCommitState> signed_vault_state;
+    if (!m_wallet->signBumpTransaction(mtx, &signed_vault_state)) {
         QMessageBox::critical(nullptr, tr("Fee bump error"), tr("Can't sign transaction."));
         return false;
     }
     // commit the bumped transaction
-    if(!m_wallet->commitBumpTransaction(hash, std::move(mtx), errors, new_hash)) {
+    if (!m_wallet->commitBumpTransaction(
+            hash, std::move(mtx), errors, new_hash, signed_vault_state)) {
         QMessageBox::critical(nullptr, tr("Fee bump error"), tr("Could not commit transaction") + "<br />(" +
             QString::fromStdString(errors[0].translated)+")");
         return false;

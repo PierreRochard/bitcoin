@@ -211,6 +211,8 @@ if(ENABLE_WALLET)
       transactiontablemodel.h
       transactionview.cpp
       transactionview.h
+      vaultrenewaldialog.cpp
+      vaultrenewaldialog.h
       walletcontroller.cpp
       walletcontroller.h
       walletframe.cpp
