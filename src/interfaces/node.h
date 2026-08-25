@@ -14,6 +14,7 @@
 #include <netbase.h>
 #include <support/allocators/secure.h>
 #include <util/log.h>
+#include <util/result.h>
 #include <util/translation.h>
 
 #include <cstddef>
@@ -162,6 +163,14 @@ public:
 
     //! Return lossless discovery evidence for fixed-vault signer selection.
     virtual ExternalSignerDiscovery discoverExternalSigners(const std::string& account_path) = 0;
+
+    //! Re-check the complete fixed-vault hardware roster, bind the selected
+    //! participant by path + fingerprint + account xpub, and only then ask
+    //! that exact device to display the descriptor address.
+    virtual util::Result<ExternalSignerAddressVerification> verifyAddressOnExternalSigner(
+        const std::vector<ExternalSignerExpectedIdentity>& expected_roster,
+        const std::string& preferred_fingerprint,
+        const std::string& descriptor) = 0;
 
     //! Get total bytes recv.
     virtual int64_t getTotalBytesRecv() = 0;

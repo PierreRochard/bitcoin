@@ -8,17 +8,21 @@
 #include <external_signer.h>
 #include <hwi/hwi.h>
 #include <key_io.h>
+#include <psbt.h>
+#include <streams.h>
 #include <tinyformat.h>
 #include <univalue.h>
 #include <util/chaintype.h>
 #include <util/strencodings.h>
 #include <util/subprocess.h>
+#include <util/translation.h>
 
 #include <algorithm>
 #include <exception>
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -215,6 +219,200 @@ ExternalSignerDiscovery DiscoverSubprocess(const std::string& command, const std
     return result;
 }
 
+struct ExactVerificationSelection {
+    std::vector<std::string> display_capable_fingerprints;
+    std::string fingerprint;
+    std::string device_path;
+};
+
+struct ExactSigningSelection {
+    const interfaces::ExternalSignerExpectedIdentity* identity;
+    std::string device_path;
+};
+
+bool PSBTReferencesFingerprint(const PartiallySignedTransaction& psbt, const std::string& fingerprint)
+{
+    const std::vector<unsigned char> parsed{ParseHex(fingerprint)};
+    auto matches = [&](const KeyOriginInfo& origin) {
+        return std::ranges::equal(parsed, origin.fingerprint);
+    };
+    for (const auto& input : psbt.inputs) {
+        if (std::ranges::any_of(input.hd_keypaths, [&](const auto& entry) {
+                return matches(entry.second);
+            }) ||
+            std::ranges::any_of(input.m_tap_bip32_paths, [&](const auto& entry) {
+                return matches(entry.second.second);
+            })) {
+            return true;
+        }
+    }
+    return false;
+}
+
+util::Result<std::vector<ExactSigningSelection>> SelectExactSigningDevices(
+    const ExternalSignerDiscovery& discovery,
+    const std::vector<interfaces::ExternalSignerExpectedIdentity>& relevant_signers)
+{
+    if (discovery.status != ExternalSignerDiscoveryStatus::SUCCESS) {
+        const std::string reason{discovery.status == ExternalSignerDiscoveryStatus::NOT_CONFIGURED ? "hardware discovery is not configured" : discovery.error.value_or("hardware discovery failed")};
+        return util::Error{Untranslated("Fresh hardware discovery did not complete: " + reason)};
+    }
+
+    // An ambiguous or partially inspected enumeration cannot establish that a
+    // colliding device is absent, so do not disclose the PSBT to any device.
+    for (const auto& device : discovery.devices) {
+        if (device.duplicate) {
+            return util::Error{Untranslated("Fresh hardware discovery found a duplicate fingerprint or device path")};
+        }
+        if (device.locked) {
+            return util::Error{Untranslated("A connected hardware wallet is locked or did not report its fingerprint")};
+        }
+        if (device.error) {
+            return util::Error{Untranslated("A connected hardware wallet could not be inspected: " + *device.error)};
+        }
+        if (device.account_xpub_error) {
+            return util::Error{Untranslated("A connected hardware wallet could not provide its account key: " + *device.account_xpub_error)};
+        }
+    }
+
+    std::vector<ExactSigningSelection> selected;
+    selected.reserve(relevant_signers.size());
+    for (const auto& identity : relevant_signers) {
+        const auto match{std::find_if(discovery.devices.begin(), discovery.devices.end(), [&](const auto& device) {
+            return device.fingerprint == identity.fingerprint;
+        })};
+        if (match == discovery.devices.end()) {
+            // A delayed-recovery branch may need only a subset of its policy
+            // keys. Missing authorized participants are therefore left for
+            // another signing pass or an offline PSBT; they must not force us
+            // to disclose the transaction to a different device.
+            continue;
+        }
+        if (!match->IsUsableForStagedVault()) {
+            return util::Error{Untranslated("A required hardware wallet no longer reports the capabilities needed to sign this Recovery Vault transaction")};
+        }
+        if (match->path.empty()) {
+            return util::Error{Untranslated("A required hardware wallet did not provide an exact device path")};
+        }
+        if (!match->account_xpub || *match->account_xpub != identity.account_xpub) {
+            return util::Error{Untranslated(
+                "A connected device has the expected fingerprint but a different complete account xpub")};
+        }
+        selected.push_back({&identity, match->path});
+    }
+    return selected;
+}
+
+util::Result<ExactVerificationSelection> SelectExactVerificationDevice(
+    const ExternalSignerDiscovery& discovery,
+    const std::vector<interfaces::ExternalSignerExpectedIdentity>& expected_roster,
+    const std::string& preferred_fingerprint)
+{
+    if (expected_roster.empty()) {
+        return util::Error{Untranslated("No configured hardware participants are available for verification")};
+    }
+    if (discovery.status != ExternalSignerDiscoveryStatus::SUCCESS) {
+        const std::string reason{discovery.status == ExternalSignerDiscoveryStatus::NOT_CONFIGURED ? "hardware discovery is not configured" : discovery.error.value_or("hardware discovery failed")};
+        return util::Error{Untranslated("Fresh hardware discovery did not complete: " + reason)};
+    }
+
+    std::map<std::string, const interfaces::ExternalSignerExpectedIdentity*> expected;
+    std::optional<std::string> account_path;
+    for (const auto& identity : expected_roster) {
+        if (identity.fingerprint.empty() || identity.account_path.empty() ||
+            !DecodeExtPubKey(identity.account_xpub).pubkey.IsValid()) {
+            return util::Error{Untranslated("The configured hardware identity is incomplete")};
+        }
+        if (!expected.emplace(identity.fingerprint, &identity).second) {
+            return util::Error{Untranslated("The configured hardware roster contains a duplicate fingerprint")};
+        }
+        if (account_path && *account_path != identity.account_path) {
+            return util::Error{Untranslated("The configured hardware participants do not share the expected account path")};
+        }
+        account_path = identity.account_path;
+    }
+    if (!preferred_fingerprint.empty() && !expected.contains(preferred_fingerprint)) {
+        return util::Error{Untranslated("The selected fingerprint is not a configured hardware participant")};
+    }
+    if (!account_path || discovery.account_path != *account_path) {
+        return util::Error{Untranslated("Fresh hardware discovery used a different account path")};
+    }
+
+    // Diagnose ambiguity before comparing sizes so a colliding fingerprint is
+    // never reduced to a generic roster-change error.
+    for (const auto& device : discovery.devices) {
+        if (device.duplicate) {
+            return util::Error{Untranslated("Fresh hardware discovery found a duplicate fingerprint or device path")};
+        }
+        if (device.locked) {
+            return util::Error{Untranslated("A connected hardware wallet is locked or did not report its fingerprint")};
+        }
+        if (device.error) {
+            return util::Error{Untranslated("A connected hardware wallet could not be inspected: " + *device.error)};
+        }
+        if (device.account_xpub_error) {
+            return util::Error{Untranslated("A connected hardware wallet could not provide its account key: " + *device.account_xpub_error)};
+        }
+        if (!device.IsUsableForStagedVault()) {
+            return util::Error{Untranslated("A connected hardware wallet is not currently usable for this Recovery Vault")};
+        }
+    }
+
+    if (discovery.devices.size() != expected.size()) {
+        return util::Error{Untranslated("The connected hardware-wallet roster changed or is incomplete")};
+    }
+
+    std::set<std::string> seen;
+    std::map<std::string, std::string> capable_paths;
+    for (const auto& device : discovery.devices) {
+        const auto configured{expected.find(device.fingerprint)};
+        if (configured == expected.end()) {
+            return util::Error{Untranslated("The connected hardware-wallet roster contains an unexpected participant")};
+        }
+        if (!seen.insert(device.fingerprint).second) {
+            return util::Error{Untranslated("Fresh hardware discovery found a duplicate fingerprint")};
+        }
+        if (!device.account_xpub || *device.account_xpub != configured->second->account_xpub) {
+            return util::Error{Untranslated(
+                "A connected device has the expected fingerprint but a different complete account xpub")};
+        }
+        if (device.path.empty()) {
+            return util::Error{Untranslated("A connected hardware wallet did not provide an exact device path")};
+        }
+        if (device.supports_multisig_address_display.value_or(false)) {
+            capable_paths.emplace(device.fingerprint, device.path);
+        }
+    }
+    if (seen.size() != expected.size()) {
+        return util::Error{Untranslated("The connected hardware-wallet roster changed or is incomplete")};
+    }
+
+    ExactVerificationSelection selection;
+    for (const auto& [fingerprint, path] : capable_paths) {
+        selection.display_capable_fingerprints.push_back(fingerprint);
+    }
+    auto selected{capable_paths.end()};
+    if (!preferred_fingerprint.empty()) selected = capable_paths.find(preferred_fingerprint);
+    if (selected == capable_paths.end() && !capable_paths.empty()) selected = capable_paths.begin();
+    if (selected != capable_paths.end()) {
+        selection.fingerprint = selected->first;
+        selection.device_path = selected->second;
+    }
+    return selection;
+}
+
+util::Result<std::string> ReadStringResult(
+    const UniValue& result,
+    const char* field,
+    const std::string& missing_error)
+{
+    const UniValue& error{result.find_value("error")};
+    if (error.isStr()) return util::Error{Untranslated("Signer returned error: " + error.get_str())};
+    const UniValue& value{result.find_value(field)};
+    if (!value.isStr() || value.get_str().empty()) return util::Error{Untranslated(missing_error)};
+    return value.get_str();
+}
+
 } // namespace
 
 interfaces::ExternalSignerDiscovery DiscoverExternalSigners(
@@ -232,4 +430,283 @@ interfaces::ExternalSignerDiscovery DiscoverExternalSigners(
     }
     result.account_path = account_path;
     return result;
+}
+
+util::Result<interfaces::ExternalSignerAddressVerification> VerifyAddressOnExactExternalSigner(
+    const std::string& command,
+    const std::string& chain,
+    const std::vector<interfaces::ExternalSignerExpectedIdentity>& expected_roster,
+    const std::string& preferred_fingerprint,
+    const std::string& descriptor)
+{
+    if (expected_roster.empty()) {
+        return util::Error{Untranslated("No configured hardware participants are available for verification")};
+    }
+
+    ExternalSignerDiscovery discovery;
+    try {
+        discovery = DiscoverExternalSigners(command, chain, expected_roster.front().account_path);
+    } catch (const std::exception& e) {
+        return util::Error{Untranslated("Fresh hardware discovery failed: " + std::string{e.what()})};
+    }
+    auto selection{SelectExactVerificationDevice(discovery, expected_roster, preferred_fingerprint)};
+    if (!selection) return util::Error{util::ErrorString(selection)};
+
+    interfaces::ExternalSignerAddressVerification evidence;
+    evidence.display_capable_fingerprints = selection->display_capable_fingerprints;
+    if (selection->fingerprint.empty()) return evidence;
+    const auto target_identity{std::find_if(expected_roster.begin(), expected_roster.end(), [&](const auto& identity) {
+        return identity.fingerprint == selection->fingerprint;
+    })};
+    if (target_identity == expected_roster.end()) {
+        return util::Error{Untranslated("The selected fingerprint is not a configured hardware participant")};
+    }
+
+    try {
+        const std::string expected_address{hwi::AddressFromDescriptor(descriptor)};
+        if (hwi::IsNativeSignerCommand(command)) {
+            const std::optional<ChainType> chain_type{ChainTypeFromString(chain)};
+            if (!chain_type) return util::Error{Untranslated("Unknown chain for native HWI: " + chain)};
+
+            const std::vector<hwi::DeviceInfo> devices{hwi::Enumerate()};
+            const size_t fingerprint_count{static_cast<size_t>(std::count_if(
+                devices.begin(), devices.end(), [&](const auto& device) {
+                    return device.fingerprint == selection->fingerprint;
+                }))};
+            if (fingerprint_count != 1) {
+                return util::Error{Untranslated(
+                    "The selected hardware fingerprint became missing or duplicated before display")};
+            }
+            const auto selected{std::find_if(devices.begin(), devices.end(), [&](const auto& device) {
+                return device.path == selection->device_path &&
+                       device.fingerprint == selection->fingerprint;
+            })};
+            if (selected == devices.end()) {
+                return util::Error{Untranslated("The exact hardware device changed before display")};
+            }
+
+            std::unique_ptr<hwi::HardwareWalletClient> client{hwi::ConnectDevice(*selected)};
+            client->SetChain(*chain_type);
+            if (hwi::FingerprintHex(client->GetMasterFingerprint()) != selection->fingerprint) {
+                return util::Error{Untranslated("The exact hardware device reported a different master fingerprint")};
+            }
+            if (!client->CanSignTaproot() || !client->CanSignMuSig2() ||
+                !client->CanDisplayMultisigAddress()) {
+                return util::Error{Untranslated(
+                    "The exact hardware device no longer reports the capabilities required for address verification")};
+            }
+            const std::string connected_xpub{EncodeExtPubKey(client->GetPubkeyAtPath(target_identity->account_path))};
+            if (connected_xpub != target_identity->account_xpub) {
+                return util::Error{Untranslated(
+                    "The exact hardware device has the expected fingerprint but a different complete account xpub")};
+            }
+            const std::string displayed{hwi::DisplayAddress(*client, descriptor)};
+            client->Close();
+            if (displayed != expected_address) {
+                return util::Error{Untranslated("The hardware wallet displayed a different address")};
+            }
+            evidence.displayed_fingerprint = selection->fingerprint;
+            evidence.displayed_address = displayed;
+            return evidence;
+        }
+
+        if (command.empty()) {
+            return util::Error{Untranslated("Hardware discovery is not configured")};
+        }
+        const std::vector<std::string> selector{Cat(
+            subprocess::util::split(command),
+            {"--device-path", selection->device_path, "--chain", chain})};
+        const UniValue xpub_result{RunCommandParseJSON(
+            Cat(selector, {"getxpub", target_identity->account_path}), "")};
+        auto connected_xpub{ReadStringResult(xpub_result, "xpub", "Signer returned no account xpub")};
+        if (!connected_xpub) return util::Error{util::ErrorString(connected_xpub)};
+        if (*connected_xpub != target_identity->account_xpub ||
+            !DecodeExtPubKey(*connected_xpub).pubkey.IsValid()) {
+            return util::Error{Untranslated(
+                "The exact hardware device has the expected fingerprint but a different complete account xpub")};
+        }
+        const UniValue display_result{RunCommandParseJSON(
+            Cat(selector, {"displayaddress", "--desc", descriptor}), "")};
+        auto displayed{ReadStringResult(display_result, "address", "Signer did not echo an address")};
+        if (!displayed) return util::Error{util::ErrorString(displayed)};
+        if (*displayed != expected_address) {
+            return util::Error{Untranslated("The hardware wallet displayed a different address")};
+        }
+        evidence.displayed_fingerprint = selection->fingerprint;
+        evidence.displayed_address = *displayed;
+        return evidence;
+    } catch (const std::exception& e) {
+        return util::Error{Untranslated(e.what())};
+    }
+}
+
+util::Result<std::vector<std::string>> SignPSBTWithExactExternalSigners(
+    const std::string& command,
+    const std::string& chain,
+    const std::vector<interfaces::ExternalSignerExpectedIdentity>& allowed_signers,
+    PartiallySignedTransaction& psbt,
+    const std::function<bool(const PartiallySignedTransaction&)>& validate_response)
+{
+    if (allowed_signers.empty()) {
+        return util::Error{Untranslated("No exact hardware participants are authorized to receive this PSBT")};
+    }
+
+    std::set<std::string> fingerprints;
+    std::optional<std::string> account_path;
+    std::vector<interfaces::ExternalSignerExpectedIdentity> relevant_signers;
+    for (const auto& identity : allowed_signers) {
+        if (!IsValidFingerprint(identity.fingerprint) || identity.account_path.empty() ||
+            !DecodeExtPubKey(identity.account_xpub).pubkey.IsValid()) {
+            return util::Error{Untranslated("An authorized hardware identity is incomplete")};
+        }
+        if (!fingerprints.insert(identity.fingerprint).second) {
+            return util::Error{Untranslated("The authorized hardware signer set contains a duplicate fingerprint")};
+        }
+        if (account_path && *account_path != identity.account_path) {
+            return util::Error{Untranslated("The authorized hardware signers do not share the expected account path")};
+        }
+        account_path = identity.account_path;
+        if (PSBTReferencesFingerprint(psbt, identity.fingerprint)) {
+            relevant_signers.push_back(identity);
+        }
+    }
+
+    // Do not enumerate or disclose anything when this transaction does not
+    // reference an authorized hardware participant.
+    if (relevant_signers.empty()) return std::vector<std::string>{};
+
+    ExternalSignerDiscovery discovery;
+    try {
+        discovery = DiscoverExternalSigners(command, chain, *account_path);
+    } catch (const std::exception& e) {
+        return util::Error{Untranslated("Fresh hardware discovery failed: " + std::string{e.what()})};
+    }
+    auto selected{SelectExactSigningDevices(discovery, relevant_signers)};
+    if (!selected) return util::Error{util::ErrorString(selected)};
+
+    const std::optional<ChainType> chain_type{ChainTypeFromString(chain)};
+    if (hwi::IsNativeSignerCommand(command) && !chain_type) {
+        return util::Error{Untranslated("Unknown chain for native HWI: " + chain)};
+    }
+
+    // Work on a copy so an error after one device has signed does not leave the
+    // caller with a partially mutated transaction that looks like full success.
+    PartiallySignedTransaction working{psbt};
+    std::vector<std::string> contacted;
+    contacted.reserve(selected->size());
+
+    for (const auto& selection : *selected) {
+        try {
+            if (hwi::IsNativeSignerCommand(command)) {
+                const std::vector<hwi::DeviceInfo> devices{hwi::Enumerate()};
+                const size_t fingerprint_count{static_cast<size_t>(std::count_if(
+                    devices.begin(), devices.end(), [&](const auto& device) {
+                        return device.fingerprint == selection.identity->fingerprint;
+                    }))};
+                const size_t path_count{static_cast<size_t>(std::count_if(
+                    devices.begin(), devices.end(), [&](const auto& device) {
+                        return device.path == selection.device_path;
+                    }))};
+                if (fingerprint_count != 1 || path_count != 1) {
+                    return util::Error{Untranslated(
+                        "An exact hardware signer became missing or duplicated before signing")};
+                }
+                const auto device{std::find_if(devices.begin(), devices.end(), [&](const auto& candidate) {
+                    return candidate.path == selection.device_path &&
+                           candidate.fingerprint == selection.identity->fingerprint;
+                })};
+                if (device == devices.end() || device->error || device->fingerprint.empty() ||
+                    device->needs_pin || device->needs_passphrase) {
+                    return util::Error{Untranslated("The exact hardware device changed or became unavailable before signing")};
+                }
+
+                std::unique_ptr<hwi::HardwareWalletClient> client{hwi::ConnectDevice(*device)};
+                client->SetChain(*chain_type);
+                if (hwi::FingerprintHex(client->GetMasterFingerprint()) != selection.identity->fingerprint) {
+                    client->Close();
+                    return util::Error{Untranslated("The exact hardware device reported a different master fingerprint")};
+                }
+                if (!client->CanSignTaproot() || !client->CanSignMuSig2()) {
+                    client->Close();
+                    return util::Error{Untranslated(
+                        "The exact hardware device no longer reports the capabilities required to sign this Recovery Vault transaction")};
+                }
+                const std::string connected_xpub{EncodeExtPubKey(
+                    client->GetPubkeyAtPath(selection.identity->account_path))};
+                if (connected_xpub != selection.identity->account_xpub) {
+                    client->Close();
+                    return util::Error{Untranslated(
+                        "The exact hardware device has the expected fingerprint but a different complete account xpub")};
+                }
+                const PartiallySignedTransaction signed_psbt{client->SignTx(working)};
+                client->Close();
+                auto merged{CombinePSBTs({working, signed_psbt})};
+                if (!merged) {
+                    return util::Error{Untranslated(
+                        "Hardware signer changed the unsigned transaction or returned conflicting PSBT data")};
+                }
+                working = std::move(*merged);
+            } else {
+                if (command.empty()) {
+                    return util::Error{Untranslated("Hardware discovery is not configured")};
+                }
+
+                // Re-enumerate immediately before disclosure so a subprocess
+                // device-path cannot silently be rebound after preflight.
+                const ExternalSignerDiscovery current{DiscoverExternalSigners(
+                    command, chain, selection.identity->account_path)};
+                auto current_selection{SelectExactSigningDevices(current, {*selection.identity})};
+                if (!current_selection) return util::Error{util::ErrorString(current_selection)};
+                if (current_selection->size() != 1 ||
+                    current_selection->front().device_path != selection.device_path) {
+                    return util::Error{Untranslated("The exact hardware device path changed before signing")};
+                }
+
+                const std::vector<std::string> selector{Cat(
+                    subprocess::util::split(command),
+                    {"--device-path", selection.device_path, "--chain", chain})};
+                const UniValue xpub_result{RunCommandParseJSON(
+                    Cat(selector, {"getxpub", selection.identity->account_path}), "")};
+                auto connected_xpub{ReadStringResult(xpub_result, "xpub", "Signer returned no account xpub")};
+                if (!connected_xpub) return util::Error{util::ErrorString(connected_xpub)};
+                if (*connected_xpub != selection.identity->account_xpub ||
+                    !DecodeExtPubKey(*connected_xpub).pubkey.IsValid()) {
+                    return util::Error{Untranslated(
+                        "The exact hardware device has the expected fingerprint but a different complete account xpub")};
+                }
+
+                DataStream serialized{};
+                serialized << working;
+                const UniValue sign_result{RunCommandParseJSON(
+                    Cat(selector, {"--stdin"}), "signtx " + EncodeBase64(serialized.str()))};
+                auto encoded{ReadStringResult(sign_result, "psbt", "Signer returned no PSBT")};
+                if (!encoded) return util::Error{util::ErrorString(encoded)};
+                auto signed_psbt{DecodeBase64PSBT(*encoded)};
+                if (!signed_psbt) {
+                    return util::Error{Untranslated(
+                        "Signer returned an invalid PSBT: " + util::ErrorString(signed_psbt).original)};
+                }
+                auto merged{CombinePSBTs({working, *signed_psbt})};
+                if (!merged) {
+                    return util::Error{Untranslated(
+                        "Hardware signer changed the unsigned transaction or returned conflicting PSBT data")};
+                }
+                working = std::move(*merged);
+            }
+            // The signer response is still isolated in `working`. Give the
+            // wallet a chance to reject unauthorized signature material after
+            // every device response, before it is sent to another signer or
+            // published back to the caller.
+            if (validate_response && !validate_response(working)) {
+                return util::Error{Untranslated(
+                    "A hardware signer returned unauthorized signature data")};
+            }
+            contacted.push_back(selection.identity->fingerprint);
+        } catch (const std::exception& e) {
+            return util::Error{Untranslated(e.what())};
+        }
+    }
+
+    psbt = std::move(working);
+    return contacted;
 }

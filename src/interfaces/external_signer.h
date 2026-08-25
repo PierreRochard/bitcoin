@@ -49,6 +49,24 @@ struct ExternalSignerDiscovery {
     std::optional<std::string> error;
 };
 
+//! Public identity material that a fixed-vault participant is expected to
+//! expose. A 32-bit fingerprint is only a lookup hint; verification must bind
+//! it to the complete account key at the policy's exact derivation path.
+struct ExternalSignerExpectedIdentity {
+    std::string fingerprint;
+    std::string account_path;
+    std::string account_xpub;
+};
+
+//! Evidence returned by one fresh, exact fixed-vault verification attempt.
+//! The capable roster is derived during that attempt rather than inherited
+//! from setup. When it is empty, no physical display was attempted.
+struct ExternalSignerAddressVerification {
+    std::vector<std::string> display_capable_fingerprints;
+    std::optional<std::string> displayed_fingerprint;
+    std::optional<std::string> displayed_address;
+};
+
 } // namespace interfaces
 
 #endif // BITCOIN_INTERFACES_EXTERNAL_SIGNER_H

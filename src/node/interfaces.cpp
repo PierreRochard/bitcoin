@@ -305,15 +305,29 @@ public:
         // its configured meaning, while listExternalSigners() and RPC keep
         // their legacy requirement for -signer.
         const std::string command{
-            args().IsArgSet("-signer")
-                ? args().GetArg("-signer", "")
-                : std::string{hwi::NATIVE_SIGNER_COMMAND}};
+            args().IsArgSet("-signer") ? args().GetArg("-signer", "") : std::string { hwi::NATIVE_SIGNER_COMMAND }};
         return DiscoverExternalSigners(command, Params().GetChainTypeString(), account_path);
 #else
         interfaces::ExternalSignerDiscovery result;
         result.status = interfaces::ExternalSignerDiscoveryStatus::FAILED;
         result.error = "External signer support is not available in this build";
         return result;
+#endif // ENABLE_EXTERNAL_SIGNER
+    }
+
+    util::Result<interfaces::ExternalSignerAddressVerification> verifyAddressOnExternalSigner(
+        const std::vector<interfaces::ExternalSignerExpectedIdentity>& expected_roster,
+        const std::string& preferred_fingerprint,
+        const std::string& descriptor) override
+    {
+#ifdef ENABLE_EXTERNAL_SIGNER
+        const std::string command{
+            args().IsArgSet("-signer") ? args().GetArg("-signer", "") : std::string { hwi::NATIVE_SIGNER_COMMAND }};
+        return VerifyAddressOnExactExternalSigner(
+            command, Params().GetChainTypeString(), expected_roster,
+            preferred_fingerprint, descriptor);
+#else
+        return util::Error{Untranslated("External signer support is not available in this build")};
 #endif // ENABLE_EXTERNAL_SIGNER
     }
     int64_t getTotalBytesRecv() override { return m_context->connman ? m_context->connman->GetTotalBytesRecv() : 0; }

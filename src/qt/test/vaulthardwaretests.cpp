@@ -6,12 +6,14 @@
 
 #include <chainparams.h>
 #include <common/args.h>
+#include <external_signer_discovery.h>
 #include <hwi/mock.h>
 #include <interfaces/node.h>
 #include <interfaces/wallet.h>
 #include <key.h>
 #include <key_io.h>
 #include <outputtype.h>
+#include <psbt.h>
 #include <qt/clientmodel.h>
 #include <qt/multisigwizard.h>
 #include <qt/optionsmodel.h>
@@ -29,6 +31,7 @@
 #include <QApplication>
 #include <QLabel>
 #include <QPushButton>
+#include <QSignalSpy>
 #include <QWizard>
 
 #include <algorithm>
@@ -78,19 +81,19 @@ FixedHardwareCandidate PrepareFixedHardwareCandidate()
 
     wallet::MultisigOptions options;
     options.type = OutputType::BECH32M;
-    options.fallback_older = MultisigWizard::kThirtyDayVaultDelay;
-    options.fallback_older_one_key = MultisigWizard::kSixtyDayVaultDelay;
+    options.fallback_older = MultisigWizard::kCurrentPrimaryVaultDelay;
+    options.fallback_older_one_key = MultisigWizard::kCurrentFinalVaultDelay;
     auto prepared{wallet::PrepareMultisigDescriptor(/*nrequired=*/2, specs, options)};
     Assert(prepared);
 
     wallet::VaultPolicyPackage policy;
     policy.network = Params().GetChainTypeString();
     policy.nrequired = 2;
-    policy.fallback_older = MultisigWizard::kThirtyDayVaultDelay;
-    policy.fallback_older_one_key = MultisigWizard::kSixtyDayVaultDelay;
+    policy.fallback_older = MultisigWizard::kCurrentPrimaryVaultDelay;
+    policy.fallback_older_one_key = MultisigWizard::kCurrentFinalVaultDelay;
     policy.recovery_stages = {
-        {2, MultisigWizard::kThirtyDayVaultDelay, {}},
-        {1, MultisigWizard::kSixtyDayVaultDelay, {}},
+        {2, MultisigWizard::kCurrentPrimaryVaultDelay, {}},
+        {1, MultisigWizard::kCurrentFinalVaultDelay, {}},
     };
     policy.descs = prepared->descs;
     policy.policy_id = prepared->policy_id;
@@ -270,6 +273,57 @@ void VaultHardwareTests::fixedDiscoveryBoundaryChangesFailClosed()
     }
 }
 
+void VaultHardwareTests::exactSigningRejectsFingerprintCollisionBeforeDisclosure()
+{
+    BasicTestingSetup test{ChainType::REGTEST};
+    m_node.setContext(&test.m_node);
+    test.m_node.args->ForceSetArg("-signer", "internal");
+    hwi::UsbEnumerateSuppress no_usb;
+
+    const FixedHardwareCandidate candidate{PrepareFixedHardwareCandidate()};
+    std::vector<uint32_t> account_path;
+    QVERIFY(ParseHDKeypath(candidate.account_path, account_path));
+    const auto account_key{DeriveExtKey(candidate.masters[0], account_path)};
+    QVERIFY(account_key);
+
+    CMutableTransaction transaction;
+    transaction.vin.resize(1);
+    transaction.vout.resize(1);
+    PartiallySignedTransaction psbt{transaction};
+    KeyOriginInfo origin;
+    const auto fingerprint_bytes{ParseHex(candidate.fingerprints[0])};
+    QCOMPARE(fingerprint_bytes.size(), size_t{4});
+    std::copy(fingerprint_bytes.begin(), fingerprint_bytes.end(), origin.fingerprint.begin());
+    origin.path = account_path;
+    psbt.inputs.front().hd_keypaths.emplace(account_key->first.key.GetPubKey(), origin);
+
+    const std::vector<interfaces::ExternalSignerExpectedIdentity> allowed{{candidate.fingerprints[0], candidate.account_path, candidate.xpubs[0]}};
+
+    {
+        hwi::MockDeviceOptions collision;
+        collision.fingerprint_override = candidate.fingerprints[0];
+        hwi::MockRegistration wrong_device{
+            candidate.masters[1], ChainType::REGTEST, collision};
+        const auto result{SignPSBTWithExactExternalSigners(
+            "internal", Params().GetChainTypeString(), allowed, psbt)};
+        QVERIFY(!result);
+        QVERIFY(QString::fromStdString(util::ErrorString(result).original)
+                    .contains(QStringLiteral("different complete account xpub"), Qt::CaseInsensitive));
+    }
+
+    const auto original_id{psbt.GetUniqueID()};
+    hwi::MockDeviceOptions malicious;
+    malicious.mutate_unsigned_transaction = true;
+    hwi::MockRegistration malicious_device{
+        candidate.masters[0], ChainType::REGTEST, malicious};
+    const auto malicious_result{SignPSBTWithExactExternalSigners(
+        "internal", Params().GetChainTypeString(), allowed, psbt)};
+    QVERIFY(!malicious_result);
+    QVERIFY(QString::fromStdString(util::ErrorString(malicious_result).original)
+                .contains(QStringLiteral("unsigned transaction"), Qt::CaseInsensitive));
+    QVERIFY(psbt.GetUniqueID() == original_id);
+}
+
 void VaultHardwareTests::hardwareOnlyRestoreReconcilesExactDevicesAcrossReload()
 {
     TestChain100Setup test;
@@ -311,7 +365,14 @@ void VaultHardwareTests::hardwareOnlyRestoreReconcilesExactDevicesAcrossReload()
         hwi::MockDeviceOptions fault;
         fault.account_xpub_error = "Injected reconnect xpub failure";
         hwi::MockRegistration broken{candidate.masters[0], ChainType::REGTEST, fault};
-        QCOMPARE(model->reconcileVaultHardwareSigners().lost_signers.size(), size_t{3});
+        const auto partial{model->reconcileVaultHardwareSigners()};
+        QCOMPARE(partial.lost_signers.size(), size_t{3});
+        QVERIFY(!partial.signer_discovery_complete);
+        const auto expected{std::ranges::find_if(partial.participants, [&](const auto& participant) {
+            return participant.fingerprint == candidate.fingerprints[0];
+        })};
+        QVERIFY(expected != partial.participants.end());
+        QCOMPARE(expected->availability, interfaces::Wallet::VaultSignerAvailability::UNKNOWN);
     }
     {
         hwi::MockRegistration exact{candidate.masters[0], ChainType::REGTEST};
@@ -325,6 +386,18 @@ void VaultHardwareTests::hardwareOnlyRestoreReconcilesExactDevicesAcrossReload()
         QCOMPARE(status.lost_signers.size(), size_t{2});
         QVERIFY(std::ranges::find(status.lost_signers, candidate.fingerprints[0]) == status.lost_signers.end());
     }
+
+    // An explicit user/RPC loss decision is different from restore-time
+    // unavailability and must not be undone merely because the device is
+    // currently connected.
+    QVERIFY(model->wallet().setLostSigner(candidate.fingerprints[0], /*lost=*/true));
+    {
+        hwi::MockRegistration exact{candidate.masters[0], ChainType::REGTEST};
+        status = model->reconcileVaultHardwareSigners();
+        QVERIFY(std::ranges::find(status.lost_signers, candidate.fingerprints[0]) != status.lost_signers.end());
+        QVERIFY(std::ranges::find(status.manually_lost_signers, candidate.fingerprints[0]) != status.manually_lost_signers.end());
+    }
+    QVERIFY(model->wallet().setLostSigner(candidate.fingerprints[0], /*lost=*/false));
 
     model->wallet().remove();
     model.reset();
@@ -351,6 +424,18 @@ void VaultHardwareTests::hardwareOnlyRestoreReconcilesExactDevicesAcrossReload()
         hwi::MockRegistration exact{candidate.masters[2], ChainType::REGTEST};
         status = model->reconcileVaultHardwareSigners();
         QVERIFY(status.lost_signers.empty());
+
+        QSignalSpy refreshed{model.get(), &WalletModel::vaultSignerStatusChanged};
+        model->refreshVaultSignerStatus();
+        QTRY_VERIFY_WITH_TIMEOUT(refreshed.count() >= 2, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(model->vaultStatus().signer_discovery_complete, 5000);
+        const auto refreshed_status{model->vaultStatus()};
+        const auto connected = std::ranges::find_if(refreshed_status.participants, [&](const auto& participant) {
+            return participant.fingerprint == candidate.fingerprints[2];
+        });
+        QVERIFY(connected != refreshed_status.participants.end());
+        QVERIFY(connected->type == interfaces::Wallet::VaultParticipantType::HARDWARE);
+        QVERIFY(connected->availability == interfaces::Wallet::VaultSignerAvailability::AVAILABLE);
 
         const auto destination{model->wallet().getNewDestination(OutputType::BECH32M, "")};
         QVERIFY2(destination, qPrintable(QString::fromStdString(util::ErrorString(destination).original)));

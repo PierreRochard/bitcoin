@@ -23,6 +23,7 @@ private Q_SLOTS:
     void fixedNativeDiscoveryWorksWithoutSignerOption();
     void fixedDiscoveryFailuresFailClosed();
     void fixedDiscoveryBoundaryChangesFailClosed();
+    void exactSigningRejectsFingerprintCollisionBeforeDisclosure();
     void hardwareOnlyRestoreReconcilesExactDevicesAcrossReload();
 
 private:

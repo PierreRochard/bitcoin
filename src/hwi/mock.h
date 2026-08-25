@@ -6,12 +6,12 @@
 #define BITCOIN_HWI_MOCK_H
 
 #include <hwi/hwi.h>
-
 #include <key.h>
 #include <span.h>
 #include <util/chaintype.h>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -39,6 +39,15 @@ struct MockDeviceOptions {
     std::optional<std::string> account_xpub_error;
     std::optional<std::string> display_address_error;
     std::optional<std::string> displayed_address_override;
+    //! Test-only malicious signer seam: return a PSBT for a different
+    //! unsigned transaction after accepting the original PSBT.
+    bool mutate_unsigned_transaction{false};
+    //! Test-only malicious signer seam: contribute signatures for another
+    //! participant while connected under this device's authorized identity.
+    std::optional<CExtKey> additional_signing_master;
+    //! Test-only collision seam: enumeration reports this fingerprint while
+    //! the connected client still exposes the master's real key identity.
+    std::optional<std::string> fingerprint_override;
 };
 
 //! RAII registration of a software "hardware wallet" that Enumerate() and

@@ -79,9 +79,11 @@ public:
         const KeyFingerprint master_fpr{m_master.id_key_fingerprint()};
         FlatSigningProvider provider;
 
-        auto add_origin = [&](const KeyOriginInfo& origin, const CPubKey* expected_pubkey, const XOnlyPubKey* expected_xonly) {
-            if (origin.fingerprint != master_fpr) return false;
-            auto derived = DeriveExtKey(m_master, origin.path);
+        auto add_origin = [&](const CExtKey& signing_master, const KeyFingerprint& signing_fpr,
+                              const KeyOriginInfo& origin, const CPubKey* expected_pubkey,
+                              const XOnlyPubKey* expected_xonly) {
+            if (origin.fingerprint != signing_fpr) return false;
+            auto derived = DeriveExtKey(signing_master, origin.path);
             if (!derived) {
                 throw HWIError("Failed to derive signing key", ErrorCode::BAD_ARGUMENT);
             }
@@ -103,14 +105,33 @@ public:
         bool have_key = false;
         for (const PSBTInput& input : psbt.inputs) {
             for (const auto& [pubkey, origin] : input.hd_keypaths) {
-                have_key |= add_origin(origin, &pubkey, nullptr);
+                have_key |= add_origin(m_master, master_fpr, origin, &pubkey, nullptr);
+                if (m_options.additional_signing_master) {
+                    have_key |= add_origin(*m_options.additional_signing_master,
+                                           m_options.additional_signing_master->id_key_fingerprint(),
+                                           origin, &pubkey, nullptr);
+                }
             }
             for (const auto& [xonly, leaf_origin] : input.m_tap_bip32_paths) {
-                have_key |= add_origin(leaf_origin.second, nullptr, &xonly);
+                have_key |= add_origin(m_master, master_fpr, leaf_origin.second, nullptr, &xonly);
+                if (m_options.additional_signing_master) {
+                    have_key |= add_origin(*m_options.additional_signing_master,
+                                           m_options.additional_signing_master->id_key_fingerprint(),
+                                           leaf_origin.second, nullptr, &xonly);
+                }
             }
         }
         if (!have_key) {
             throw HWIError("Signer fingerprint does not match any PSBT input", ErrorCode::INVALID_TX);
+        }
+
+        if (m_options.mutate_unsigned_transaction) {
+            auto mutated{psbt.GetUnsignedTx()};
+            if (!mutated || mutated->vout.empty()) {
+                throw HWIError("Cannot mutate this PSBT", ErrorCode::INVALID_TX);
+            }
+            ++mutated->vout.front().nValue;
+            return PartiallySignedTransaction{*mutated};
         }
 
         for (const PSBTInput& input : psbt.inputs) {
@@ -209,7 +230,8 @@ MockRegistration::MockRegistration(CExtKey master, ChainType chain, MockDeviceOp
 {
     LOCK(g_mocks_mutex);
     m_path = strprintf("mock:%d", g_next_mock_id++);
-    m_fingerprint = FingerprintHex(master.id_key_fingerprint());
+    m_fingerprint = options.fingerprint_override.value_or(
+        FingerprintHex(master.id_key_fingerprint()));
     auto rec = std::make_unique<MockRecord>();
     rec->path = m_path;
     rec->master = std::move(master);
