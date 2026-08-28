@@ -143,10 +143,8 @@ VaultRenewalResultPresentation PresentRenewalCommit(
     const wallet::VaultRenewalCommitResult& result)
 {
     VaultRenewalResultPresentation presentation;
-    for (std::size_t index{0}; index < result.transactions.size(); ++index) {
-        const auto& item{result.transactions[index]};
+    for (const auto& item : result.transactions) {
         const QString txid{QString::fromStdString(item.txid.ToString())};
-        const QString identity{item.txid.IsNull() ? WalletView::tr("Transaction %1").arg(index + 1) : txid};
         QString state;
         switch (item.outcome) {
         case wallet::VaultRenewalCommitOutcome::RELAYED:
@@ -173,12 +171,12 @@ VaultRenewalResultPresentation PresentRenewalCommit(
             state = WalletView::tr("not attempted");
             break;
         }
-        if (!item.txid.IsNull()) presentation.transaction_ids << txid;
-        QString detail{WalletView::tr("%1: %2").arg(identity, state)};
-        if (!item.error.empty()) {
-            detail += WalletView::tr(" — %1").arg(QString::fromStdString(item.error));
-        }
-        presentation.failures << detail;
+        presentation.outcomes.push_back({
+            QString::fromStdString(item.cluster_id),
+            item.txid.IsNull() ? QString{} : txid,
+            state,
+            QString::fromStdString(item.error),
+        });
     }
     return presentation;
 }
@@ -761,16 +759,8 @@ void WalletView::beginVaultRenewalSigning(const QString& batch_token)
     wallet::VaultRenewalBatch batch{*m_vault_renewal->batch};
     const std::shared_ptr<interfaces::Wallet> wallet_interface{walletModel->walletShared()};
     const auto operation_phase{m_vault_renewal->operation_phase};
-    const interfaces::Wallet::VaultStatus signer_status{walletModel->vaultStatus()};
-    QStringList hardware;
-    int local_count{0};
-    for (const auto& participant : signer_status.participants) {
-        if (participant.type == interfaces::Wallet::VaultParticipantType::HARDWARE) {
-            hardware << QString::fromStdString(participant.fingerprint).toUpper();
-        } else if (participant.type == interfaces::Wallet::VaultParticipantType::LOCAL_SOFTWARE) {
-            ++local_count;
-        }
-    }
+    const QStringList hardware{signer.hardware_participants};
+    const int local_count{signer.local_participant_count};
     QPointer<WalletView> guard{this};
     m_vault_renewal->workers.start(
         [guard, wallet_interface, batch = std::move(batch), operation_phase, generation,
@@ -801,10 +791,14 @@ void WalletView::beginVaultRenewalSigning(const QString& batch_token)
                                          .arg(static_cast<qulonglong>(total))
                                          .arg(participants);
                         } else {
-                            detail = WalletView::tr("Transaction %1 of %2: local keys are available; waiting for confirmations from connected hardware participants %3.")
+                            const QString participants{
+                                hardware.size() == 1 ?
+                                    WalletView::tr("connected hardware participant %1").arg(hardware.front()) :
+                                    WalletView::tr("connected hardware participants %1").arg(hardware.join(QStringLiteral(", ")))};
+                            detail = WalletView::tr("Transaction %1 of %2: waiting for approval on %3.")
                                          .arg(static_cast<qulonglong>(index + 1))
                                          .arg(static_cast<qulonglong>(total))
-                                         .arg(hardware.join(QStringLiteral(", ")));
+                                         .arg(participants);
                         }
                         guard->m_vault_renewal->dialog->setSigningProgress(index, total, detail);
                     }, Qt::QueuedConnection);

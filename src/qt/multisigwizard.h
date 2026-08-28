@@ -31,6 +31,7 @@ class WalletController;
 class WalletModel;
 class MultisigWizardTests;
 class QCloseEvent;
+class QEvent;
 class QLockFile;
 
 namespace interfaces {
@@ -157,6 +158,7 @@ public Q_SLOTS:
 
 protected:
     void closeEvent(QCloseEvent* event) override;
+    void changeEvent(QEvent* event) override;
 
 private:
     friend class MultisigIntroPage;

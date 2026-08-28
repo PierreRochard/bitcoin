@@ -9,6 +9,7 @@
 #include <qt/platformstyle.h>
 
 #include <QCheckBox>
+#include <QEvent>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -18,12 +19,32 @@
 #include <QSignalBlocker>
 #include <QStackedWidget>
 #include <QVBoxLayout>
+#include <QWidget>
 
 #include <algorithm>
 #include <limits>
 #include <ranges>
 
 namespace {
+QString ParticipantKind(interfaces::Wallet::VaultParticipantType type)
+{
+    using Type = interfaces::Wallet::VaultParticipantType;
+    switch (type) {
+    case Type::LOCAL_SOFTWARE: return VaultRenewalDialog::tr("This device");
+    case Type::HARDWARE: return VaultRenewalDialog::tr("Hardware");
+    case Type::AIR_GAPPED: return VaultRenewalDialog::tr("Offline signer");
+    case Type::UNKNOWN: return VaultRenewalDialog::tr("Key");
+    }
+    return VaultRenewalDialog::tr("Key");
+}
+
+QString ParticipantName(int index, interfaces::Wallet::VaultParticipantType type,
+                        const QString& fingerprint)
+{
+    const QString name{VaultRenewalDialog::tr("Key %1 · %2").arg(index + 1).arg(ParticipantKind(type))};
+    return fingerprint.isEmpty() ? name : VaultRenewalDialog::tr("%1 (%2)").arg(name, fingerprint);
+}
+
 QLabel* MakeHeadline(const QString& text, QWidget* parent)
 {
     auto* label{new QLabel(text, parent)};
@@ -36,14 +57,30 @@ QLabel* MakeHeadline(const QString& text, QWidget* parent)
     return label;
 }
 
+QWidget* MakeIllustratedHeadline(const QString& text,
+                                 GUIUtil::VaultIllustration illustration,
+                                 QWidget* parent,
+                                 QLabel** headline_out = nullptr)
+{
+    auto* row{new QWidget(parent)};
+    auto* layout{new QHBoxLayout(row)};
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(12);
+    auto* headline{MakeHeadline(text, row)};
+    if (headline_out) *headline_out = headline;
+    layout->addWidget(headline, 1, Qt::AlignVCenter);
+    layout->addWidget(
+        new GUIUtil::VaultIllustrationLabel(illustration, QSize{120, 80}, row),
+        0, Qt::AlignTop);
+    return row;
+}
+
 QFrame* MakeCard(const QString& name, QWidget* parent)
 {
     auto* card{new QFrame(parent)};
     card->setObjectName(name);
-    card->setFrameShape(QFrame::StyledPanel);
-    card->setStyleSheet(QStringLiteral(
-        "QFrame { background: palette(alternate-base); border: 1px solid palette(mid); border-radius: 8px; } "
-        "QFrame QLabel, QFrame QCheckBox { border: none; background: transparent; }"));
+    card->setProperty("vaultPaper", true);
+    card->setFrameShape(QFrame::NoFrame);
     return card;
 }
 
@@ -105,8 +142,15 @@ VaultRenewalSignerPresentation PresentVaultRenewalSigners(
             "This vault does not have the exact three-participant roster required for guided renewal.");
     }
 
-    for (const auto& participant : status.participants) {
+    for (int index = 0; index < static_cast<int>(status.participants.size()); ++index) {
+        const auto& participant = status.participants[index];
         const QString fingerprint{QString::fromStdString(participant.fingerprint).toUpper()};
+        const QString name{ParticipantName(index, participant.type, fingerprint)};
+        if (participant.type == Type::HARDWARE) {
+            presentation.hardware_participants << name;
+        } else if (participant.type == Type::LOCAL_SOFTWARE) {
+            ++presentation.local_participant_count;
+        }
         QString state;
         QString blocker;
         if (participant.is_lost ||
@@ -114,8 +158,8 @@ VaultRenewalSignerPresentation PresentVaultRenewalSigners(
                 status.manually_lost_signers.end()) {
             state = VaultRenewalDialog::tr("Marked lost — renewal blocked");
             blocker = VaultRenewalDialog::tr(
-                          "Participant %1 is marked lost. Mark it found only after recovering that exact key.")
-                          .arg(fingerprint);
+                          "%1 is marked lost. Mark it found only after recovering that exact key.")
+                          .arg(name);
         } else {
             switch (participant.type) {
             case Type::LOCAL_SOFTWARE:
@@ -123,7 +167,7 @@ VaultRenewalSignerPresentation PresentVaultRenewalSigners(
                     state = VaultRenewalDialog::tr("Local key ready");
                 } else {
                     state = VaultRenewalDialog::tr("Local key unavailable");
-                    blocker = VaultRenewalDialog::tr("Local participant %1 is unavailable.").arg(fingerprint);
+                    blocker = VaultRenewalDialog::tr("%1 is unavailable.").arg(name);
                 }
                 break;
             case Type::HARDWARE:
@@ -133,29 +177,29 @@ VaultRenewalSignerPresentation PresentVaultRenewalSigners(
                         "Hardware participant status is not fresh yet. Wait for Check Status to finish.");
                 } else if (participant.availability == Availability::AVAILABLE) {
                     state = VaultRenewalDialog::tr(
-                        "Hardware connected — confirmations will be requested");
+                        "Hardware connected — approval will be requested");
                 } else {
                     state = VaultRenewalDialog::tr("Hardware unavailable");
                     blocker = VaultRenewalDialog::tr(
-                                  "Connect the exact hardware participant %1 and refresh its status.")
-                                  .arg(fingerprint);
+                                  "Connect %1 and refresh its status.")
+                                  .arg(name);
                 }
                 break;
             case Type::AIR_GAPPED:
                 state = VaultRenewalDialog::tr("Offline / PSBT — unsupported for renewal");
                 blocker = VaultRenewalDialog::tr(
-                              "Participant %1 is configured for offline PSBT signing. Protection renewal requires direct signing and does not export PSBTs.")
-                              .arg(fingerprint);
+                              "%1 is configured for offline PSBT signing. Protection renewal requires direct signing and does not export PSBTs.")
+                              .arg(name);
                 break;
             case Type::UNKNOWN:
                 state = VaultRenewalDialog::tr("Signing source unknown");
                 blocker = VaultRenewalDialog::tr(
-                              "The signing source for participant %1 is unknown. Review participant setup before renewing.")
-                              .arg(fingerprint);
+                              "The signing source for %1 is unknown. Review participant setup before renewing.")
+                              .arg(name);
                 break;
             }
         }
-        presentation.roster << VaultRenewalDialog::tr("Participant %1 · %2").arg(fingerprint, state);
+        presentation.roster << VaultRenewalDialog::tr("%1 · %2").arg(name, state);
         if (!blocker.isEmpty()) {
             presentation.ready = false;
             if (presentation.reason.isEmpty()) presentation.reason = blocker;
@@ -173,6 +217,7 @@ VaultRenewalDialog::VaultRenewalDialog(const PlatformStyle* platform_style, QWid
     setWindowModality(Qt::WindowModal);
     setMinimumSize(640, 520);
     resize(760, 600);
+    GUIUtil::applyRecoveryVaultStyle(this);
 
     auto* outer{new QVBoxLayout(this)};
     outer->setContentsMargins(18, 16, 18, 16);
@@ -192,10 +237,23 @@ VaultRenewalDialog::VaultRenewalDialog(const PlatformStyle* platform_style, QWid
     auto* plan_layout{new QVBoxLayout(plan_page)};
     plan_layout->setContentsMargins(2, 2, 8, 2);
     plan_layout->setSpacing(12);
-    plan_layout->addWidget(MakeHeadline(tr("Renew three-key protection"), plan_page));
-    plan_layout->addWidget(MakeBody(
+    auto* plan_heading{new QWidget(plan_page)};
+    auto* plan_heading_layout{new QHBoxLayout(plan_heading)};
+    plan_heading_layout->setContentsMargins(0, 0, 0, 0);
+    plan_heading_layout->setSpacing(12);
+    auto* plan_heading_copy{new QVBoxLayout};
+    plan_heading_copy->setContentsMargins(0, 0, 0, 0);
+    plan_heading_copy->setSpacing(6);
+    plan_heading_copy->addWidget(MakeHeadline(tr("Renew three-key protection"), plan_heading));
+    plan_heading_copy->addWidget(MakeBody(
         tr("Move selected coins to fresh addresses under this same Recovery Vault policy. All three keys remain able to spend forever; renewal postpones when additional recovery paths become available."),
-        plan_page, QStringLiteral("vaultRenewalIntroduction")));
+        plan_heading, QStringLiteral("vaultRenewalIntroduction")));
+    plan_heading_layout->addLayout(plan_heading_copy, 1);
+    plan_heading_layout->addWidget(
+        new GUIUtil::VaultIllustrationLabel(
+            GUIUtil::VaultIllustration::PROTECTION_RENEWAL, QSize{120, 80}, plan_heading),
+        0, Qt::AlignTop);
+    plan_layout->addWidget(plan_heading);
     m_plan_privacy_notice = MakeBody(
         tr("Renewal amounts, eligibility, fund grouping, and participant details are hidden while privacy mode is active."),
         plan_page, QStringLiteral("vaultRenewalPlanPrivacyNotice"));
@@ -307,7 +365,9 @@ VaultRenewalDialog::VaultRenewalDialog(const PlatformStyle* platform_style, QWid
     auto* review_layout{new QVBoxLayout(review_page)};
     review_layout->setContentsMargins(2, 2, 8, 2);
     review_layout->setSpacing(12);
-    review_layout->addWidget(MakeHeadline(tr("Review protection renewal"), review_page));
+    review_layout->addWidget(MakeIllustratedHeadline(
+        tr("Review protection renewal"),
+        GUIUtil::VaultIllustration::PROTECTION_RENEWAL, review_page));
     m_review_privacy_notice = MakeBody(
         tr("Transaction amounts, fees, and fund grouping are hidden while privacy mode is active. Turn privacy mode off to sign."),
         review_page, QStringLiteral("vaultRenewalReviewPrivacyNotice"));
@@ -322,7 +382,7 @@ VaultRenewalDialog::VaultRenewalDialog(const PlatformStyle* platform_style, QWid
     m_review_batch_layout->setSpacing(7);
     review_layout->addWidget(m_review_card);
     auto* consequences{MakeBody(
-        tr("Existing privacy groups are never combined, so renewal does not link groups that are not already connected on-chain. An oversized group may be split into multiple transactions only when transaction weight requires it. Each transaction returns to one fresh internal vault address. Your hardware devices may ask for repeated confirmations. Every transaction will be signed before any is broadcast. Fees reduce the returned amount, and the 90/180-day clocks restart only after each new output's first confirmation."),
+        tr("Existing privacy groups are never combined, so renewal does not link groups that are not already connected on-chain. An oversized group may be split into multiple transactions only when transaction weight requires it. Each transaction returns to one fresh internal vault address. Your hardware devices may ask for repeated approvals. Every transaction will be signed before any is broadcast. Fees reduce the returned amount, and the 90/180-day clocks restart only after each new output's first confirmation."),
         review_page, QStringLiteral("vaultRenewalConsequences"))};
     consequences->setAccessibleName(tr("Renewal consequences"));
     review_layout->addWidget(consequences);
@@ -366,19 +426,28 @@ VaultRenewalDialog::VaultRenewalDialog(const PlatformStyle* platform_style, QWid
     auto* progress_layout{new QVBoxLayout(progress_page)};
     progress_layout->setContentsMargins(2, 2, 2, 2);
     progress_layout->setSpacing(12);
-    m_progress_headline = MakeHeadline(tr("Signing renewal transactions"), progress_page);
+    auto* progress_headline{MakeIllustratedHeadline(
+        tr("Signing renewal transactions"),
+        GUIUtil::VaultIllustration::PROTECTION_RENEWAL, progress_page,
+        &m_progress_headline)};
     m_progress_detail = MakeBody({}, progress_page, QStringLiteral("vaultRenewalProgressDetail"));
     m_progress_detail->setAccessibleName(tr("Renewal progress detail"));
+    m_progress_count = new QLabel(progress_page);
+    m_progress_count->setObjectName(QStringLiteral("vaultRenewalProgressCount"));
+    m_progress_count->setProperty("vaultEyebrow", true);
+    m_progress_count->setAlignment(Qt::AlignHCenter | Qt::AlignVCenter);
+    m_progress_count->setAccessibleName(tr("Renewal progress count"));
     m_progress = new QProgressBar(progress_page);
     m_progress->setObjectName(QStringLiteral("vaultRenewalProgress"));
     m_progress->setAccessibleName(tr("Renewal progress"));
-    m_progress->setTextVisible(true);
+    m_progress->setTextVisible(false);
     m_cancel_progress = new QPushButton(tr("Cancel Signing"), progress_page);
     m_cancel_progress->setObjectName(QStringLiteral("vaultRenewalCancelProgressButton"));
     m_cancel_progress->setAccessibleDescription(tr("Stop before broadcast and discard the in-memory signed batch."));
     progress_layout->addStretch();
-    progress_layout->addWidget(m_progress_headline);
+    progress_layout->addWidget(progress_headline);
     progress_layout->addWidget(m_progress_detail);
+    progress_layout->addWidget(m_progress_count);
     progress_layout->addWidget(m_progress);
     progress_layout->addWidget(m_cancel_progress, 0, Qt::AlignLeft);
     progress_layout->addStretch();
@@ -398,13 +467,21 @@ VaultRenewalDialog::VaultRenewalDialog(const PlatformStyle* platform_style, QWid
     auto* result_layout{new QVBoxLayout(result_page)};
     result_layout->setContentsMargins(2, 2, 2, 2);
     result_layout->setSpacing(12);
-    m_result_headline = MakeHeadline({}, result_page);
+    auto* result_headline{MakeIllustratedHeadline(
+        {}, GUIUtil::VaultIllustration::PROTECTION_RENEWAL, result_page,
+        &m_result_headline)};
     m_result_detail = MakeBody({}, result_page, QStringLiteral("vaultRenewalResultDetail"));
     m_result_detail->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
     m_result_detail->setAccessibleName(tr("Renewal result"));
+    m_result_list = new QWidget(result_page);
+    m_result_list->setObjectName(QStringLiteral("vaultRenewalResultList"));
+    m_result_list_layout = new QVBoxLayout(m_result_list);
+    m_result_list_layout->setContentsMargins(0, 4, 0, 0);
+    m_result_list_layout->setSpacing(4);
     result_layout->addStretch();
-    result_layout->addWidget(m_result_headline);
+    result_layout->addWidget(result_headline);
     result_layout->addWidget(m_result_detail);
+    result_layout->addWidget(m_result_list);
     result_layout->addStretch();
     auto* result_actions{new QHBoxLayout};
     m_retry_button = new QPushButton(tr("Retry Remaining"), result_page);
@@ -483,12 +560,15 @@ void VaultRenewalDialog::setPrivacy(bool privacy)
         if (privacy) {
             m_progress_headline->setText(tr("Renewal in progress"));
             m_progress->setFormat(tr("Progress hidden"));
+            m_progress_count->setText(tr("Progress hidden"));
             m_progress_detail->setText(tr("Transaction and participant details are hidden while privacy mode is active."));
         } else {
             m_progress_headline->setText(
                 m_broadcast_started ? tr("Broadcasting signed transactions") : tr("Signing renewal transactions"));
-            m_progress->setFormat(
-                m_broadcast_started ? tr("Broadcast %1 of %2").arg(m_progress->value()).arg(m_progress->maximum()) : tr("Signed %1 of %2").arg(m_progress->value()).arg(m_progress->maximum()));
+            const QString count{
+                m_broadcast_started ? tr("Broadcast %1 of %2").arg(m_progress->value()).arg(m_progress->maximum()) : tr("Signed %1 of %2").arg(m_progress->value()).arg(m_progress->maximum())};
+            m_progress->setFormat(count);
+            m_progress_count->setText(count);
             m_progress_detail->setText(m_progress_unmasked_detail);
         }
     }
@@ -696,7 +776,9 @@ void VaultRenewalDialog::updatePlanPresentation()
                           .arg(amountText(m_plan.excluded_uneconomic),
                                CoinCount(m_plan.excluded_uneconomic_count));
     }
-    m_plan_exclusions->setText(exclusions.isEmpty() ? tr("No eligible funds were excluded.") : tr("Not included: %1.").arg(exclusions.join(QStringLiteral(" · "))));
+    m_plan_exclusions->setText(
+        exclusions.isEmpty() ? tr("Unavailable for renewal: none.") :
+                               tr("Unavailable for renewal: %1.").arg(exclusions.join(QStringLiteral(" · "))));
 
     if (m_plan.batches.empty()) {
         m_plan_status->setText(
@@ -745,14 +827,24 @@ void VaultRenewalDialog::rebuildBatches(QVBoxLayout* layout, bool detailed)
     ClearLayout(layout);
     for (std::size_t index{0}; index < m_plan.batches.size(); ++index) {
         const auto& batch{m_plan.batches[index]};
-        auto* row{MakeCard(QStringLiteral("vaultRenewalBatch%1").arg(index + 1), nullptr)};
+        auto* row{new QFrame};
+        row->setObjectName(QStringLiteral("vaultRenewalBatch%1").arg(index + 1));
+        row->setProperty("vaultInset", true);
+        row->setFrameShape(QFrame::NoFrame);
         auto* row_layout{new QVBoxLayout(row)};
         row_layout->setContentsMargins(9, 7, 9, 7);
-        auto* title{MakeBody(
-            (m_plan.fees_ready ? tr("Transaction %1 · %2") : tr("Privacy group %1 · %2"))
-                .arg(static_cast<qulonglong>(index + 1))
-                .arg(m_plan.fees_ready ? InputCount(batch.input_count) : CoinCount(batch.input_count)),
-            row)};
+        const int mapped_group{privacyGroupNumber(batch.identifier)};
+        const int group_number{mapped_group > 0 ? mapped_group : static_cast<int>(index) + 1};
+        const QString title_text{
+            m_plan.fees_ready ?
+                tr("Transaction %1 · Privacy group %2 · %3")
+                    .arg(static_cast<qulonglong>(index + 1))
+                    .arg(group_number)
+                    .arg(InputCount(batch.input_count)) :
+                tr("Privacy group %1 · %2")
+                    .arg(group_number)
+                    .arg(CoinCount(batch.input_count))};
+        auto* title{MakeBody(title_text, row)};
         QFont title_font{title->font()};
         title_font.setBold(true);
         title->setFont(title_font);
@@ -768,10 +860,19 @@ void VaultRenewalDialog::rebuildBatches(QVBoxLayout* layout, bool detailed)
     }
 }
 
+int VaultRenewalDialog::privacyGroupNumber(const QString& identifier) const
+{
+    for (std::size_t index{0}; index < m_available_groups.size(); ++index) {
+        if (m_available_groups[index].identifier == identifier) {
+            return static_cast<int>(index) + 1;
+        }
+    }
+    return 0;
+}
+
 QString VaultRenewalDialog::amountText(CAmount amount) const
 {
-    return BitcoinUnits::formatWithPrivacy(
-        m_display_unit, amount, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy);
+    return GUIUtil::formatVaultAmount(m_display_unit, amount, m_privacy);
 }
 
 void VaultRenewalDialog::setSigningProgress(std::size_t completed, std::size_t total, const QString& detail)
@@ -784,9 +885,11 @@ void VaultRenewalDialog::setSigningProgress(std::size_t completed, std::size_t t
     const int value{static_cast<int>(std::min<std::size_t>(completed, static_cast<std::size_t>(maximum)))};
     m_progress->setRange(0, std::max(1, maximum));
     m_progress->setValue(value);
-    m_progress->setFormat(
+    const QString count{
         m_privacy ? tr("Progress hidden") :
-                    tr("Signed %1 of %2").arg(static_cast<qulonglong>(completed)).arg(static_cast<qulonglong>(total)));
+                    tr("Signed %1 of %2").arg(static_cast<qulonglong>(completed)).arg(static_cast<qulonglong>(total))};
+    m_progress->setFormat(count);
+    m_progress_count->setText(count);
     if (m_cancellation_pending) {
         m_progress_unmasked_detail = tr("Stopping safely before broadcast…");
         m_progress_detail->setText(
@@ -814,9 +917,11 @@ void VaultRenewalDialog::setBroadcastProgress(std::size_t completed, std::size_t
     const int value{static_cast<int>(std::min<std::size_t>(completed, static_cast<std::size_t>(maximum)))};
     m_progress->setRange(0, std::max(1, maximum));
     m_progress->setValue(value);
-    m_progress->setFormat(
+    const QString count{
         m_privacy ? tr("Progress hidden") :
-                    tr("Broadcast %1 of %2").arg(static_cast<qulonglong>(completed)).arg(static_cast<qulonglong>(total)));
+                    tr("Broadcast %1 of %2").arg(static_cast<qulonglong>(completed)).arg(static_cast<qulonglong>(total))};
+    m_progress->setFormat(count);
+    m_progress_count->setText(count);
     m_progress_detail->setText(
         m_privacy ? tr("Transaction details are hidden while privacy mode is active.") : detail);
     m_cancel_progress->setText(tr("Broadcast in progress"));
@@ -848,6 +953,8 @@ void VaultRenewalDialog::renderResult()
 {
     if (!m_last_result) return;
     const auto& result{*m_last_result};
+    ClearLayout(m_result_list_layout);
+    m_result_list->hide();
     if (m_privacy) {
         m_result_headline->setText(tr("Renewal finished"));
         m_result_detail->setText(
@@ -912,11 +1019,37 @@ void VaultRenewalDialog::renderResult()
                                                 .arg(TransactionCount(result.stored_not_relayed)) :
                                             tr("The signed renewal batch was not broadcast. Existing vault coins and their recovery clocks are unchanged."));
     }
-    if (!result.failures.isEmpty()) {
-        const QString heading{result.terminal_error.isEmpty() ? QString{} : tr("Recorded prior per-transaction outcomes:\n")};
-        m_result_detail->setText(
-            m_result_detail->text() + QStringLiteral("\n\n") + heading +
-            result.failures.join(QLatin1Char('\n')));
+    if (!result.outcomes.empty() || !result.failures.isEmpty()) {
+        if (!result.terminal_error.isEmpty()) {
+            m_result_detail->setText(
+                m_result_detail->text() + QStringLiteral("\n\n") +
+                tr("Recorded prior per-transaction outcomes:"));
+        }
+        int line_index{0};
+        const auto add_line = [&](const QString& line) {
+            auto* row{new QLabel(line, m_result_list)};
+            row->setObjectName(QStringLiteral("vaultRenewalResultLine%1").arg(++line_index));
+            row->setWordWrap(true);
+            row->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+            m_result_list_layout->addWidget(row);
+        };
+        for (const auto& outcome : result.outcomes) {
+            const int group_number{privacyGroupNumber(outcome.group_identifier)};
+            const QString group_name{group_number > 0 ? tr("Privacy group %1").arg(group_number) :
+                                                        tr("Selected privacy group")};
+            QString line{tr("%1: %2").arg(group_name, outcome.state)};
+            if (!outcome.transaction_id.isEmpty()) {
+                line += tr(" — transaction %1").arg(outcome.transaction_id);
+            }
+            if (!outcome.error.isEmpty()) {
+                line += tr(" — %1").arg(outcome.error);
+            }
+            add_line(line);
+        }
+        for (const QString& failure : result.failures) {
+            add_line(failure);
+        }
+        m_result_list->show();
     }
     const bool can_retry{result.retry_available && result.terminal_error.isEmpty()};
     m_retry_button->setVisible(can_retry);
@@ -933,4 +1066,12 @@ void VaultRenewalDialog::reject()
         return;
     }
     QDialog::reject();
+}
+
+void VaultRenewalDialog::changeEvent(QEvent* event)
+{
+    QDialog::changeEvent(event);
+    if (event->type() == QEvent::PaletteChange) {
+        GUIUtil::applyRecoveryVaultStyle(this);
+    }
 }

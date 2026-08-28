@@ -21,12 +21,14 @@ class PlatformStyle;
 
 QT_BEGIN_NAMESPACE
 class QCheckBox;
+class QEvent;
 class QFrame;
 class QLabel;
 class QProgressBar;
 class QPushButton;
 class QStackedWidget;
 class QVBoxLayout;
+class QWidget;
 QT_END_NAMESPACE
 
 /** One selectable whole privacy group from the read-only wallet status. The
@@ -74,13 +76,20 @@ struct VaultRenewalPlanPresentation {
     std::vector<VaultRenewalBatchPresentation> batches;
 };
 
+struct VaultRenewalTransactionOutcomePresentation {
+    QString group_identifier;
+    QString transaction_id;
+    QString state;
+    QString error;
+};
+
 struct VaultRenewalResultPresentation {
     std::size_t relayed{0};
     std::size_t stored_not_relayed{0};
     std::size_t failed{0};
     std::size_t already_accepted{0};
     std::size_t not_attempted{0};
-    QStringList transaction_ids;
+    std::vector<VaultRenewalTransactionOutcomePresentation> outcomes;
     QStringList failures;
     QString terminal_error;
     bool retry_available{false};
@@ -90,6 +99,8 @@ struct VaultRenewalSignerPresentation {
     bool ready{false};
     QString reason;
     QStringList roster;
+    QStringList hardware_participants;
+    int local_participant_count{0};
 };
 
 /** Translate truthful persisted/fresh signer states into direct-renewal
@@ -134,6 +145,7 @@ Q_SIGNALS:
 
 protected:
     void reject() override;
+    void changeEvent(QEvent* event) override;
 
 private:
     enum class Page {
@@ -169,10 +181,13 @@ private:
     QPushButton* m_sign_button{nullptr};
     QLabel* m_progress_headline{nullptr};
     QLabel* m_progress_detail{nullptr};
+    QLabel* m_progress_count{nullptr};
     QProgressBar* m_progress{nullptr};
     QPushButton* m_cancel_progress{nullptr};
     QLabel* m_result_headline{nullptr};
     QLabel* m_result_detail{nullptr};
+    QWidget* m_result_list{nullptr};
+    QVBoxLayout* m_result_list_layout{nullptr};
     QPushButton* m_retry_button{nullptr};
     std::optional<VaultRenewalResultPresentation> m_last_result;
     QString m_progress_unmasked_detail;
@@ -193,6 +208,7 @@ private:
     void updatePlanPresentation();
     void renderResult();
     void rebuildBatches(QVBoxLayout* layout, bool detailed);
+    int privacyGroupNumber(const QString& identifier) const;
     QString amountText(CAmount amount) const;
 };
 

@@ -45,6 +45,7 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
+#include <QEvent>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -59,6 +60,7 @@
 #include <QListWidget>
 #include <QLocale>
 #include <QLockFile>
+#include <QStringList>
 #include <QMessageBox>
 #include <QPageLayout>
 #include <QPageSize>
@@ -68,6 +70,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <functional>
 #include <memory>
 #include <set>
 #ifndef QT_NO_PDF
@@ -82,6 +85,7 @@
 #include <QScrollArea>
 #include <QSizePolicy>
 #include <QSpinBox>
+#include <QStyle>
 #include <QTabWidget>
 #include <QTemporaryFile>
 #include <QTextDocument>
@@ -99,6 +103,16 @@ using wallet::WALLET_FLAG_DISABLE_PRIVATE_KEYS;
 using wallet::WALLET_FLAG_EXTERNAL_SIGNER;
 
 namespace {
+// A Recovery Vault address fits QR version 4 at error-correction level L:
+// 33 data modules plus the four-module quiet zone on every side. Four pixels
+// per module therefore produces an exact, unscaled 164-pixel symbol.
+constexpr int VERIFY_QR_SYMBOL_SIZE{164};
+constexpr int VERIFY_QR_TILE_SIZE{180};
+
+// A maximum-size BCVP part fits QR version 9: 53 data modules plus eight
+// quiet-zone modules. Three pixels per module keeps both parts on one page.
+constexpr int RECOVERY_KIT_QR_SYMBOL_SIZE{183};
+
 /** Secret mnemonic entry whose persistent backing store is cleansing locked
  * memory. It intentionally offers no clipboard or context-menu path and never
  * mirrors plaintext into a QString/QLineEdit property. */
@@ -112,9 +126,13 @@ public:
         setFocusPolicy(Qt::StrongFocus);
         setContextMenuPolicy(Qt::NoContextMenu);
         setMinimumHeight(fontMetrics().height() + 18);
+        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        setFixedHeight(fontMetrics().height() + 22);
         setProperty("secureMnemonicBacking", true);
         setAccessibleDescription(tr("Secret phrase entry. Plaintext is held only in cleansing locked memory; the screen shows only a word count."));
     }
+
+    void setOnChanged(std::function<void()> callback) { m_on_changed = std::move(callback); }
 
     ~SecureMnemonicEdit() override
     {
@@ -222,7 +240,8 @@ protected:
         const size_t words{wordCount()};
         const QString display{words == 0 ? tr("Type the 24-word phrase (paste is disabled)") : tr("%1 of 24 words entered • phrase hidden").arg(words)};
         QPainter painter(this);
-        painter.setPen(palette().color(words == 0 ? QPalette::PlaceholderText : QPalette::Text));
+        const QPalette::ColorGroup group{isEnabled() ? QPalette::Active : QPalette::Disabled};
+        painter.setPen(palette().color(group, words == 0 ? QPalette::PlaceholderText : QPalette::Text));
         painter.drawText(rect().adjusted(8, 2, -8, -2), Qt::AlignVCenter | Qt::AlignLeft, display);
     }
 
@@ -254,10 +273,26 @@ private:
             QAccessible::updateAccessibility(&event);
         }
         update();
+        if (m_on_changed) m_on_changed();
     }
 
     SecureString m_value;
     size_t m_announced_words{0};
+    std::function<void()> m_on_changed;
+};
+
+class RestoreKeysPage final : public QWizardPage
+{
+public:
+    explicit RestoreKeysPage(std::function<bool()> complete, QWidget* parent = nullptr)
+        : QWizardPage(parent), m_complete(std::move(complete))
+    {
+    }
+    bool isComplete() const override { return m_complete && m_complete(); }
+    void notifyCompleteChanged() { Q_EMIT completeChanged(); }
+
+private:
+    std::function<bool()> m_complete;
 };
 
 /** Read-only canonical address presentation that grows to its wrapped
@@ -431,7 +466,8 @@ util::Result<CTxDestination> FirstDescriptorDestination(const std::string& encod
 class VaultPhaseHeader final : public QWidget
 {
 public:
-    VaultPhaseHeader(int phase, const QString& title, const QString& body, QWidget* parent = nullptr)
+    VaultPhaseHeader(int phase, const QString& title, const QString& body, QWidget* parent = nullptr,
+                     std::optional<GUIUtil::VaultIllustration> illustration = std::nullopt)
         : QWidget(parent)
     {
         setObjectName(QStringLiteral("vaultPhaseHeader"));
@@ -439,15 +475,20 @@ public:
         layout->setContentsMargins(0, 0, 0, 8);
         layout->setSpacing(5);
 
-        auto* progress = new QLabel(tr("Step %1 of 4").arg(phase));
-        progress->setObjectName(QStringLiteral("vaultPhaseProgress"));
-        progress->setAccessibleName(tr("Setup progress: step %1 of 4").arg(phase));
-        QFont progress_font = progress->font();
-        progress_font.setBold(true);
-        progress_font.setPointSizeF(std::max<qreal>(8.0, progress_font.pointSizeF() - 1.0));
-        progress->setFont(progress_font);
-        progress->setForegroundRole(QPalette::PlaceholderText);
-        layout->addWidget(progress);
+        m_progress = new QLabel;
+        m_progress->setObjectName(QStringLiteral("vaultPhaseProgress"));
+        m_progress->setTextFormat(Qt::RichText);
+        m_progress->setWordWrap(true);
+        layout->addWidget(m_progress);
+        m_current = std::max(0, phase - 1);
+        setPhaseTrail({tr("Review Vault"), tr("Secure Recovery"), tr("Verify Address"), tr("Finish")}, m_current);
+
+        auto* body_layout = new QHBoxLayout;
+        body_layout->setContentsMargins(0, 0, 0, 0);
+        body_layout->setSpacing(14);
+        auto* copy_layout = new QVBoxLayout;
+        copy_layout->setContentsMargins(0, 0, 0, 0);
+        copy_layout->setSpacing(5);
 
         m_headline = new QLabel(title);
         m_headline->setObjectName(QStringLiteral("vaultPhaseHeadline"));
@@ -457,19 +498,21 @@ public:
         headline_font.setPointSizeF(headline_font.pointSizeF() + 5.0);
         m_headline->setFont(headline_font);
         m_headline->setAccessibleName(title);
-        layout->addWidget(m_headline);
+        copy_layout->addWidget(m_headline);
 
         m_explanation = new QLabel(body);
         m_explanation->setObjectName(QStringLiteral("vaultPhaseExplanation"));
         m_explanation->setWordWrap(true);
         m_explanation->setVisible(!body.isEmpty());
-        layout->addWidget(m_explanation);
-
-        m_phases = new QLabel(tr("Review Vault   •   Secure Recovery   •   Verify Address   •   Finish"));
-        m_phases->setObjectName(QStringLiteral("vaultPhaseNames"));
-        m_phases->setWordWrap(true);
-        m_phases->setForegroundRole(QPalette::PlaceholderText);
-        layout->addWidget(m_phases);
+        copy_layout->addWidget(m_explanation);
+        copy_layout->addStretch();
+        body_layout->addLayout(copy_layout, 1);
+        if (illustration) {
+            body_layout->addWidget(
+                new GUIUtil::VaultIllustrationLabel(*illustration, QSize{144, 96}, this),
+                0, Qt::AlignTop | Qt::AlignRight);
+        }
+        layout->addLayout(body_layout);
     }
 
     void setContent(const QString& title, const QString& body)
@@ -480,12 +523,36 @@ public:
         m_explanation->setVisible(!body.isEmpty());
     }
 
-    void setPhaseNames(const QString& names) { m_phases->setText(names); }
+    void setPhaseNames(const QString& names)
+    {
+        QStringList trail;
+        for (const QString& part : names.split(QStringLiteral("•"), Qt::SkipEmptyParts)) {
+            trail << part.trimmed();
+        }
+        if (!trail.isEmpty()) setPhaseTrail(trail, m_current);
+    }
 
 private:
+    void setPhaseTrail(const QStringList& names, int current)
+    {
+        m_current = std::clamp(current, 0, std::max(0, static_cast<int>(names.size()) - 1));
+        QStringList html;
+        for (int i = 0; i < names.size(); ++i) {
+            const QString escaped{names.at(i).toHtmlEscaped()};
+            if (i == m_current) {
+                html << QStringLiteral("<b>%1</b>").arg(escaped);
+            } else {
+                html << QStringLiteral("<span style=\"opacity:0.65\">%1</span>").arg(escaped);
+            }
+        }
+        m_progress->setText(html.join(QStringLiteral(" · ")));
+        m_progress->setAccessibleName(tr("Setup progress: %1").arg(names.value(m_current)));
+    }
+
     QLabel* m_headline{nullptr};
     QLabel* m_explanation{nullptr};
-    QLabel* m_phases{nullptr};
+    QLabel* m_progress{nullptr};
+    int m_current{0};
 };
 
 QFrame* MakeTitledCard(const QString& title, const QString& body)
@@ -580,6 +647,7 @@ public:
         setButtonText(QWizard::CancelButton, tr("Cancel"));
         setButtonLayout({QWizard::BackButton, QWizard::Stretch,
                          QWizard::CancelButton, QWizard::NextButton, QWizard::FinishButton});
+        GUIUtil::applyRecoveryVaultStyle(this);
 
         auto* policy_page = new QWizardPage;
         policy_page->setTitle({});
@@ -588,7 +656,7 @@ public:
         auto* restore_policy_header = new VaultPhaseHeader(
             1, tr("Open your Recovery Kit"),
             tr("Start with the public policy file from the kit. No private recovery phrase is requested yet."),
-            policy_page);
+            policy_page, GUIUtil::VaultIllustration::RECOVERY_KIT);
         restore_policy_header->setPhaseNames(tr("Recovery Kit   •   Authority   •   Review   •   Restore Wallet"));
         policy_layout->addWidget(restore_policy_header);
         auto* form = new QFormLayout;
@@ -620,25 +688,35 @@ public:
         m_policy->setVisible(false);
         m_policy->setAccessibleName(tr("Manual Recovery Kit policy entry"));
         policy_layout->addWidget(m_policy, 1);
+        auto* recognized = new QFrame(policy_page);
+        recognized->setObjectName("restorePolicyPaper");
+        recognized->setProperty("vaultPaper", true);
+        auto* recognized_layout = new QVBoxLayout(recognized);
+        recognized_layout->setContentsMargins(16, 14, 16, 14);
+        recognized_layout->setSpacing(8);
         m_policy_summary = new QLabel;
         m_policy_summary->setObjectName("restorePolicySummary");
         m_policy_summary->setWordWrap(true);
         m_policy_summary->setTextInteractionFlags(Qt::TextSelectableByMouse);
-        policy_layout->addWidget(m_policy_summary);
+        recognized_layout->addWidget(m_policy_summary);
         m_policy_status = new QLabel;
         m_policy_status->setObjectName("restorePolicyStatus");
         m_policy_status->setWordWrap(true);
-        policy_layout->addWidget(m_policy_status);
+        m_policy_status->setProperty("vaultSecondary", true);
+        recognized_layout->addWidget(m_policy_status);
+        recognized->hide();
+        policy_layout->addWidget(recognized);
+        policy_layout->addStretch();
         setPage(Policy, policy_page);
 
-        auto* keys_page = new QWizardPage;
-        keys_page->setTitle({});
-        keys_page->setSubTitle({});
-        auto* keys_layout = new QVBoxLayout(keys_page);
+        m_keys_page = new RestoreKeysPage([this] { return restoreKeysComplete(); }, this);
+        m_keys_page->setTitle({});
+        m_keys_page->setSubTitle({});
+        auto* keys_layout = new QVBoxLayout(m_keys_page);
         auto* restore_authority_header = new VaultPhaseHeader(
             2, tr("Choose what to restore"),
             tr("Choose explicitly. Leaving a phrase empty never silently creates a watch-only wallet."),
-            keys_page);
+            m_keys_page, GUIUtil::VaultIllustration::RESTORE_AUTHORITY);
         restore_authority_header->setPhaseNames(tr("Recovery Kit   •   Authority   •   Review   •   Restore Wallet"));
         keys_layout->addWidget(restore_authority_header);
         m_authority_choices = new QButtonGroup(this);
@@ -697,9 +775,13 @@ public:
         m_remove_word->setAccessibleName(tr("Remove the last recovery word"));
         m_remove_word->setToolTip(tr("Remove the last recovery word without revealing the phrase"));
         m_remove_word->setAutoDefault(false);
-        m_add_key = new QPushButton(tr("Add Another Key"));
+        m_remove_word->setEnabled(false);
+        m_add_key = new QPushButton(tr("Add Recovery Phrase"));
         m_add_key->setObjectName("restoreAddKeyButton");
+        m_add_key->setAccessibleName(tr("Validate and add this software-key recovery phrase"));
+        m_add_key->setToolTip(tr("Validate this phrase and match it to the Recovery Kit"));
         m_add_key->setAutoDefault(false);
+        m_add_key->setEnabled(false);
         phrase_actions->addWidget(m_remove_word);
         phrase_actions->addWidget(m_add_key);
         phrase_actions->addStretch();
@@ -707,6 +789,9 @@ public:
         m_key_list = new QListWidget;
         m_key_list->setObjectName("restoreAcceptedKeys");
         m_key_list->setSelectionMode(QAbstractItemView::NoSelection);
+        m_key_list->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Maximum);
+        m_key_list->setMaximumHeight(fontMetrics().height() * 5);
+        m_key_list->hide();
         phrase_layout->addWidget(m_key_list);
         m_key_status = new QLabel;
         m_key_status->setObjectName("restoreKeyStatus");
@@ -719,7 +804,12 @@ public:
         keys_layout->addWidget(m_key_authority);
         keys_layout->addStretch();
         m_phrase_panel->setVisible(false);
-        setPage(RecoveryKeys, keys_page);
+        setPage(RecoveryKeys, m_keys_page);
+        m_phrase->setOnChanged([this] {
+            updatePhraseControls();
+            if (m_keys_page) m_keys_page->notifyCompleteChanged();
+        });
+        updatePhraseControls();
 
         auto* authority_page = new QWizardPage;
         authority_page->setTitle({});
@@ -728,7 +818,7 @@ public:
         auto* restore_review_header = new VaultPhaseHeader(
             3, tr("Review restored authority"),
             tr("Confirm exactly what this wallet can authorize before creating it."),
-            authority_page);
+            authority_page, GUIUtil::VaultIllustration::ADDRESS_VERIFICATION);
         restore_review_header->setPhaseNames(tr("Recovery Kit   •   Authority   •   Review   •   Restore Wallet"));
         authority_layout->addWidget(restore_review_header);
         m_authority_summary = new QLabel;
@@ -774,7 +864,7 @@ public:
         auto* restore_finish_header = new VaultPhaseHeader(
             4, tr("Restore the wallet"),
             tr("The wallet appears immediately, then scans from genesis in the background."),
-            rescan_page);
+            rescan_page, GUIUtil::VaultIllustration::RESTORE_AUTHORITY);
         restore_finish_header->setPhaseNames(tr("Recovery Kit   •   Authority   •   Review   •   Restore Wallet"));
         rescan_layout->addWidget(restore_finish_header);
         m_rescan_summary = new QLabel;
@@ -814,12 +904,12 @@ public:
             if (!phrases) {
                 clearPhrases();
                 m_recovered_software.clear();
-                m_key_list->clear();
                 m_key_status->clear();
             } else {
                 m_phrase->setFocus(Qt::OtherFocusReason);
             }
             updateAuthority();
+            if (m_keys_page) m_keys_page->notifyCompleteChanged();
         });
         connect(this, &QWizard::currentIdChanged, this, [this](int page_id) {
             if (page_id == Authority || page_id == Rescan) updateAuthority();
@@ -870,6 +960,25 @@ public:
     ~VaultRestoreWizard() override { clearPhrases(); }
 
 private:
+    void updatePhraseControls()
+    {
+        if (!m_phrase || !m_remove_word || !m_add_key) return;
+        const bool complete{m_phrases.size() >= 3};
+        const bool has_phrase{!m_phrase->trimmedEmpty()};
+        m_phrase->setEnabled(!complete);
+        m_remove_word->setEnabled(!complete && has_phrase);
+        m_add_key->setEnabled(!complete && has_phrase);
+        if (complete) {
+            m_phrase->setAccessibleDescription(tr("All three software keys are matched. Phrase entry is complete."));
+            m_phrase->setToolTip(tr("All three software keys are already matched to this Recovery Kit."));
+        } else {
+            if (!has_phrase) {
+                m_phrase->setAccessibleDescription(tr("No recovery words entered. Phrase contents remain hidden."));
+            }
+            m_phrase->setToolTip({});
+        }
+    }
+
     void clearPhrases()
     {
         if (m_phrase) m_phrase->clearSecure();
@@ -877,6 +986,11 @@ private:
             if (!phrase.empty()) memory_cleanse(phrase.data(), phrase.size());
         }
         std::vector<SecureString>{}.swap(m_phrases);
+        if (m_key_list) {
+            m_key_list->clear();
+            m_key_list->hide();
+        }
+        updatePhraseControls();
     }
 
     void setRetryWallet(WalletModel* wallet_model)
@@ -941,7 +1055,6 @@ private:
         clearPhrases();
         m_recovered_software.clear();
         m_connected_hardware.clear();
-        m_key_list->clear();
         m_key_status->clear();
         m_authority_choices->setExclusive(false);
         for (auto* button : m_authority_choices->buttons())
@@ -980,8 +1093,10 @@ private:
 
     void updatePolicySummary()
     {
-        if (m_policy_summary) {
-            m_policy_summary->setText(m_policy_summary_base + QLatin1Char('\n') + m_hardware_match_summary);
+        if (!m_policy_summary) return;
+        m_policy_summary->setText(m_policy_summary_base + QLatin1Char('\n') + m_hardware_match_summary);
+        if (auto* paper = m_policy_summary->parentWidget()) {
+            paper->setVisible(!m_policy_summary_base.trimmed().isEmpty());
         }
     }
 
@@ -1069,7 +1184,7 @@ private:
                             : tr("Exact hardware matches: Unknown overall; %1 exact positive match(es) were observed (%2), but another device diagnostic was inconclusive.")
                                   .arg(matches.size()).arg(matches.join(QStringLiteral(", ")));
                     } else if (guard->m_connected_hardware.empty()) {
-                        guard->m_hardware_match_summary = tr("Exact hardware matches: none connected. Reconnect the participant devices, then reopen or retry this restore step.");
+                        guard->m_hardware_match_summary = tr("Exact hardware matches: none connected. Continue and choose watch-only or printed software-key authority, or reconnect the exact participant devices before choosing hardware authority.");
                     } else {
                         QStringList matches;
                         for (const std::string& fingerprint : guard->m_connected_hardware) {
@@ -1082,7 +1197,8 @@ private:
                     }
                 }
                 guard->updatePolicySummary();
-                guard->updateAuthority(); }, Qt::QueuedConnection);
+                guard->updateAuthority();
+                if (guard->m_keys_page) guard->m_keys_page->notifyCompleteChanged(); }, Qt::QueuedConnection);
         });
     }
 
@@ -1115,10 +1231,30 @@ private:
         }
         m_recovered_software.insert(match->fingerprint);
         m_key_list->addItem(tr("Software key %1 matched").arg(m_phrases.size()));
-        m_key_status->setText(tr("Recovery key matched this Recovery Kit."));
-        m_add_key->setEnabled(m_phrases.size() < 3);
+        m_key_list->setVisible(m_key_list->count() > 0);
+        const int matched{static_cast<int>(m_phrases.size())};
+        m_key_status->setText(
+            matched == 1 ? tr("1 software key matched this Recovery Kit.") :
+                           tr("%1 software keys matched this Recovery Kit.").arg(matched));
+        updatePhraseControls();
         updateAuthority();
+        if (m_keys_page) m_keys_page->notifyCompleteChanged();
         return true;
+    }
+
+    bool restoreKeysComplete() const
+    {
+        const int choice = m_authority_choices ? m_authority_choices->checkedId() : -1;
+        if (choice == 0) return true;
+        if (choice == 1) {
+            if (!m_phrase || !m_phrase->trimmedEmpty()) return false;
+            return !m_recovered_software.empty();
+        }
+        if (choice == 2) {
+            return !m_hardware_discovery_pending && m_hardware_discovery_known &&
+                   !m_connected_hardware.empty();
+        }
+        return false;
     }
 
     void updateAuthority()
@@ -1218,7 +1354,16 @@ private:
         clearPhrases();
     }
 
+    void changeEvent(QEvent* event) override
+    {
+        QWizard::changeEvent(event);
+        if (event->type() == QEvent::PaletteChange) {
+            GUIUtil::applyRecoveryVaultStyle(this);
+        }
+    }
+
     MultisigWizard* m_wizard;
+    RestoreKeysPage* m_keys_page{nullptr};
     QLineEdit* m_name{nullptr};
     QToolButton* m_manual_policy_toggle{nullptr};
     QPlainTextEdit* m_policy{nullptr};
@@ -1454,7 +1599,7 @@ public:
         review_layout->addWidget(new VaultPhaseHeader(
             1, tr("Review your Recovery Vault"),
             tr("Understand who controls it now and what changes only after time has passed."),
-            m_fixed_review));
+            m_fixed_review, GUIUtil::VaultIllustration::ACCESS_TIMELINE));
         auto* name_form = new QFormLayout;
         m_name = new QLineEdit;
         m_name->setObjectName("stagedWalletNameEdit");
@@ -1498,6 +1643,7 @@ public:
             "• Recovery never happens automatically; you must start and sign a recovery transaction.\n"
             "• Every received coin has its own clock. Change and consolidation restart that clock."));
         consequences->setObjectName("essentialRecoveryConsequences");
+        consequences->setProperty("vaultSecondary", true);
         consequences->setWordWrap(true);
         consequences->setAccessibleName(tr("Essential recovery consequences"));
         review_layout->addWidget(consequences);
@@ -1527,7 +1673,7 @@ public:
             primary_font.setBold(true);
             m_slot_primary[slot]->setFont(primary_font);
             m_slot_secondary[slot] = new QLabel;
-            m_slot_secondary[slot]->setStyleSheet(QStringLiteral("QLabel { color: palette(placeholder-text); }"));
+            m_slot_secondary[slot]->setProperty("vaultSecondary", true);
             m_slot_secondary[slot]->setTextInteractionFlags(Qt::TextSelectableByMouse);
             row_layout->addWidget(number);
             row_layout->addWidget(m_slot_primary[slot], 1);
@@ -1539,6 +1685,7 @@ public:
         auto* discovery_row = new QHBoxLayout;
         m_discovery_status = new QLabel;
         m_discovery_status->setObjectName("hardwareDiscoveryStatus");
+        m_discovery_status->setProperty("vaultSecondary", true);
         m_discovery_status->setWordWrap(true);
         m_retry = new QPushButton(tr("Check Again"));
         m_retry->setObjectName("refreshDevicesButton");
@@ -1571,15 +1718,20 @@ public:
 
         auto* boundary = new QLabel(tr("Next, you’ll open and print one complete Recovery Kit. The wallet is created only after you confirm the printed kit."));
         boundary->setObjectName("recoveryKitNextLabel");
+        boundary->setProperty("vaultSecondary", true);
         boundary->setWordWrap(true);
         review_layout->addWidget(boundary);
         auto* secondary_actions = new QHBoxLayout;
         m_restore = new QPushButton(tr("Restore Recovery Vault…"));
         m_restore->setObjectName("restoreFromMnemonicButton");
         m_restore->setAutoDefault(false);
+        m_restore->setFlat(true);
+        m_restore->setProperty("vaultQuiet", true);
         m_advanced = new QPushButton(tr("Advanced…"));
         m_advanced->setObjectName("advancedVaultButton");
         m_advanced->setAutoDefault(false);
+        m_advanced->setFlat(true);
+        m_advanced->setProperty("vaultQuiet", true);
         secondary_actions->addWidget(m_restore);
         secondary_actions->addWidget(m_advanced);
         secondary_actions->addStretch();
@@ -1919,11 +2071,13 @@ private:
         if (!m_wizard->advancedFlow()) {
             const int connected = static_cast<int>(m_wizard->m_hardware.size());
             if (!m_discovery_valid && !m_discovery_error.isEmpty()) {
+                setDiscoveryStatusSecondary(false);
                 m_authority->setText(tr("The key roster is not ready. No software slot was substituted."));
                 m_discovery_status->setText(m_discovery_error);
                 m_retry->setVisible(true);
                 return;
             }
+            setDiscoveryStatusSecondary(true);
             m_discovery_status->setText(tr("Connected hardware wallets were checked when this screen opened. Use Check Again after connecting or unlocking a device."));
             m_retry->setVisible(true);
             if (connected == 0) {
@@ -2068,8 +2222,17 @@ private:
 
             if (m_discovery_valid && detected.size() > MultisigWizard::kStagedVaultKeyCount) {
                 m_discovery_valid = false;
-                m_discovery_error = tr("%1 hardware wallets were detected. Disconnect extras until at most three remain, then refresh. No devices were selected automatically.")
-                                        .arg(detected.size());
+                QStringList names;
+                for (const auto& spec : detected) {
+                    if (!spec.label.empty()) {
+                        names << QString::fromStdString(spec.label);
+                    } else if (spec.fingerprint) {
+                        names << QString::fromStdString(*spec.fingerprint);
+                    }
+                }
+                m_discovery_error = tr("%1 hardware wallets were detected (%2). Disconnect extras until at most three remain, then click Check Again. No devices were selected automatically.")
+                                        .arg(detected.size())
+                                        .arg(names.join(QStringLiteral(", ")));
             }
 
             const bool roster_changed = m_roster_initialized && signature != m_roster_signature;
@@ -2184,6 +2347,16 @@ private:
             }
         }
     }
+
+    void setDiscoveryStatusSecondary(bool secondary)
+    {
+        if (m_discovery_status->property("vaultSecondary").toBool() == secondary) return;
+        m_discovery_status->setProperty("vaultSecondary", secondary);
+        m_discovery_status->style()->unpolish(m_discovery_status);
+        m_discovery_status->style()->polish(m_discovery_status);
+        m_discovery_status->update();
+    }
+
     MultisigWizard* m_wizard;
     QWidget* m_fixed_review{nullptr};
     QScrollArea* m_fixed_scroll{nullptr};
@@ -2588,14 +2761,20 @@ public:
         m_phase_header = new VaultPhaseHeader(
             2, tr("Secure your Recovery Kit"),
             tr("Print the complete kit, inspect every page, and store it offline before creating the wallet."),
-            this);
+            this, GUIUtil::VaultIllustration::RECOVERY_KIT);
         layout->addWidget(m_phase_header);
+        auto* kit_paper = new QFrame(this);
+        kit_paper->setObjectName("recoveryKitPaper");
+        kit_paper->setProperty("vaultPaper", true);
+        auto* kit_layout = new QVBoxLayout(kit_paper);
+        kit_layout->setContentsMargins(18, 16, 18, 16);
+        kit_layout->setSpacing(10);
         m_warning = new QLabel(tr(
             "Back up every signing source. If this wallet holds software keys, one separate wallet backup contains all of them. "
             "Also keep every hardware or offline seed, this public policy JSON, and any PINs or passphrases. "
             "The public policy cannot restore software keys or spend."));
         m_warning->setWordWrap(true);
-        layout->addWidget(m_warning);
+        kit_layout->addWidget(m_warning);
         m_tabs = new QTabWidget;
         m_tabs->setObjectName("backupTabs");
         policy = new QPlainTextEdit;
@@ -2609,7 +2788,7 @@ public:
         human->setReadOnly(true);
         human->setLineWrapMode(QPlainTextEdit::WidgetWidth);
         m_tabs->addTab(human, tr("Human transcript"));
-        layout->addWidget(m_tabs);
+        layout->addWidget(m_tabs, 1);
 
         auto* policy_btns = new QHBoxLayout;
         m_copy_policy = new QPushButton(tr("Copy policy JSON"));
@@ -2626,11 +2805,11 @@ public:
         m_save_human->setObjectName("saveTranscriptButton");
         m_save_human->setAutoDefault(false);
         policy_btns->addWidget(m_copy_policy);
-        policy_btns->addWidget(m_print_policy);
         policy_btns->addWidget(m_copy_human);
         policy_btns->addWidget(m_save_human);
         policy_btns->addStretch();
         layout->addLayout(policy_btns);
+        kit_layout->addWidget(m_print_policy, 0, Qt::AlignLeft);
         m_status = new QLabel;
         m_status->setObjectName("policyPackageStatus");
         m_status->setWordWrap(true);
@@ -2653,7 +2832,8 @@ public:
         m_print_status = new QLabel;
         m_print_status->setObjectName("printPolicyStatus");
         m_print_status->setWordWrap(true);
-        layout->addWidget(m_print_status);
+        m_print_status->setProperty("vaultSecondary", true);
+        kit_layout->addWidget(m_print_status);
         auto* wallet_backup_row = new QHBoxLayout;
         m_backup_wallet = new QPushButton(tr("Save software-key wallet backup…"));
         m_backup_wallet->setObjectName("backupSoftwareWalletButton");
@@ -2671,10 +2851,13 @@ public:
         m_ack_definition = new QLabel;
         m_ack_definition->setObjectName("backupAcknowledgmentDefinition");
         m_ack_definition->setWordWrap(true);
-        layout->addWidget(m_ack_definition);
+        m_ack_definition->setProperty("vaultSecondary", true);
+        kit_layout->addWidget(m_ack_definition);
         ack = new QCheckBox(tr("I printed or copied the policy JSON somewhere I will still have if this computer is gone."));
         ack->setObjectName("backupAckCheck");
-        layout->addWidget(ack);
+        kit_layout->addWidget(ack);
+        layout->addWidget(kit_paper);
+        layout->addStretch(1);
         connect(m_copy_policy, &QPushButton::clicked, this, [this] {
             GUIUtil::setClipboard(policy->toPlainText());
         });
@@ -3469,7 +3652,7 @@ public:
         m_phase_header = new VaultPhaseHeader(
             3, tr("Verify the first address"),
             tr("A Recovery Kit comparison checks consistency. Only a separate capable signer can independently verify the address."),
-            this);
+            this, GUIUtil::VaultIllustration::ADDRESS_VERIFICATION);
         layout->addWidget(m_phase_header);
         auto* scroll = new QScrollArea;
         scroll->setObjectName("verifyAddressScroll");
@@ -3480,18 +3663,37 @@ public:
         auto* content_layout = new QVBoxLayout(content);
         content_layout->setContentsMargins(0, 0, 0, 0);
         content_layout->setSpacing(7);
+        auto* address_paper = new QFrame(content);
+        address_paper->setObjectName("verifyAddressPaper");
+        address_paper->setProperty("vaultPaper", true);
+        auto* paper_layout = new QVBoxLayout(address_paper);
+        paper_layout->setContentsMargins(16, 14, 16, 14);
+        paper_layout->setSpacing(10);
         auto* row = new QHBoxLayout;
-        qr = new QRImageWidget;
+        m_qr_frame = new QFrame(address_paper);
+        m_qr_frame->setObjectName("verifyQrFrame");
+        m_qr_frame->setFixedSize(VERIFY_QR_TILE_SIZE, VERIFY_QR_TILE_SIZE);
+        m_qr_frame->setStyleSheet(QStringLiteral("QFrame#verifyQrFrame { background: #ffffff; border: 1px solid palette(mid); border-radius: 8px; }"));
+        auto* qr_layout = new QVBoxLayout(m_qr_frame);
+        qr_layout->setContentsMargins(7, 7, 7, 7);
+        qr_layout->setSpacing(0);
+        qr = new QRImageWidget(m_qr_frame);
         qr->setObjectName("verifyQr");
         qr->setAlignment(Qt::AlignCenter);
-        qr->setFixedSize(168, 168);
-        row->addWidget(qr, 0, Qt::AlignTop);
+        qr->setFixedSize(VERIFY_QR_SYMBOL_SIZE, VERIFY_QR_SYMBOL_SIZE);
+        qr->setAccessibleName(tr("QR code for the complete first receive address"));
+        qr->setAccessibleDescription(tr("A black-on-white QR rendering of the same complete address shown beside it."));
+        qr_layout->addWidget(qr, 0, Qt::AlignCenter);
+        row->addWidget(m_qr_frame, 0, Qt::AlignTop);
 
         auto* addr_col = new QVBoxLayout;
-        addr_col->addWidget(new QLabel(tr("Receive address")));
+        auto* address_caption = new QLabel(tr("Receive address"));
+        address_caption->setProperty("vaultEyebrow", true);
+        addr_col->addWidget(address_caption);
         address = new CompleteAddressEdit;
         address->setObjectName("verifyAddressEdit");
         address->setReadOnly(true);
+        address->setFrameStyle(QFrame::NoFrame);
         address->setFont(GUIUtil::fixedPitchFont());
         address->setLineWrapMode(QPlainTextEdit::WidgetWidth);
         address->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
@@ -3505,7 +3707,8 @@ public:
         addr_col->addWidget(copy, 0, Qt::AlignLeft);
         addr_col->addStretch();
         row->addLayout(addr_col, 1);
-        content_layout->addLayout(row);
+        paper_layout->addLayout(row);
+        content_layout->addWidget(address_paper);
 
         devices = new QListWidget;
         devices->setObjectName("verifyDeviceList");
@@ -3526,12 +3729,13 @@ public:
         status = new QLabel;
         status->setObjectName("verifyStatusLabel");
         status->setWordWrap(true);
-        content_layout->addWidget(status);
         m_independent_state = new QLabel;
         m_independent_state->setObjectName("independentVerificationState");
         m_independent_state->setWordWrap(true);
         setIndependentState({}, /*warning=*/false);
         content_layout->addWidget(m_independent_state);
+        content_layout->addWidget(status);
+        content_layout->addSpacing(8);
         m_resume_kit_ack = new QCheckBox(tr(
             "I located the original complete printed Recovery Kit, checked that every page is present and legible, and confirmed it is stored offline."));
         m_resume_kit_ack->setObjectName("resumeRecoveryKitAcknowledgment");
@@ -3779,12 +3983,11 @@ public:
             m_address_valid = !shown.isEmpty() && IsValidDestination(decoded);
             address->setPlainText(m_address_valid ? shown : QString::fromStdString(util::ErrorString(dest).original));
         }
-        if (m_address_valid && qr->setQR(shown)) {
-            if (GUIUtil::HasPixmap(qr)) {
-                qr->setPixmap(qr->pixmap(Qt::ReturnByValue).scaled(168, 168, Qt::KeepAspectRatio, Qt::SmoothTransformation));
-            }
+        if (m_address_valid && qr->setQR(shown, {}, VERIFY_QR_SYMBOL_SIZE)) {
+            m_qr_frame->show();
             qr->show();
         } else {
+            m_qr_frame->hide();
             qr->hide();
         }
         devices->clear();
@@ -4001,6 +4204,10 @@ private:
                 m_show_button->setText(tr("Verify on %1").arg(item->data(Qt::UserRole + 1).toString()));
                 m_show_button->setEnabled(true);
                 m_show_button->setDefault(true);
+                if (auto* next = qobject_cast<QPushButton*>(m_wizard->button(QWizard::NextButton))) {
+                    next->setDefault(false);
+                    next->setAutoDefault(false);
+                }
                 return;
             }
         }
@@ -4018,6 +4225,7 @@ private:
 
     MultisigWizard* m_wizard;
     VaultPhaseHeader* m_phase_header{nullptr};
+    QFrame* m_qr_frame{nullptr};
     QPushButton* m_show_button{nullptr};
     QLabel* m_devices_empty{nullptr};
     QLabel* m_airgap_help{nullptr};
@@ -4044,7 +4252,9 @@ public:
         setSubTitle(tr("Your recovery vault is ready for a small test payment."));
         setFinalPage(true);
         auto* layout = new QVBoxLayout(this);
-        m_phase_header = new VaultPhaseHeader(4, tr("Finish"), {}, this);
+        layout->addStretch(1);
+        m_phase_header = new VaultPhaseHeader(
+            4, tr("Finish"), {}, this, GUIUtil::VaultIllustration::VAULT_READY);
         layout->addWidget(m_phase_header);
         m_summary = new QLabel;
         m_summary->setObjectName("doneSummaryLabel");
@@ -4093,7 +4303,7 @@ public:
             technical_toggle->setArrowType(shown ? Qt::DownArrow : Qt::RightArrow);
             technical->setVisible(shown);
         });
-        layout->addStretch();
+        layout->addStretch(1);
         connect(copy_policy, &QPushButton::clicked, this, [this] {
             GUIUtil::setClipboard(m_policy_id->text());
         });
@@ -4105,16 +4315,10 @@ public:
     }
     void initializePage() override
     {
-        QTimer::singleShot(0, this, [this] {
-            if (auto* done = qobject_cast<QPushButton*>(m_wizard->button(QWizard::FinishButton))) {
-                done->setDefault(false);
-                done->setAutoDefault(false);
-            }
-            m_receive->setDefault(true);
-            m_receive->setFocus(Qt::OtherFocusReason);
-        });
+        bool ready{false};
         if (m_wizard->advancedFlow()) {
             const bool verified = m_wizard->m_address_independently_verified;
+            ready = verified;
             setTitle(verified ? tr("Wallet is ready") : tr("Verification remaining"));
             setSubTitle(verified ? tr("Review the policy that was created before receiving a test amount.") : tr("The wallet exists, but its first address was not independently verified."));
             m_phase_header->setVisible(false);
@@ -4157,21 +4361,39 @@ public:
             m_summary->setText(lead + detail +
                 tr("<p>The first receive address was completed during setup. Send a small test amount before moving a main balance.</p>"));
             m_policy_id->setText(m_wizard->m_policy_id);
-            return;
+        } else {
+            setTitle({});
+            setSubTitle({});
+            m_phase_header->setVisible(true);
+            const bool verified = m_wizard->m_address_independently_verified;
+            const bool not_recorded = m_wizard->m_setup_status_not_recorded;
+            ready = verified && !not_recorded && !m_wizard->m_recovery_kit_status_missing;
+            m_phase_header->setContent(
+                ready ? tr("Vault Ready") : tr("Verification Remaining"),
+                ready ? tr("Your Recovery Vault is ready for a small test payment.") : not_recorded ? tr("The wallet exists, but its setup status was not recorded. Verification remains visible rather than inventing a Ready state.") :
+                                                                                                      tr("The wallet exists, but independent address verification remains incomplete. A persistent warning will remain."));
+            const QString kit_state = m_wizard->m_recovery_kit_status_missing || not_recorded ? tr("⚠ Recovery Kit confirmation not recorded") : tr("✓ Recovery Kit confirmed");
+            m_summary->setText(ready ? tr("<p>%1<br>✓ First address independently verified</p>").arg(kit_state) : tr("<p>%1<br>⚠ %2</p>").arg(kit_state, not_recorded ? tr("Verification status not recorded") : tr("Address not independently verified")));
+            m_policy_id->setText(m_wizard->m_policy_id);
         }
-        setTitle({});
-        setSubTitle({});
-        m_phase_header->setVisible(true);
-        const bool verified = m_wizard->m_address_independently_verified;
-        const bool not_recorded = m_wizard->m_setup_status_not_recorded;
-        const bool ready = verified && !not_recorded && !m_wizard->m_recovery_kit_status_missing;
-        m_phase_header->setContent(
-            ready ? tr("Vault Ready") : tr("Verification Remaining"),
-            ready ? tr("Your Recovery Vault is ready for a small test payment.") : not_recorded ? tr("The wallet exists, but its setup status was not recorded. Verification remains visible rather than inventing a Ready state.") :
-                                                                                                  tr("The wallet exists, but setup or independent address verification remains incomplete. A persistent warning will remain."));
-        const QString kit_state = m_wizard->m_recovery_kit_status_missing || not_recorded ? tr("⚠ Recovery Kit confirmation not recorded") : tr("✓ Recovery Kit confirmed");
-        m_summary->setText(ready ? tr("<p>%1<br>✓ First address independently verified</p>").arg(kit_state) : tr("<p>%1<br>⚠ %2</p>").arg(kit_state, not_recorded ? tr("Verification status not recorded") : tr("Address not independently verified")));
-        m_policy_id->setText(m_wizard->m_policy_id);
+
+        m_receive->setVisible(ready);
+        m_receive->setEnabled(ready);
+        m_receive->setAutoDefault(ready);
+        m_receive->setDefault(false);
+        QTimer::singleShot(0, this, [this, ready] {
+            auto* done = qobject_cast<QPushButton*>(m_wizard->button(QWizard::FinishButton));
+            if (done) {
+                done->setAutoDefault(!ready);
+                done->setDefault(!ready);
+            }
+            if (ready) {
+                m_receive->setDefault(true);
+                m_receive->setFocus(Qt::OtherFocusReason);
+            } else if (done) {
+                done->setFocus(Qt::OtherFocusReason);
+            }
+        });
     }
 
 private:
@@ -4210,10 +4432,7 @@ MultisigWizard::MultisigWizard(interfaces::Node& node, WalletController* wallet_
     setButtonText(QWizard::CancelButton, tr("Cancel"));
     setMinimumSize(760, 600);
     resize(900, 620);
-    setStyleSheet(QStringLiteral(
-        "QWidget#vaultPhaseHeader { margin-bottom: 2px; }"
-        "QFrame#recoveryTimeline { border: 1px solid palette(mid); border-radius: 6px; }"
-        "QLabel#independentVerificationState { border-radius: 5px; }"));
+    GUIUtil::applyRecoveryVaultStyle(this);
     connect(this, &QWizard::currentIdChanged, this, [this](int id) {
         configureNavigation(id);
     });
@@ -4402,6 +4621,10 @@ void MultisigWizard::configureNavigation(int page_id)
     case Page_Verify:
         setButtonText(QWizard::NextButton, tr("Finish Setup"));
         setButtonLayout({QWizard::Stretch, QWizard::CancelButton, QWizard::NextButton});
+        if (auto* next = qobject_cast<QPushButton*>(button(QWizard::NextButton))) {
+            next->setAutoDefault(false);
+            next->setDefault(false);
+        }
         break;
     case Page_Done:
         setButtonLayout({QWizard::Stretch, QWizard::FinishButton});
@@ -4493,6 +4716,14 @@ void MultisigWizard::closeEvent(QCloseEvent* event)
         publishCreatedWallet();
     }
     QWizard::closeEvent(event);
+}
+
+void MultisigWizard::changeEvent(QEvent* event)
+{
+    QWizard::changeEvent(event);
+    if (event->type() == QEvent::PaletteChange) {
+        GUIUtil::applyRecoveryVaultStyle(this);
+    }
 }
 
 void MultisigWizard::setWalletName(const QString& name) { m_wallet_name = name; }
@@ -4842,7 +5073,7 @@ QString MultisigWizard::privateRecoveryKitHtml() const
     };
     auto qr_image_uri = [](const std::string& part) -> QString {
         QRImageWidget widget;
-        if (!widget.setQR(QString::fromStdString(part))) return {};
+        if (!widget.setQR(QString::fromStdString(part), {}, RECOVERY_KIT_QR_SYMBOL_SIZE)) return {};
         const QImage image{widget.exportImage()};
         if (image.isNull()) return {};
         QByteArray png;
@@ -4972,7 +5203,7 @@ QString MultisigWizard::privateRecoveryKitHtml() const
                 html.fill(QChar{0});
                 return {};
             }
-            html += QStringLiteral("<td><b>%1 %2/%3</b><br><img width=\"210\" height=\"210\" src=\"%4\"><div class=\"qrpart\"><code>%5</code></div></td>")
+            html += QStringLiteral("<td><b>%1 %2/%3</b><br><img width=\"183\" height=\"183\" src=\"%4\"><div class=\"qrpart\"><code>%5</code></div></td>")
                 .arg(tr("Part").toHtmlEscaped()).arg(part_index + 1).arg(qr_parts.size())
                 .arg(uri, QString::fromStdString(qr_parts[part_index]).toHtmlEscaped());
         }

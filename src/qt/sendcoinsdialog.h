@@ -28,6 +28,7 @@ namespace Ui {
 
 QT_BEGIN_NAMESPACE
 class QButtonGroup;
+class QEvent;
 class QLabel;
 class QPushButton;
 class QVBoxLayout;
@@ -57,6 +58,9 @@ public:
     // Only used for testing-purposes
     wallet::CCoinControl* getCoinControl() { return m_coin_control.get(); }
     bool currentTransactionIsUnsignedForTest() const;
+
+protected:
+    void changeEvent(QEvent* event) override;
 
 public Q_SLOTS:
     /** Open the deliberately separate delayed-recovery workflow. No recovery
@@ -89,6 +93,7 @@ private:
     QPushButton* m_vault_recovery_offer_button{nullptr};
     QLabel* m_vault_recovery_offer_availability{nullptr};
     QLabel* m_recovery_selection_detail{nullptr};
+    QLabel* m_recovery_change_warning{nullptr};
     QString m_vault_send_block_reason;
     interfaces::Wallet::VaultStatus m_vault_status;
     bool m_delayed_recovery{false};

@@ -29,7 +29,7 @@ class QRImageWidget : public QLabel
 
 public:
     explicit QRImageWidget(QWidget *parent = nullptr);
-    bool setQR(const QString& data, const QString& text = "");
+    bool setQR(const QString& data, const QString& text = "", int requested_size = QR_IMAGE_SIZE);
     QImage exportImage();
 
 public Q_SLOTS:
@@ -42,6 +42,7 @@ protected:
 
 private:
     QMenu* contextMenu{nullptr};
+    QImage m_export_image;
 };
 
 #endif // BITCOIN_QT_QRIMAGEWIDGET_H

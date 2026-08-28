@@ -32,6 +32,8 @@ public Q_SLOTS:
 
 private Q_SLOTS:
     void wizardTests();
+    void qrRendering();
+    void vaultIllustrations();
     void grabPages();
     void wizardTemplates();
     void createWalletWithController();

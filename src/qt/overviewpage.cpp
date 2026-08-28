@@ -26,6 +26,7 @@
 #include <QFrame>
 #include <QGridLayout>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QLabel>
 #include <QMessageBox>
 #include <QPainter>
@@ -60,13 +61,7 @@ BitcoinUnit VaultDisplayUnit(BitcoinUnit configured, CAmount total)
 
 QString VaultFriendlyDuration(int64_t seconds)
 {
-    if (seconds < 0) seconds = 0;
-    constexpr int64_t day = 24 * 60 * 60;
-    if (seconds < day) {
-        return GUIUtil::formatNiceTimeOffset(seconds);
-    }
-    const int days = static_cast<int>((seconds + day / 2) / day);
-    return days == 1 ? QObject::tr("1 day") : QObject::tr("%1 days").arg(days);
+    return GUIUtil::formatVaultDuration(seconds);
 }
 
 } // namespace
@@ -225,12 +220,9 @@ void OverviewPage::buildVaultDashboard()
     auto* dashboard = new QVBoxLayout(content);
     dashboard->setContentsMargins(0, 0, 0, 0);
     dashboard->setSpacing(10);
-    m_vault_dashboard->setStyleSheet(QStringLiteral(
-        "#vaultDashboard, #vaultDashboardContent { background: transparent; }"
-        "QFrame[vaultCard=\"true\"] { background: transparent; border: none; border-top: 1px solid palette(mid); border-radius: 0px; }"
-        "QFrame[vaultCard=\"true\"] QLabel { background: transparent; border: none; }"
-        "QLabel[vaultEyebrow=\"true\"] { font-weight: 600; }"
-        "QFrame[vaultDivider=\"true\"] { background: palette(mid); border: none; min-width: 1px; max-width: 1px; min-height: 36px; }"));
+    m_vault_dashboard->setStyleSheet(
+        QStringLiteral("#vaultDashboard, #vaultDashboardContent { background: transparent; }") +
+        GUIUtil::recoveryVaultStyleSheet(palette()));
 
     const auto make_card = [](const char* name) {
         auto* card = new QFrame;
@@ -293,10 +285,15 @@ void OverviewPage::buildVaultDashboard()
     access_heading->setObjectName("vaultAccessHeading");
     access_header->addWidget(access_heading);
     access_header->addStretch();
+    access_header->addWidget(
+        new GUIUtil::VaultIllustrationLabel(
+            GUIUtil::VaultIllustration::ACCESS_TIMELINE, QSize{120, 80}, access_card),
+        0, Qt::AlignTop);
     m_vault_access_details = new QPushButton(tr("Technical Details"), access_card);
     m_vault_access_details->setObjectName("vaultAccessTechnicalButton");
     m_vault_access_details->setCheckable(true);
     m_vault_access_details->setFlat(true);
+    m_vault_access_details->setProperty("vaultQuiet", true);
     m_vault_access_details->setAccessibleDescription(tr("Show exact block-based recovery timing."));
     access_header->addWidget(m_vault_access_details);
     access_layout->addLayout(access_header);
@@ -327,8 +324,13 @@ void OverviewPage::buildVaultDashboard()
     protection_heading->setObjectName("vaultThreeKeyProtectionHeading");
     protection_header->addWidget(protection_heading);
     protection_header->addStretch();
+    protection_header->addWidget(
+        new GUIUtil::VaultIllustrationLabel(
+            GUIUtil::VaultIllustration::PROTECTION_RENEWAL, QSize{120, 80}, m_vault_protection_card),
+        0, Qt::AlignTop);
     m_vault_renewal_button = new QPushButton(tr("Renew Early…"), m_vault_protection_card);
     m_vault_renewal_button->setObjectName("vaultRenewalButton");
+    m_vault_renewal_button->setAutoDefault(false);
     m_vault_renewal_button->setAccessibleDescription(
         tr("Review a self-transfer that restarts the 90/180-day recovery clocks after confirmation."));
     protection_header->addWidget(m_vault_renewal_button);
@@ -360,16 +362,33 @@ void OverviewPage::buildVaultDashboard()
         stat_layout->addWidget(value);
         protection_grid->addWidget(stat, 1);
     };
-    add_protection_stat(tr("THREE-KEY ONLY"), m_vault_protected_stat, m_vault_protected_amount,
+    add_protection_stat(tr("Three-key only"), m_vault_protected_stat, m_vault_protected_amount,
                        QStringLiteral("vaultThreeKeyOnlyAmount"),
                        tr("Amount for which all three keys are the only spending path"));
-    add_protection_stat(tr("RECOVERY OPEN"), m_vault_recovery_enabled_stat, m_vault_recovery_enabled_amount,
+    m_vault_due_stat = new QWidget(m_vault_protected_stat);
+    m_vault_due_stat->setObjectName(QStringLiteral("vaultRenewalDueStat"));
+    auto* due_layout = new QVBoxLayout(m_vault_due_stat);
+    due_layout->setContentsMargins(0, 4, 0, 0);
+    due_layout->setSpacing(1);
+    m_vault_due_caption = new QLabel(tr("Due soon"), m_vault_due_stat);
+    m_vault_due_caption->setObjectName(QStringLiteral("vaultRenewalDueCaption"));
+    m_vault_due_caption->setProperty("vaultSecondary", true);
+    m_vault_due_caption->setWordWrap(true);
+    m_vault_due_amount = make_amount(QStringLiteral("vaultRenewalDueAmount"), m_vault_due_stat);
+    QFont due_font = m_vault_due_amount->font();
+    due_font.setPointSize(std::max(1, due_font.pointSize() - 2));
+    m_vault_due_amount->setFont(due_font);
+    m_vault_due_amount->setAccessibleName(
+        tr("Amount entering the fourteen-day protection renewal window, included in three-key-only"));
+    due_layout->addWidget(m_vault_due_caption);
+    due_layout->addWidget(m_vault_due_amount);
+    if (auto* protected_column = m_vault_protected_stat->layout()) {
+        protected_column->addWidget(m_vault_due_stat);
+    }
+    add_protection_stat(tr("Recovery open"), m_vault_recovery_enabled_stat, m_vault_recovery_enabled_amount,
                        QStringLiteral("vaultRecoveryEnabledAmount"),
                        tr("Amount with an additional recovery path available"));
-    add_protection_stat(tr("DUE SOON"), m_vault_due_stat, m_vault_due_amount,
-                       QStringLiteral("vaultRenewalDueAmount"),
-                       tr("Amount entering the fourteen-day protection renewal window"));
-    add_protection_stat(tr("CONFIRMING"), m_vault_unconfirmed_stat, m_vault_unconfirmed_amount,
+    add_protection_stat(tr("Confirming"), m_vault_unconfirmed_stat, m_vault_unconfirmed_amount,
                        QStringLiteral("vaultUnconfirmedClockAmount"),
                        tr("Unconfirmed amount whose recovery clocks have not started"));
     protection_layout->addLayout(protection_grid);
@@ -437,6 +456,7 @@ void OverviewPage::buildVaultDashboard()
     m_refresh_participants->setObjectName("refreshVaultParticipantsButton");
     m_refresh_participants->setAccessibleDescription(tr("Check connected hardware participants. Until this finishes, their availability remains unknown."));
     m_refresh_participants->setFlat(true);
+    m_refresh_participants->setProperty("vaultQuiet", true);
     participants_header->addWidget(m_refresh_participants);
     dashboard->addLayout(participants_header);
 
@@ -458,12 +478,14 @@ void OverviewPage::buildVaultDashboard()
     actions->addWidget(m_start_delayed_recovery);
     m_delayed_recovery_availability = new QLabel;
     m_delayed_recovery_availability->setObjectName("delayedRecoveryAvailability");
+    m_delayed_recovery_availability->setProperty("vaultSecondary", true);
     m_delayed_recovery_availability->setWordWrap(true);
     actions->addWidget(m_delayed_recovery_availability, 1);
     auto* recovery_kit = new QPushButton(tr("Export Public Policy…"));
     recovery_kit->setObjectName("recoveryKitButton");
     recovery_kit->setAccessibleDescription(tr("Export the public vault policy. This does not reveal or recreate private recovery phrases."));
     recovery_kit->setFlat(true);
+    recovery_kit->setProperty("vaultQuiet", true);
     actions->addWidget(recovery_kit);
     connect(m_start_delayed_recovery, &QPushButton::clicked, this, &OverviewPage::delayedRecoveryRequested);
     connect(recovery_kit, &QPushButton::clicked, this, &OverviewPage::recoveryKitRequested);
@@ -496,6 +518,7 @@ void OverviewPage::rebuildVaultStages()
         divider->setFrameShape(QFrame::NoFrame);
         divider->setAccessibleName(tr("Next recovery stage"));
         m_vault_stages_layout->addWidget(divider);
+        divider->show();
     };
     const auto make_column = [&](const QString& object_name, const QString& phase,
                                  const QString& quorum, const QString& summary,
@@ -531,12 +554,14 @@ void OverviewPage::rebuildVaultStages()
         return std::tuple{column, quorum_label, summary_label};
     };
 
+    const bool marked_lost = !m_privacy && !m_vault_status.manually_lost_signers.empty();
     QString immediate_summary;
     if (m_privacy) {
-        immediate_summary = tr("Amount hidden");
+        immediate_summary = GUIUtil::formatVaultAmount(unit, 0, true);
+    } else if (marked_lost && total > 0) {
+        immediate_summary = tr("Immediate spend blocked");
     } else if (m_balances.vault_immediate > 0) {
-        immediate_summary = BitcoinUnits::formatWithUnit(
-            unit, m_balances.vault_immediate, false, BitcoinUnits::SeparatorStyle::ALWAYS);
+        immediate_summary = GUIUtil::formatVaultAmount(unit, m_balances.vault_immediate);
     } else if (m_balances.unconfirmed_balance > 0) {
         immediate_summary = tr("Available after confirmation");
     } else {
@@ -554,6 +579,7 @@ void OverviewPage::rebuildVaultStages()
     m_vault_immediate_amount->setObjectName("vaultImmediateAmount");
     m_vault_immediate_amount->setAccessibleName(tr("Amount available for immediate spend"));
     m_vault_stages_layout->addWidget(immediate_column, 1);
+    immediate_column->show();
 
     for (int index = 0; index < static_cast<int>(m_vault_status.recovery_stages.size()); ++index) {
         const auto& stage = m_vault_status.recovery_stages[index];
@@ -571,20 +597,20 @@ void OverviewPage::rebuildVaultStages()
         QString summary;
         QString exact;
         if (m_privacy) {
-            summary = tr("Hidden");
+            summary = GUIUtil::formatVaultAmount(unit, 0, true);
         } else {
-            const QString available = BitcoinUnits::formatWithUnit(
-                unit, stage.recoverable_now, false, BitcoinUnits::SeparatorStyle::ALWAYS);
-            const QString awaiting = BitcoinUnits::formatWithUnit(
-                unit, stage.awaiting_maturity, false, BitcoinUnits::SeparatorStyle::ALWAYS);
+            const QString available = GUIUtil::formatVaultAmount(unit, stage.recoverable_now);
+            const QString awaiting = GUIUtil::formatVaultAmount(unit, stage.awaiting_maturity);
             if (stage.recoverable_now > 0 && stage.awaiting_maturity > 0) {
                 summary = tr("%1 now\n%2 later").arg(available, awaiting);
             } else if (stage.recoverable_now > 0) {
-                summary = tr("%1 now").arg(available);
+                summary = stage.recoverable_now == total ? tr("Eligible now") :
+                                                           tr("%1 now").arg(available);
             } else if (stage.awaiting_maturity > 0 && stage.earliest_blocks_remaining) {
-                summary = tr("%1 in about %2").arg(
-                    awaiting,
-                    VaultFriendlyDuration(int64_t{*stage.earliest_blocks_remaining} * spacing));
+                const QString when{VaultFriendlyDuration(int64_t{*stage.earliest_blocks_remaining} * spacing)};
+                summary = stage.awaiting_maturity == total ?
+                    tr("Same coins in about %1").arg(when) :
+                    tr("%1 in about %2").arg(awaiting, when);
             } else if (m_balances.unconfirmed_balance > 0) {
                 summary = tr("Timing starts after confirmation");
             } else {
@@ -606,6 +632,7 @@ void OverviewPage::rebuildVaultStages()
         summary_label->setObjectName(QStringLiteral("vaultRecoveryStage%1Summary").arg(index + 1));
         summary_label->setAccessibleName(tr("Amount eligible at recovery stage %1").arg(index + 1));
         m_vault_stages_layout->addWidget(column, 1);
+        column->show();
     }
 }
 
@@ -637,6 +664,7 @@ void OverviewPage::rebuildVaultParticipants()
         QFont identity_font = identity->font();
         identity_font.setWeight(QFont::DemiBold);
         identity->setFont(identity_font);
+        const QString fingerprint_text = QString::fromStdString(participant.fingerprint).toUpper();
         if (m_privacy) {
             identity->setText(tr("Key %1 · Hidden").arg(index + 1));
             availability = tr("Hidden");
@@ -669,14 +697,18 @@ void OverviewPage::rebuildVaultParticipants()
                 availability = manually_lost ? tr("Marked lost") : tr("Unknown");
                 break;
             }
-            identity->setText(tr("Key %1 · %2").arg(index + 1).arg(kind));
+            identity->setText(fingerprint_text.isEmpty() ?
+                tr("Key %1 · %2").arg(index + 1).arg(kind) :
+                tr("Key %1 · %2 (%3)").arg(index + 1).arg(kind, fingerprint_text));
         }
-        const QString fingerprint_text = QString::fromStdString(participant.fingerprint).toUpper();
         identity->setToolTip(m_privacy ? QString{} :
             tr("Fingerprint: %1\nPath: %2").arg(fingerprint_text, QString::fromStdString(participant.path)));
         identity->setTextInteractionFlags(m_privacy ? Qt::NoTextInteraction : Qt::TextSelectableByMouse);
         state->setText(availability);
         state->setAccessibleName(tr("Participant %1 status: %2").arg(index + 1).arg(availability));
+        if (manually_lost && !m_privacy) {
+            state->setStyleSheet(QStringLiteral("color: palette(bright-text); font-weight: 600;"));
+        }
         layout->addWidget(identity, 1);
         layout->addWidget(state);
 
@@ -685,7 +717,8 @@ void OverviewPage::rebuildVaultParticipants()
         lost_button->setVisible(!m_privacy);
         lost_button->setEnabled(!participant.fingerprint.empty());
         lost_button->setAccessibleDescription(manually_lost ? tr("Remove the local lost marker for participant %1.").arg(index + 1) : tr("Persistently mark participant %1 as lost on this device.").arg(index + 1));
-        lost_button->setFlat(true);
+        lost_button->setFlat(!manually_lost);
+        lost_button->setProperty("vaultQuiet", !manually_lost);
         const std::string fingerprint = participant.fingerprint;
         const bool mark_lost = !manually_lost;
         const std::optional<std::string> expected_policy_commitment{
@@ -715,8 +748,21 @@ void OverviewPage::setVaultSignerLost(
 {
     if (!walletModel || fingerprint.empty()) return;
     const QString fingerprint_text = QString::fromStdString(fingerprint).toUpper();
+    QString name = fingerprint_text;
+    for (int index = 0; index < static_cast<int>(m_vault_status.participants.size()); ++index) {
+        if (m_vault_status.participants[index].fingerprint != fingerprint) continue;
+        QString kind;
+        switch (m_vault_status.participants[index].type) {
+        case interfaces::Wallet::VaultParticipantType::LOCAL_SOFTWARE: kind = tr("This device"); break;
+        case interfaces::Wallet::VaultParticipantType::HARDWARE: kind = tr("Hardware"); break;
+        case interfaces::Wallet::VaultParticipantType::AIR_GAPPED: kind = tr("Offline signer"); break;
+        case interfaces::Wallet::VaultParticipantType::UNKNOWN: kind = tr("Key"); break;
+        }
+        name = tr("Key %1 · %2 (%3)").arg(index + 1).arg(kind, fingerprint_text);
+        break;
+    }
     const QString title = lost ? tr("Mark participant lost?") : tr("Mark participant found?");
-    const QString text = lost ? tr("Immediate spending will be blocked because it requires every participant. This local marker does not change the vault policy. Continue for participant %1?").arg(fingerprint_text) : tr("Remove the local lost marker for participant %1? Only continue if you can use this exact participant again.").arg(fingerprint_text);
+    const QString text = lost ? tr("Immediate spending will be blocked because it requires every participant. This local marker does not change the vault policy. Continue for %1?").arg(name) : tr("Remove the local lost marker for %1? Only continue if you can use this exact participant again.").arg(name);
     if (QMessageBox::warning(this, title, text, QMessageBox::Cancel | QMessageBox::Yes, QMessageBox::Cancel) != QMessageBox::Yes) return;
 
     bool saved{false};
@@ -765,13 +811,18 @@ void OverviewPage::updateVaultDashboard()
 
     const CAmount total = m_balances.balance + m_balances.unconfirmed_balance + m_balances.immature_balance;
     const BitcoinUnit unit = VaultDisplayUnit(walletModel->getOptionsModel()->getDisplayUnit(), total);
-    m_vault_total_amount->setText(BitcoinUnits::formatWithPrivacy(unit, total, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
+    m_vault_total_amount->setText(GUIUtil::formatVaultAmount(unit, total, m_privacy));
     if (m_privacy) {
-        m_vault_balance_status->setText(tr("Vault status hidden"));
-        m_vault_setup_status->setText(tr("Setup status hidden"));
-        m_vault_verification_status->setText(tr("Verification status hidden"));
+        m_vault_balance_status->setText(tr("Hidden"));
+        m_vault_setup_status->setText(tr("Hidden"));
+        m_vault_verification_status->setText(tr("Hidden"));
     } else {
-        if (m_balances.unconfirmed_balance > 0 && m_balances.balance == 0) {
+        if (!m_vault_status.manually_lost_signers.empty()) {
+            const int lost = static_cast<int>(m_vault_status.manually_lost_signers.size());
+            m_vault_balance_status->setText(
+                lost == 1 ? tr("One key marked lost\nImmediate spend blocked") :
+                            tr("%1 keys marked lost\nImmediate spend blocked").arg(lost));
+        } else if (m_balances.unconfirmed_balance > 0 && m_balances.balance == 0) {
             m_vault_balance_status->setText(tr("Awaiting first confirmation\nRecovery timing has not started"));
         } else if (m_balances.unconfirmed_balance > 0) {
             m_vault_balance_status->setText(tr("Includes funds awaiting confirmation"));
@@ -860,8 +911,13 @@ void OverviewPage::updateVaultDashboard()
             earliest = stage.earliest_blocks_remaining;
         }
     }
+    const bool marked_lost = !m_vault_status.manually_lost_signers.empty();
+    const bool show_delayed_recovery =
+        !m_privacy && !m_vault_status.genesis_rescan_required && (recovery_eligible || marked_lost);
     m_start_delayed_recovery->setEnabled(recovery_eligible && !m_vault_status.genesis_rescan_required);
-    m_start_delayed_recovery->setVisible(recovery_eligible && !m_vault_status.genesis_rescan_required && !m_privacy);
+    m_start_delayed_recovery->setVisible(show_delayed_recovery);
+    m_start_delayed_recovery->setFlat(!marked_lost);
+    m_start_delayed_recovery->setDefault(marked_lost);
     if (recovery_eligible) {
         m_delayed_recovery_availability->setText(tr("Recovery available now"));
     } else if (earliest) {
@@ -870,11 +926,13 @@ void OverviewPage::updateVaultDashboard()
     } else {
         m_delayed_recovery_availability->setText(tr("No delayed-recovery funds are currently eligible."));
     }
-    // The access timeline already communicates unavailable recovery states.
-    // Keep this action row for actions, not another paragraph of status copy.
-    m_delayed_recovery_availability->hide();
+    // Lost-signer is the exceptional case where the next action is delayed
+    // recovery even before a stage is eligible. Healthy vaults already show
+    // timing on the 3 → 2 → 1 timeline.
+    m_delayed_recovery_availability->setVisible(marked_lost && !m_privacy && !recovery_eligible);
     rebuildVaultStages();
     rebuildVaultParticipants();
+    refreshVaultTitleBadge();
 }
 
 void OverviewPage::updateVaultProtectionCard()
@@ -887,8 +945,7 @@ void OverviewPage::updateVaultProtectionCard()
     const CAmount total{m_balances.balance + m_balances.unconfirmed_balance + m_balances.immature_balance};
     const BitcoinUnit unit{VaultDisplayUnit(walletModel->getOptionsModel()->getDisplayUnit(), total)};
     const auto amount = [&](CAmount value) {
-        return BitcoinUnits::formatWithPrivacy(
-            unit, value, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy);
+        return GUIUtil::formatVaultAmount(unit, value, m_privacy);
     };
     m_vault_protected_amount->setText(amount(m_vault_renewal_status.three_key_only));
     m_vault_recovery_enabled_amount->setText(amount(m_vault_renewal_status.recovery_enabled));
@@ -897,18 +954,19 @@ void OverviewPage::updateVaultProtectionCard()
     const bool mixed_protection = m_vault_renewal_status.recovery_enabled > 0 ||
                                   m_vault_renewal_status.warning > 0 ||
                                   m_vault_renewal_status.unconfirmed > 0;
-    m_vault_protected_stat->setVisible(m_privacy || (m_vault_renewal_status.three_key_only > 0 && mixed_protection));
-    m_vault_recovery_enabled_stat->setVisible(m_privacy || m_vault_renewal_status.recovery_enabled > 0);
-    m_vault_due_stat->setVisible(m_privacy || m_vault_renewal_status.warning > 0);
-    m_vault_unconfirmed_stat->setVisible(m_privacy || m_vault_renewal_status.unconfirmed > 0);
+    // "Due soon" is a subset of three-key-only, not a sibling total.
+    m_vault_protected_stat->setVisible(!m_privacy && m_vault_renewal_status.three_key_only > 0 && mixed_protection);
+    m_vault_recovery_enabled_stat->setVisible(!m_privacy && m_vault_renewal_status.recovery_enabled > 0);
+    m_vault_due_stat->setVisible(!m_privacy && m_vault_renewal_status.warning > 0 && m_vault_protected_stat->isVisible());
+    m_vault_unconfirmed_stat->setVisible(!m_privacy && m_vault_renewal_status.unconfirmed > 0);
     // Empty due sets end a reminder cycle even while privacy mode suppresses
     // presentation. Non-empty sets remain fully suppressed in privacy mode.
     checkVaultRenewalReminder();
 
     if (m_privacy) {
-        m_vault_next_expansion->setText(tr("Protection timing hidden"));
-        m_vault_protection_explanation->setText(tr("Protection details hidden"));
-        m_vault_next_expansion->show();
+        m_vault_protection_explanation->setText(tr("Hidden"));
+        m_vault_next_expansion->setText(tr("Hidden"));
+        m_vault_next_expansion->hide();
         m_vault_renewal_button->hide();
         return;
     }
@@ -918,6 +976,9 @@ void OverviewPage::updateVaultProtectionCard()
         m_vault_renewal_status.recovery_enabled == 0) {
         m_vault_protection_explanation->setText(
             tr("Waiting for confirmation. The recovery clocks have not started."));
+    } else if (!m_vault_status.manually_lost_signers.empty()) {
+        m_vault_protection_explanation->setText(
+            tr("Immediate spend is blocked while a key is marked lost. Delayed recovery or marking it found restores ordinary use."));
     } else {
         m_vault_protection_explanation->setText(
             tr("All three keys always work. Renewing restarts the recovery clocks for selected funds."));
@@ -970,11 +1031,17 @@ void OverviewPage::updateVaultProtectionCard()
     m_vault_renewal_button->setProperty("renewalDue", due);
     m_vault_renewal_button->setText(
         due ? tr("Renew Three-Key Protection…") : tr("Renew Early…"));
-    m_vault_renewal_button->setFlat(!due);
+    m_vault_renewal_button->setFlat(false);
+    m_vault_renewal_button->setProperty("vaultQuiet", false);
     m_vault_renewal_button->setDefault(due);
     const bool available{!m_vault_renewal_status.clusters.empty() &&
                          !m_vault_status.genesis_rescan_required};
-    m_vault_renewal_button->setEnabled(available);
+    const bool participant_marked_lost = std::ranges::any_of(
+        m_vault_status.participants, [this](const auto& participant) {
+            return std::ranges::find(m_vault_status.manually_lost_signers, participant.fingerprint) !=
+                   m_vault_status.manually_lost_signers.end();
+        });
+    m_vault_renewal_button->setEnabled(available && !participant_marked_lost);
     m_vault_renewal_button->setVisible(available);
     if (m_vault_status.genesis_rescan_required) {
         m_vault_renewal_button->setToolTip(
@@ -982,6 +1049,9 @@ void OverviewPage::updateVaultProtectionCard()
     } else if (m_vault_renewal_status.clusters.empty()) {
         m_vault_renewal_button->setToolTip(
             tr("No confirmed, safe, unlocked vault coins are available to renew."));
+    } else if (participant_marked_lost) {
+        m_vault_renewal_button->setToolTip(
+            tr("A policy participant is marked lost. Mark it found before renewing protection."));
     } else {
         m_vault_renewal_button->setToolTip({});
     }
@@ -1168,17 +1238,16 @@ void OverviewPage::setWalletModel(WalletModel *model)
 void OverviewPage::changeEvent(QEvent* e)
 {
     if (e->type() == QEvent::PaletteChange) {
-        QIcon icon = m_platform_style->SingleColorIcon(QStringLiteral(":/icons/warning"));
-        ui->labelTransactionsStatus->setIcon(icon);
-        ui->labelWalletStatus->setIcon(icon);
+        ui->labelTransactionsStatus->setIcon(m_platform_style->SingleColorIcon(QStringLiteral(":/icons/warning")));
+        refreshVaultTitleBadge();
         if (m_vault_dashboard) {
             // Hairlines use palette(mid), which is resolved when the sheet is
             // polished. Re-polish so a live palette change cannot leave the
             // previous theme's borders on the dashboard.
             m_vault_dashboard->setPalette(palette());
-            const QString sheet{m_vault_dashboard->styleSheet()};
-            m_vault_dashboard->setStyleSheet({});
-            m_vault_dashboard->setStyleSheet(sheet);
+            m_vault_dashboard->setStyleSheet(
+                QStringLiteral("#vaultDashboard, #vaultDashboardContent { background: transparent; }") +
+                GUIUtil::recoveryVaultStyleSheet(palette()));
             if (auto* scroll = findChild<QScrollArea*>("vaultDashboardScroll")) {
                 scroll->setPalette(palette());
                 scroll->viewport()->setPalette(palette());
@@ -1221,10 +1290,36 @@ void OverviewPage::updateAlerts(const QString &warnings)
     this->ui->labelAlerts->setText(warnings);
 }
 
+void OverviewPage::refreshVaultTitleBadge()
+{
+    const bool vault = m_balances.is_vault;
+    ui->labelWalletStatus->setAutoDefault(false);
+    ui->labelWalletStatus->setDefault(false);
+    ui->labelWalletStatus->setFlat(vault);
+    if (vault) {
+        ui->labelWalletStatus->setStyleSheet(
+            QStringLiteral("QPushButton { border: none; background: transparent; padding: 0px; }"));
+        if (m_out_of_sync) {
+            ui->labelWalletStatus->setIcon(m_platform_style->SingleColorIcon(QStringLiteral(":/icons/warning")));
+            ui->labelWalletStatus->setToolTip(
+                tr("The displayed information may be out of date. Your wallet automatically synchronizes with the Bitcoin network after a connection is established, but this process has not completed yet."));
+        } else {
+            ui->labelWalletStatus->setIcon(m_platform_style->SingleColorIcon(QStringLiteral(":/icons/lock_closed")));
+            ui->labelWalletStatus->setToolTip(tr("Recovery Vault"));
+        }
+        ui->labelWalletStatus->setVisible(true);
+        return;
+    }
+    ui->labelWalletStatus->setStyleSheet({});
+    ui->labelWalletStatus->setIcon(m_platform_style->SingleColorIcon(QStringLiteral(":/icons/warning")));
+    ui->labelWalletStatus->setVisible(m_out_of_sync);
+}
+
 void OverviewPage::showOutOfSyncWarning(bool fShow)
 {
-    ui->labelWalletStatus->setVisible(fShow);
+    m_out_of_sync = fShow;
     ui->labelTransactionsStatus->setVisible(fShow);
+    refreshVaultTitleBadge();
 }
 
 void OverviewPage::setMonospacedFont(const QFont& f)

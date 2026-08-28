@@ -96,6 +96,7 @@ private:
     QLabel* m_vault_immediate_quorum{nullptr};
     QLabel* m_vault_protected_amount{nullptr};
     QLabel* m_vault_recovery_enabled_amount{nullptr};
+    QLabel* m_vault_due_caption{nullptr};
     QLabel* m_vault_due_amount{nullptr};
     QLabel* m_vault_unconfirmed_amount{nullptr};
     QLabel* m_vault_next_expansion{nullptr};
@@ -114,6 +115,7 @@ private:
     QVBoxLayout* m_vault_participants_layout{nullptr};
 
     const PlatformStyle* m_platform_style;
+    bool m_out_of_sync{true};
 
     TxViewDelegate *txdelegate;
     std::unique_ptr<TransactionFilterProxy> filter;
@@ -124,6 +126,7 @@ private:
     void rebuildVaultParticipants();
     void updateVaultProtectionCard();
     void checkVaultRenewalReminder();
+    void refreshVaultTitleBadge();
     void setVaultSignerLost(const std::string& fingerprint, bool lost,
                             const std::optional<std::string>& expected_policy_commitment);
 

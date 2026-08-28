@@ -4,6 +4,8 @@
 
 #include <qt/test/vaultrenewaltests.h>
 
+#include <qt/bitcoinunits.h>
+#include <qt/guiutil.h>
 #include <qt/overviewpage.h>
 #include <qt/platformstyle.h>
 #include <qt/vaultrenewaldialog.h>
@@ -225,6 +227,23 @@ void VaultRenewalTests::guidedPresentation()
     QVERIFY(due_selection.findChild<QCheckBox*>(QStringLiteral("vaultRenewalGroupCheck2"))->isChecked());
     due_selection.close();
 
+    VaultRenewalDialog mapping{style.get()};
+    mapping.setAvailableGroups(Groups(/*due=*/true), /*due=*/true);
+    mapping.start(/*due=*/true);
+    mapping.setPlan(DuePlan());
+    Show(mapping);
+    QVERIFY(VisibleText(mapping).contains(QStringLiteral("Privacy group 2")));
+    QVERIFY(VisibleText(mapping).contains(QStringLiteral("Privacy group 3")));
+    QVERIFY(!VisibleText(mapping).contains(QStringLiteral("Privacy group 1 · 1 coin")));
+    mapping.setBatch(DueExactBatch());
+    auto* mapping_batch_1{mapping.findChild<QFrame*>(QStringLiteral("vaultRenewalBatch1"))};
+    auto* mapping_batch_2{mapping.findChild<QFrame*>(QStringLiteral("vaultRenewalBatch2"))};
+    QVERIFY(mapping_batch_1);
+    QVERIFY(mapping_batch_2);
+    QVERIFY(VisibleText(*mapping_batch_1).contains(QStringLiteral("Transaction 1 · Privacy group 2 · 1 input")));
+    QVERIFY(VisibleText(*mapping_batch_2).contains(QStringLiteral("Transaction 2 · Privacy group 3 · 1 input")));
+    mapping.close();
+
     dialog.setPlan(ReadOnlyPlan());
     QVERIFY(!review->isEnabled());
     auto* signer_status{dialog.findChild<QLabel*>(QStringLiteral("vaultRenewalSignerStatus"))};
@@ -233,6 +252,15 @@ void VaultRenewalTests::guidedPresentation()
     QVERIFY(summary);
     QVERIFY(signer_status->text().contains(QStringLiteral("not fresh"), Qt::CaseInsensitive));
     QVERIFY(summary->text().contains(QStringLiteral("calculated only"), Qt::CaseInsensitive));
+    auto* plan_exclusions{dialog.findChild<QLabel*>(QStringLiteral("vaultRenewalPlanExclusions"))};
+    QVERIFY(plan_exclusions);
+    QCOMPARE(plan_exclusions->text(), QStringLiteral("Unavailable for renewal: 1 BTC locked (1 coin)."));
+    auto no_exclusions{ReadOnlyPlan()};
+    no_exclusions.excluded_locked_count = 0;
+    no_exclusions.excluded_locked = 0;
+    dialog.setPlan(no_exclusions);
+    QCOMPARE(plan_exclusions->text(), QStringLiteral("Unavailable for renewal: none."));
+    dialog.setPlan(ReadOnlyPlan());
 
     dialog.setSignerReadiness(true, {});
     QVERIFY(review->isEnabled());
@@ -272,10 +300,14 @@ void VaultRenewalTests::guidedPresentation()
     dialog.setSigningProgress(1, 1, QStringLiteral("Transaction is fully signed."));
     auto* cancel{dialog.findChild<QPushButton*>(QStringLiteral("vaultRenewalCancelProgressButton"))};
     auto* progress{dialog.findChild<QProgressBar*>(QStringLiteral("vaultRenewalProgress"))};
+    auto* progress_count{dialog.findChild<QLabel*>(QStringLiteral("vaultRenewalProgressCount"))};
     QVERIFY(cancel);
     QVERIFY(progress);
+    QVERIFY(progress_count);
     QVERIFY(cancel->isEnabled());
     QCOMPARE(progress->value(), 1);
+    QVERIFY(!progress->isTextVisible());
+    QCOMPARE(progress_count->text(), QStringLiteral("Signed 1 of 1"));
     cancel->click();
     QCOMPARE(cancel_requests, 1);
     dialog.setCancellationPending();
@@ -294,7 +326,7 @@ void VaultRenewalTests::guidedPresentation()
     VaultRenewalResultPresentation result;
     result.stored_not_relayed = 1;
     result.retry_available = true;
-    result.failures << QStringLiteral("abc: stored, not relayed");
+    result.outcomes.push_back({QStringLiteral("cluster-a"), QStringLiteral("abc"), QStringLiteral("stored, not relayed"), {}});
     dialog.setResult(result);
     QCOMPARE(pages->currentIndex(), 3);
     auto* retry{dialog.findChild<QPushButton*>(QStringLiteral("vaultRenewalRetryButton"))};
@@ -311,12 +343,21 @@ void VaultRenewalTests::guidedPresentation()
     result.failed = 1;
     result.not_attempted = 1;
     result.retry_available = true;
-    result.failures << QStringLiteral("group-c: not attempted");
+    result.outcomes = {
+        {QStringLiteral("cluster-a"), QStringLiteral("a1b2c3"), QStringLiteral("relayed"), {}},
+        {QStringLiteral("cluster-a"), QStringLiteral("a4b5c6"), QStringLiteral("already accepted"), {}},
+        {QStringLiteral("cluster-b"), QStringLiteral("d4e5f6"), QStringLiteral("stored, not relayed"), {}},
+        {QStringLiteral("cluster-b"), QStringLiteral("d7e8f9"), QStringLiteral("failed"), {}},
+        {QStringLiteral("cluster-c"), {}, QStringLiteral("not attempted"), {}},
+    };
     dialog.setResult(result);
     QVERIFY(detail->text().contains(QStringLiteral("2 transactions accepted"), Qt::CaseInsensitive));
     QVERIFY(detail->text().contains(QStringLiteral("not attempted"), Qt::CaseInsensitive));
     QVERIFY(detail->text().contains(QStringLiteral("portions"), Qt::CaseInsensitive));
     QVERIFY(detail->text().contains(QStringLiteral("dashboard"), Qt::CaseInsensitive));
+    QVERIFY(VisibleText(dialog).contains(QStringLiteral("Privacy group 3: not attempted")));
+    QVERIFY(VisibleText(dialog).contains(
+        QStringLiteral("Privacy group 1: relayed — transaction a1b2c3")));
     QVERIFY(!detail->text().contains(QStringLiteral("accepted transactions are pending confirmation"), Qt::CaseInsensitive));
     QVERIFY(retry->isVisible());
 
@@ -376,6 +417,12 @@ void VaultRenewalTests::guidedPresentation()
     QVERIFY(split_summary->text().contains(QStringLiteral("1 privacy group")));
     QVERIFY(split_summary->text().contains(QStringLiteral("2 transactions")));
     QVERIFY(!split_summary->text().contains(QStringLiteral("(s)")));
+    auto* split_first{split.findChild<QFrame*>(QStringLiteral("vaultRenewalBatch1"))};
+    auto* split_second{split.findChild<QFrame*>(QStringLiteral("vaultRenewalBatch2"))};
+    QVERIFY(split_first);
+    QVERIFY(split_second);
+    QVERIFY(VisibleText(*split_first).contains(QStringLiteral("Privacy group 1")));
+    QVERIFY(VisibleText(*split_second).contains(QStringLiteral("Privacy group 1")));
 }
 
 void VaultRenewalTests::privacyPresentation()
@@ -393,16 +440,14 @@ void VaultRenewalTests::privacyPresentation()
     plan.signers_ready = true;
     plan.unavailable_reason.clear();
     plan.signer_lines = {
-        QStringLiteral("Participant FEEDC0DE · Hardware connected"),
-        QStringLiteral("Participant C001D00D · Local key ready"),
-        QStringLiteral("Participant 1234ABCD · Local key ready"),
+        QStringLiteral("Key 1 · Hardware (FEEDC0DE) · Hardware connected"),
+        QStringLiteral("Key 2 · This device (C001D00D) · Local key ready"),
+        QStringLiteral("Key 3 · This device (1234ABCD) · Local key ready"),
     };
     dialog.setPlan(plan);
     Show(dialog);
 
-    const QString unmasked_amount{BitcoinUnits::formatWithPrivacy(
-        BitcoinUnit::BTC, 3 * COIN, BitcoinUnits::SeparatorStyle::ALWAYS,
-        /*privacy=*/false)};
+    const QString unmasked_amount{GUIUtil::formatVaultAmount(BitcoinUnit::BTC, 3 * COIN)};
     auto* pages{dialog.findChild<QStackedWidget*>(QStringLiteral("vaultRenewalPages"))};
     auto* scope_card{dialog.findChild<QFrame*>(QStringLiteral("vaultRenewalScopeCard"))};
     auto* plan_card{dialog.findChild<QFrame*>(QStringLiteral("vaultRenewalPlanCard"))};
@@ -430,7 +475,7 @@ void VaultRenewalTests::privacyPresentation()
     auto* plan_accessible{QAccessible::queryAccessibleInterface(plan_card)};
     QVERIFY(plan_accessible);
     QVERIFY(plan_accessible->state().invisible);
-    QVERIFY(plan_summary->text().contains(QLatin1Char('#')));
+    QVERIFY(plan_summary->text().contains(QStringLiteral("••••")));
     QVERIFY(!VisibleText(dialog).contains(unmasked_amount));
     QVERIFY(!VisibleText(dialog).contains(QStringLiteral("FEEDC0DE")));
     QVERIFY(!VisibleText(dialog).contains(QStringLiteral("1 privacy group")));
@@ -465,7 +510,7 @@ void VaultRenewalTests::privacyPresentation()
     QVERIFY(review_card->isHidden());
     QVERIFY(sign->isHidden());
     QVERIFY(!sign->isEnabled());
-    QVERIFY(review_summary->text().contains(QLatin1Char('#')));
+    QVERIFY(review_summary->text().contains(QStringLiteral("••••")));
     QVERIFY(!VisibleText(dialog).contains(unmasked_amount));
     QVERIFY(!VisibleText(dialog).contains(QStringLiteral("1 privacy group")));
     QVERIFY(!VisibleText(dialog).contains(QStringLiteral("Privacy group 1")));
@@ -503,15 +548,17 @@ void VaultRenewalTests::privacyPresentation()
     result.stored_not_relayed = 1;
     result.not_attempted = 1;
     result.retry_available = true;
-    result.transaction_ids << QStringLiteral("deadbeefcafebabe");
-    result.failures << QStringLiteral("deadbeefcafebabe: stored, not relayed");
+    result.outcomes = {
+        {QStringLiteral("cluster-a"), QStringLiteral("deadbeefcafebabe"), QStringLiteral("stored, not relayed"), {}},
+        {QStringLiteral("cluster-b"), {}, QStringLiteral("not attempted"), {}},
+    };
     dialog.setResult(result);
     auto* result_detail{dialog.findChild<QLabel*>(QStringLiteral("vaultRenewalResultDetail"))};
     auto* retry{dialog.findChild<QPushButton*>(QStringLiteral("vaultRenewalRetryButton"))};
     QVERIFY(result_detail);
     QVERIFY(retry);
     QCOMPARE(pages->currentIndex(), 3);
-    QVERIFY(result_detail->text().contains(QStringLiteral("deadbeefcafebabe")));
+    QVERIFY(VisibleText(dialog).contains(QStringLiteral("deadbeefcafebabe")));
     QVERIFY(retry->isVisible());
 
     dialog.setPrivacy(true);
@@ -520,7 +567,7 @@ void VaultRenewalTests::privacyPresentation()
     QVERIFY(retry->isHidden());
     QVERIFY(!retry->isEnabled());
     dialog.setPrivacy(false);
-    QVERIFY(result_detail->text().contains(QStringLiteral("deadbeefcafebabe")));
+    QVERIFY(VisibleText(dialog).contains(QStringLiteral("deadbeefcafebabe")));
     QVERIFY(retry->isVisible());
     QVERIFY(retry->isEnabled());
 }
@@ -595,11 +642,18 @@ void VaultRenewalTests::adaptiveRendering()
                 };
 
                 capture(dialog, QStringLiteral("due-plan"));
-                dialog.setSignerReadiness(
-                    false, QStringLiteral("Connect the exact hardware participant 33333333."),
-                    {QStringLiteral("Participant 11111111 · Local key ready"),
-                     QStringLiteral("Participant 22222222 · Local key ready"),
-                     QStringLiteral("Participant 33333333 · Hardware unavailable")});
+                interfaces::Wallet::VaultStatus blocked_status;
+                blocked_status.signer_discovery_complete = true;
+                blocked_status.participants = {
+                    Participant("11111111", interfaces::Wallet::VaultParticipantType::LOCAL_SOFTWARE,
+                                interfaces::Wallet::VaultSignerAvailability::AVAILABLE),
+                    Participant("22222222", interfaces::Wallet::VaultParticipantType::LOCAL_SOFTWARE,
+                                interfaces::Wallet::VaultSignerAvailability::AVAILABLE),
+                    Participant("33333333", interfaces::Wallet::VaultParticipantType::HARDWARE,
+                                interfaces::Wallet::VaultSignerAvailability::UNAVAILABLE),
+                };
+                const auto blocked{PresentVaultRenewalSigners(blocked_status)};
+                dialog.setSignerReadiness(blocked.ready, blocked.reason, blocked.roster);
                 capture(dialog, QStringLiteral("signer-blocked"));
 
                 dialog.setBatch(DueExactBatch());
@@ -614,7 +668,7 @@ void VaultRenewalTests::adaptiveRendering()
                 QVERIFY(sign);
                 sign->click();
                 dialog.setSigningProgress(
-                    1, 2, QStringLiteral("Transaction 2 of 2: waiting for connected hardware confirmations."));
+                    1, 2, QStringLiteral("Transaction 2 of 2: waiting for approval on connected hardware participant Key 3 · Hardware (33333333)."));
                 capture(dialog, QStringLiteral("signing-progress"));
                 dialog.setCancellationPending();
                 capture(dialog, QStringLiteral("cancel-pending"));
@@ -624,10 +678,10 @@ void VaultRenewalTests::adaptiveRendering()
                 partial.stored_not_relayed = 1;
                 partial.not_attempted = 1;
                 partial.retry_available = true;
-                partial.failures = {
-                    QStringLiteral("a1b2c3: relayed"),
-                    QStringLiteral("d4e5f6: stored, not relayed"),
-                    QStringLiteral("group-c: not attempted"),
+                partial.outcomes = {
+                    {QStringLiteral("cluster-b"), QStringLiteral("a1b2c3"), QStringLiteral("relayed"), {}},
+                    {QStringLiteral("cluster-b"), QStringLiteral("d4e5f6"), QStringLiteral("stored, not relayed"), {}},
+                    {QStringLiteral("cluster-c"), {}, QStringLiteral("not attempted"), {}},
                 };
                 dialog.setResult(partial);
                 capture(dialog, QStringLiteral("partial-result"));
@@ -760,6 +814,10 @@ void VaultRenewalTests::signerReadiness()
     QVERIFY(presentation.ready);
     QCOMPARE(presentation.roster.size(), 3);
     QVERIFY(presentation.roster.front().contains(QStringLiteral("Local key ready")));
+    QVERIFY(presentation.roster.front().contains(
+        QStringLiteral("Key 1 · This device (11111111)")));
+    QCOMPARE(presentation.local_participant_count, 3);
+    QVERIFY(presentation.hardware_participants.isEmpty());
 
     status.participants[2] = Participant("33333333", Type::HARDWARE, Availability::AVAILABLE);
     status.signer_discovery_complete = false;
@@ -771,7 +829,13 @@ void VaultRenewalTests::signerReadiness()
     status.signer_discovery_complete = true;
     presentation = PresentVaultRenewalSigners(status);
     QVERIFY(presentation.ready);
-    QVERIFY(presentation.roster.back().contains(QStringLiteral("confirmations"), Qt::CaseInsensitive));
+    QVERIFY(presentation.roster.back().contains(QStringLiteral("approval"), Qt::CaseInsensitive));
+    QVERIFY(!presentation.roster.back().contains(QStringLiteral("confirmation"), Qt::CaseInsensitive));
+    QVERIFY(presentation.roster.back().contains(
+        QStringLiteral("Key 3 · Hardware (33333333)")));
+    QCOMPARE(presentation.hardware_participants,
+             QStringList{QStringLiteral("Key 3 · Hardware (33333333)")});
+    QCOMPARE(presentation.local_participant_count, 2);
 
     status.participants[2].availability = Availability::UNAVAILABLE;
     presentation = PresentVaultRenewalSigners(status);

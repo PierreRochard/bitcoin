@@ -29,9 +29,10 @@ QRImageWidget::QRImageWidget(QWidget* parent)
     contextMenu->addAction(tr("&Copy Image"), this, &QRImageWidget::copyImage);
 }
 
-bool QRImageWidget::setQR(const QString& data, const QString& text)
+bool QRImageWidget::setQR(const QString& data, const QString& text, int requested_size)
 {
 #ifdef USE_QRCODE
+    m_export_image = QImage{};
     setText("");
     if (data.isEmpty()) return false;
 
@@ -48,40 +49,72 @@ bool QRImageWidget::setQR(const QString& data, const QString& text)
         return false;
     }
 
-    QImage qrImage = QImage(code->width + 8, code->width + 8, QImage::Format_RGB32);
-    qrImage.fill(0xffffff);
-    unsigned char *p = code->data;
-    for (int y = 0; y < code->width; ++y) {
-        for (int x = 0; x < code->width; ++x) {
-            qrImage.setPixel(x + 4, y + 4, ((*p & 1) ? 0x0 : 0xffffff));
-            ++p;
+    static constexpr int QUIET_ZONE_MODULES{4};
+    const int module_grid_size{code->width + 2 * QUIET_ZONE_MODULES};
+    const int module_size{requested_size / module_grid_size};
+    if (module_size < 1) {
+        QRcode_free(code);
+        setText(tr("QR code image size is too small."));
+        return false;
+    }
+
+    QImage qr_image{requested_size, requested_size, QImage::Format_RGB32};
+    if (qr_image.isNull()) {
+        QRcode_free(code);
+        setText(tr("Error creating QR Code image."));
+        return false;
+    }
+    qr_image.fill(Qt::white);
+    {
+        QPainter painter{&qr_image};
+        painter.setRenderHint(QPainter::Antialiasing, false);
+        painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
+
+        const int rendered_size{module_grid_size * module_size};
+        const int offset{(requested_size - rendered_size) / 2};
+        const int data_offset{offset + QUIET_ZONE_MODULES * module_size};
+        const unsigned char* module{code->data};
+        for (int y = 0; y < code->width; ++y) {
+            for (int x = 0; x < code->width; ++x, ++module) {
+                if (*module & 1) {
+                    painter.fillRect(data_offset + x * module_size,
+                                     data_offset + y * module_size,
+                                     module_size, module_size, Qt::black);
+                }
+            }
         }
     }
     QRcode_free(code);
 
-    const int qr_image_size = QR_IMAGE_SIZE + (text.isEmpty() ? 0 : 2 * QR_IMAGE_MARGIN);
-    QImage qrAddrImage(qr_image_size, qr_image_size, QImage::Format_RGB32);
-    qrAddrImage.fill(0xffffff);
-    {
-        QPainter painter(&qrAddrImage);
-        painter.drawImage(QR_IMAGE_MARGIN, 0, qrImage.scaled(QR_IMAGE_SIZE, QR_IMAGE_SIZE));
-
-        if (!text.isEmpty()) {
-            QRect paddedRect = qrAddrImage.rect();
-            paddedRect.setHeight(QR_IMAGE_SIZE + QR_IMAGE_TEXT_MARGIN);
-
-            QFont font = GUIUtil::fixedPitchFont();
-            font.setStretch(QFont::SemiCondensed);
-            font.setLetterSpacing(QFont::AbsoluteSpacing, 1);
-            const qreal font_size = GUIUtil::calculateIdealFontSize(paddedRect.width() - 2 * QR_IMAGE_TEXT_MARGIN, text, font);
-            font.setPointSizeF(font_size);
-
-            painter.setFont(font);
-            painter.drawText(paddedRect, Qt::AlignBottom | Qt::AlignCenter, text);
+    if (text.isEmpty()) {
+        m_export_image = qr_image;
+    } else {
+        const int composite_size{requested_size + 2 * QR_IMAGE_MARGIN};
+        m_export_image = QImage{composite_size, composite_size, QImage::Format_RGB32};
+        if (m_export_image.isNull()) {
+            setText(tr("Error creating QR Code image."));
+            return false;
         }
+        m_export_image.fill(Qt::white);
+
+        QPainter painter{&m_export_image};
+        painter.drawImage(QR_IMAGE_MARGIN, 0, qr_image);
+
+        const QRect text_rect{QR_IMAGE_TEXT_MARGIN,
+                              requested_size + QR_IMAGE_TEXT_MARGIN,
+                              composite_size - 2 * QR_IMAGE_TEXT_MARGIN,
+                              QR_IMAGE_MARGIN};
+        QFont font = GUIUtil::fixedPitchFont();
+        font.setStretch(QFont::SemiCondensed);
+        font.setLetterSpacing(QFont::AbsoluteSpacing, 1);
+        const qreal font_size = GUIUtil::calculateIdealFontSize(text_rect.width(), text, font);
+        font.setPointSizeF(font_size);
+
+        painter.setFont(font);
+        painter.drawText(text_rect, Qt::AlignTop | Qt::AlignHCenter, text);
     }
 
-    setPixmap(QPixmap::fromImage(qrAddrImage));
+    setPixmap(QPixmap::fromImage(m_export_image));
 
     return true;
 #else
@@ -92,11 +125,7 @@ bool QRImageWidget::setQR(const QString& data, const QString& text)
 
 QImage QRImageWidget::exportImage()
 {
-    if (!GUIUtil::HasPixmap(this)) {
-        return QImage();
-    }
-
-    return this->pixmap(Qt::ReturnByValue).toImage();
+    return m_export_image;
 }
 
 void QRImageWidget::mousePressEvent(QMouseEvent *event)

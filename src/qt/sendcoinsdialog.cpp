@@ -30,6 +30,7 @@
 
 #include <QButtonGroup>
 #include <QCheckBox>
+#include <QEvent>
 #include <QFontMetrics>
 #include <QFrame>
 #include <QHBoxLayout>
@@ -156,28 +157,34 @@ SendCoinsDialog::SendCoinsDialog(const PlatformStyle *_platformStyle, QWidget *p
     m_vault_notice->setTextFormat(Qt::RichText);
     m_vault_notice->setWordWrap(true);
     m_vault_notice->setAccessibleName(tr("Immediate send status"));
-    m_vault_notice->setStyleSheet(QStringLiteral("QLabel { background: palette(alternate-base); color: palette(text); padding: 10px; border: 1px solid palette(mid); border-radius: 6px; }"));
     m_vault_notice->hide();
 
     m_vault_recovery_offer = new QWidget;
     m_vault_recovery_offer->setObjectName("vaultDelayedRecoveryOffer");
-    auto* recovery_offer_layout = new QVBoxLayout(m_vault_recovery_offer);
+    auto* recovery_offer_layout = new QHBoxLayout(m_vault_recovery_offer);
     recovery_offer_layout->setContentsMargins(8, 0, 8, 4);
-    recovery_offer_layout->setSpacing(3);
+    recovery_offer_layout->setSpacing(10);
+    recovery_offer_layout->addWidget(
+        new GUIUtil::VaultIllustrationLabel(
+            GUIUtil::VaultIllustration::DELAYED_RECOVERY, QSize{90, 60}, m_vault_recovery_offer),
+        0, Qt::AlignTop);
+    auto* recovery_offer_copy = new QVBoxLayout;
+    recovery_offer_copy->setContentsMargins(0, 0, 0, 0);
+    recovery_offer_copy->setSpacing(3);
     m_vault_recovery_offer_button = new QPushButton(tr("Start Delayed Recovery…"), m_vault_recovery_offer);
     m_vault_recovery_offer_button->setObjectName("vaultDelayedRecoveryOfferButton");
     m_vault_recovery_offer_button->setMinimumHeight(32);
     m_vault_recovery_offer_button->setAccessibleDescription(tr("Leave standard Send and open the guided delayed-recovery flow. You will choose the exact stage next."));
-    recovery_offer_layout->addWidget(m_vault_recovery_offer_button, 0, Qt::AlignLeft);
+    recovery_offer_copy->addWidget(m_vault_recovery_offer_button, 0, Qt::AlignLeft);
     m_vault_recovery_offer_availability = new QLabel(m_vault_recovery_offer);
     m_vault_recovery_offer_availability->setObjectName("vaultDelayedRecoveryOfferAvailability");
     m_vault_recovery_offer_availability->setWordWrap(true);
-    recovery_offer_layout->addWidget(m_vault_recovery_offer_availability);
+    recovery_offer_copy->addWidget(m_vault_recovery_offer_availability);
+    recovery_offer_layout->addLayout(recovery_offer_copy, 1);
     m_vault_recovery_offer->hide();
 
     m_recovery_panel = new QFrame;
     m_recovery_panel->setObjectName("delayedRecoveryPanel");
-    m_recovery_panel->setStyleSheet(QStringLiteral("QFrame#delayedRecoveryPanel { background: palette(alternate-base); border: 1px solid palette(mid); border-radius: 8px; }"));
     auto* recovery_layout = new QVBoxLayout(m_recovery_panel);
     recovery_layout->setSpacing(8);
     auto* recovery_header = new QHBoxLayout;
@@ -193,7 +200,11 @@ SendCoinsDialog::SendCoinsDialog(const PlatformStyle *_platformStyle, QWidget *p
     cancel_recovery->setMinimumHeight(32);
     recovery_header->addWidget(recovery_title);
     recovery_header->addStretch();
-    recovery_header->addWidget(cancel_recovery);
+    recovery_header->addWidget(
+        new GUIUtil::VaultIllustrationLabel(
+            GUIUtil::VaultIllustration::DELAYED_RECOVERY, QSize{114, 76}, m_recovery_panel),
+        0, Qt::AlignTop);
+    recovery_header->addWidget(cancel_recovery, 0, Qt::AlignTop);
     recovery_layout->addLayout(recovery_header);
 
     auto* recovery_intro = new QLabel(tr("Choose one policy stage. The wallet will not choose a lower-signature stage for you."));
@@ -216,17 +227,30 @@ SendCoinsDialog::SendCoinsDialog(const PlatformStyle *_platformStyle, QWidget *p
     m_recovery_selection_detail->setAccessibleName(tr("Selected recovery stage details"));
     recovery_layout->addWidget(m_recovery_selection_detail);
 
-    auto* change_warning = new QLabel(tr("The full eligible balance is entered by default. If you reduce it, change may be created. Relative recovery clocks restart on every change output; when a signer is lost, sweep to a newly secured vault."));
-    change_warning->setObjectName("delayedRecoveryChangeWarning");
-    change_warning->setWordWrap(true);
-    change_warning->setAccessibleName(tr("Recovery change warning"));
-    recovery_layout->addWidget(change_warning);
+    m_recovery_change_warning = new QLabel(tr("The full eligible balance is entered by default. If you reduce it, change may be created. Relative recovery clocks restart on every change output; when a signer is lost, sweep to a newly secured vault."));
+    m_recovery_change_warning->setObjectName("delayedRecoveryChangeWarning");
+    m_recovery_change_warning->setWordWrap(true);
+    m_recovery_change_warning->setAccessibleName(tr("Recovery change warning"));
+    m_recovery_change_warning->hide();
+    recovery_layout->addWidget(m_recovery_change_warning);
     m_recovery_panel->hide();
 
     const int recipient_row = ui->verticalLayout->indexOf(ui->scrollArea);
     ui->verticalLayout->insertWidget(recipient_row, m_vault_notice);
     ui->verticalLayout->insertWidget(recipient_row + 1, m_vault_recovery_offer);
     ui->verticalLayout->insertWidget(recipient_row + 2, m_recovery_panel);
+    ui->scrollArea->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Minimum);
+    ui->verticalLayout->setStretch(ui->verticalLayout->indexOf(ui->scrollArea), 0);
+    if (ui->verticalLayout_2->count() > 1) ui->verticalLayout_2->setStretch(1, 0);
+    int button_row = -1;
+    for (int i = 0; i < ui->verticalLayout->count(); ++i) {
+        if (ui->verticalLayout->itemAt(i)->layout() == ui->horizontalLayout) {
+            button_row = i;
+            break;
+        }
+    }
+    if (button_row >= 0) ui->verticalLayout->insertStretch(button_row, 1);
+    GUIUtil::applyRecoveryVaultStyle(this);
     connect(m_vault_recovery_offer_button, &QPushButton::clicked, this, &SendCoinsDialog::startDelayedRecovery);
     connect(cancel_recovery, &QPushButton::clicked, this, &SendCoinsDialog::cancelDelayedRecovery);
     connect(m_recovery_stage_group, &QButtonGroup::idClicked, this, &SendCoinsDialog::selectRecoveryStage);
@@ -323,6 +347,14 @@ SendCoinsDialog::~SendCoinsDialog()
     delete ui;
 }
 
+void SendCoinsDialog::changeEvent(QEvent* event)
+{
+    QDialog::changeEvent(event);
+    if (event->type() == QEvent::PaletteChange) {
+        GUIUtil::applyRecoveryVaultStyle(this);
+    }
+}
+
 bool SendCoinsDialog::currentTransactionIsUnsignedForTest() const
 {
     if (!m_current_transaction || !m_current_transaction->getWtx()) return false;
@@ -353,7 +385,7 @@ void SendCoinsDialog::startDelayedRecovery()
     m_recovery_amount_initialized = false;
     m_recovery_panel->show();
     ui->addButton->hide();
-    ui->clearButton->setText(tr("Clear Recovery"));
+    ui->clearButton->hide();
     updateVaultSendState();
     refreshBalance();
     setupTabChain(nullptr);
@@ -473,11 +505,11 @@ void SendCoinsDialog::rebuildRecoveryStages()
         QString timing;
         QString technical;
         if (stage.older) {
-            timing = tr("About %1").arg(GUIUtil::formatNiceTimeOffset(int64_t{*stage.older} * spacing));
+            timing = tr("About %1").arg(GUIUtil::formatVaultDuration(int64_t{*stage.older} * spacing));
             technical = tr("Technical: %1-block relative delay").arg(*stage.older);
         } else if (stage.after) {
             if (stage.earliest_blocks_remaining && *stage.earliest_blocks_remaining > 0) {
-                timing = tr("About %1").arg(GUIUtil::formatNiceTimeOffset(int64_t{*stage.earliest_blocks_remaining} * spacing));
+                timing = tr("About %1").arg(GUIUtil::formatVaultDuration(int64_t{*stage.earliest_blocks_remaining} * spacing));
             } else {
                 timing = tr("Eligible now");
             }
@@ -490,12 +522,12 @@ void SendCoinsDialog::rebuildRecoveryStages()
         QString maturity;
         if (stage.earliest_blocks_remaining && *stage.earliest_blocks_remaining > 0) {
             maturity = tr(" · next eligibility in about %1 (%2 blocks)")
-                           .arg(GUIUtil::formatNiceTimeOffset(int64_t{*stage.earliest_blocks_remaining} * spacing))
+                           .arg(GUIUtil::formatVaultDuration(int64_t{*stage.earliest_blocks_remaining} * spacing))
                            .arg(*stage.earliest_blocks_remaining);
         }
         const QString amounts = tr("Eligible now: %1 · Awaiting: %2")
-                                    .arg(BitcoinUnits::formatWithUnit(unit, stage.recoverable_now),
-                                         BitcoinUnits::formatWithUnit(unit, stage.awaiting_maturity));
+                                    .arg(GUIUtil::formatVaultAmount(unit, stage.recoverable_now),
+                                         GUIUtil::formatVaultAmount(unit, stage.awaiting_maturity));
         if (reuse) {
             auto* option = qobject_cast<QRadioButton*>(m_recovery_stage_group->button(index));
             if (!option) continue;
@@ -690,7 +722,7 @@ bool SendCoinsDialog::PrepareSendText(QString& question_string, QString& informa
         if (stage->older) {
             const int64_t delay_seconds = int64_t{*stage->older} * Params().GetConsensus().nPowTargetSpacing;
             question_string.append(tr("Delayed recovery: the selected stage requires %1 after about %2 of coin age. Any change is a new coin, so its relative recovery clock starts over. Prefer a full sweep to a newly secured vault if a signer is lost.")
-                                       .arg(quorum, GUIUtil::formatNiceTimeOffset(delay_seconds)));
+                                       .arg(quorum, GUIUtil::formatVaultDuration(delay_seconds)));
         } else if (stage->after) {
             question_string.append(tr("Delayed recovery: the selected stage is eligible now and requires %1. Prefer a full sweep to a newly secured vault if a signer is lost.")
                                        .arg(quorum));
@@ -1030,6 +1062,7 @@ void SendCoinsDialog::clear()
     clearPreparedVaultContext();
     if (m_recovery_panel) m_recovery_panel->hide();
     ui->addButton->show();
+    ui->clearButton->show();
     ui->clearButton->setText(tr("Clear All"));
     ui->checkBoxCoinControlChange->setChecked(false);
     ui->lineEditCoinControlChange->clear();
@@ -1327,10 +1360,28 @@ void SendCoinsDialog::updateFeeMinimizedLabel()
 }
 
 namespace {
-QString LostSignerLabel(const std::string& fingerprint)
+QString VaultParticipantKind(interfaces::Wallet::VaultParticipantType type)
+{
+    using Type = interfaces::Wallet::VaultParticipantType;
+    switch (type) {
+    case Type::LOCAL_SOFTWARE: return QObject::tr("This device");
+    case Type::HARDWARE: return QObject::tr("Hardware");
+    case Type::AIR_GAPPED: return QObject::tr("Offline signer");
+    case Type::UNKNOWN: return QObject::tr("Key");
+    }
+    return QObject::tr("Key");
+}
+
+QString LostSignerLabel(const std::string& fingerprint, const interfaces::Wallet::VaultStatus& status)
 {
     const QString hex = QString::fromStdString(fingerprint);
-    return QObject::tr("Participant (%1)").arg(hex);
+    for (int index = 0; index < static_cast<int>(status.participants.size()); ++index) {
+        if (status.participants[index].fingerprint != fingerprint) continue;
+        return QObject::tr("Key %1 · %2 (%3)")
+            .arg(index + 1)
+            .arg(VaultParticipantKind(status.participants[index].type), hex);
+    }
+    return QObject::tr("Key (%1)").arg(hex);
 }
 
 bool SameParticipantIdentity(const interfaces::Wallet::VaultStatus::VaultParticipant& first,
@@ -1404,6 +1455,7 @@ bool SendCoinsDialog::updateVaultSendState(bool fresh_persisted_state)
     }
     m_recovery_panel->setVisible(vault && m_delayed_recovery);
     ui->addButton->setVisible(!m_delayed_recovery);
+    ui->clearButton->setVisible(!m_delayed_recovery);
 
     if (m_delayed_recovery) rebuildRecoveryStages();
     const auto* selected_stage = selectedRecoveryStage();
@@ -1415,14 +1467,14 @@ bool SendCoinsDialog::updateVaultSendState(bool fresh_persisted_state)
                 const int64_t seconds = int64_t{*selected_stage->earliest_blocks_remaining} * Params().GetConsensus().nPowTargetSpacing;
                 m_recovery_selection_detail->setText(
                     tr("Nothing is eligible at this stage yet. Next eligibility is expected in about %1.")
-                        .arg(GUIUtil::formatNiceTimeOffset(seconds)));
+                        .arg(GUIUtil::formatVaultDuration(seconds)));
             } else {
                 m_recovery_selection_detail->setText(tr("Nothing is eligible at this stage yet."));
             }
         } else {
             m_recovery_selection_detail->setText(
                 tr("The full eligible balance, %1, is entered below by default.")
-                    .arg(BitcoinUnits::formatWithUnit(model->getOptionsModel()->getDisplayUnit(), selected_stage->recoverable_now)));
+                    .arg(GUIUtil::formatVaultAmount(model->getOptionsModel()->getDisplayUnit(), selected_stage->recoverable_now)));
         }
     }
 
@@ -1449,6 +1501,14 @@ bool SendCoinsDialog::updateVaultSendState(bool fresh_persisted_state)
     });
     const bool unavailable_marker = vault && (relevant_lost_marker || hardware_not_available);
     const bool manually_lost = vault && !relevant_manually_lost.empty();
+    const bool recipient_input_blocked =
+        (!m_delayed_recovery && m_vault_status.is_fixed_staged_vault && manually_lost) ||
+        (m_delayed_recovery && selected_stage && selected_stage->recoverable_now == 0);
+    ui->scrollArea->setEnabled(!recipient_input_blocked);
+    if (m_recovery_change_warning) {
+        m_recovery_change_warning->setVisible(
+            m_delayed_recovery && selected_stage && selected_stage->recoverable_now > 0);
+    }
     if (m_vault_notice) {
         m_vault_notice->setVisible(vault && !m_delayed_recovery);
         if (m_vault_status.genesis_rescan_required) {
@@ -1459,11 +1519,15 @@ bool SendCoinsDialog::updateVaultSendState(bool fresh_persisted_state)
         } else if (manually_lost) {
             QStringList names;
             for (const auto& fpr : relevant_manually_lost) {
-                names << LostSignerLabel(fpr);
+                names << LostSignerLabel(fpr, m_vault_status);
             }
             const bool one = names.size() == 1;
             const QString title = (one ? tr("Participant marked lost: %1") : tr("Participants marked lost: %1")).arg(names.join(QStringLiteral(", ")));
-            const QString action = one ? tr("The immediate path needs every participant. Manage this participant or begin delayed recovery from the Recovery Vault dashboard.") : tr("The immediate path needs every participant. Manage them or begin delayed recovery from the Recovery Vault dashboard.");
+            const QString action = m_vault_status.is_fixed_staged_vault ?
+                (one ? tr("The immediate path needs every participant. Manage this participant or start delayed recovery below.") :
+                       tr("The immediate path needs every participant. Manage these participants or start delayed recovery below.")) :
+                (one ? tr("This advanced vault still needs the marked participant. Manage this participant from the Recovery Vault dashboard.") :
+                       tr("This advanced vault still needs the marked participants. Manage these participants from the Recovery Vault dashboard."));
             m_vault_notice->setText(QStringLiteral("<b>%1</b><br>%2").arg(GUIUtil::HtmlEscape(title), GUIUtil::HtmlEscape(action)));
             m_vault_notice->setAccessibleDescription(title + QStringLiteral(". ") + action);
         } else if (unavailable_marker) {
@@ -1504,12 +1568,16 @@ bool SendCoinsDialog::updateVaultSendState(bool fresh_persisted_state)
                                               });
     const bool show_recovery_offer = immediate_signer_unavailable && !m_delayed_recovery && !m_vault_status.genesis_rescan_required;
     m_vault_recovery_offer->setVisible(show_recovery_offer);
-    m_vault_recovery_offer_button->setEnabled(recovery_eligible);
+    // Lost-signer is a dead end on this form (immediate send is 0). Keep the
+    // delayed-recovery door open so the user can inspect stages and timing
+    // even before a path is eligible. Missing hardware that is not marked
+    // lost still waits until a recovery stage actually matures.
+    m_vault_recovery_offer_button->setEnabled(recovery_eligible || manually_lost);
     if (recovery_eligible) {
         m_vault_recovery_offer_availability->setText(tr("Recovery is eligible now. You will choose the exact policy stage next."));
     } else if (earliest_recovery) {
         m_vault_recovery_offer_availability->setText(tr("Delayed recovery is expected in about %1.")
-                                                         .arg(GUIUtil::formatNiceTimeOffset(int64_t{*earliest_recovery} * Params().GetConsensus().nPowTargetSpacing)));
+                                                         .arg(GUIUtil::formatVaultDuration(int64_t{*earliest_recovery} * Params().GetConsensus().nPowTargetSpacing)));
     } else {
         m_vault_recovery_offer_availability->setText(tr("No delayed-recovery funds are currently eligible."));
     }
@@ -1555,7 +1623,7 @@ bool SendCoinsDialog::updateVaultSendState(bool fresh_persisted_state)
         // the backend strips the lost participant from both local and exact
         // hardware signing.
         m_vault_direct_send_available = false;
-        ui->sendButton->setToolTip(m_vault_status.is_fixed_staged_vault ? tr("A participant is marked lost. Begin delayed recovery from the Recovery Vault dashboard.") : tr("A participant is marked lost in this advanced vault. Review and create an unsigned PSBT for the remaining trusted participants."));
+        ui->sendButton->setToolTip(m_vault_status.is_fixed_staged_vault ? tr("A participant is marked lost. Start delayed recovery below.") : tr("A participant is marked lost in this advanced vault. Review and create an unsigned PSBT for the remaining trusted participants."));
     }
 
     m_vault_send_block_reason.clear();
@@ -1564,14 +1632,16 @@ bool SendCoinsDialog::updateVaultSendState(bool fresh_persisted_state)
     } else if (m_vault_status.genesis_rescan_required) {
         m_vault_send_block_reason = tr("This restored vault must complete its blockchain rescan from genesis before funds can be sent.");
     } else if (!m_delayed_recovery && manually_lost) {
-        m_vault_send_block_reason = tr("Immediate send needs every vault participant. A participant is marked lost; manage participants or begin delayed recovery from the Recovery Vault dashboard.");
+        m_vault_send_block_reason = m_vault_status.is_fixed_staged_vault ?
+            tr("Immediate send needs every vault participant. A participant is marked lost; manage participants or start delayed recovery below.") :
+            tr("This advanced vault still needs the marked participant. Manage participants from the Recovery Vault dashboard before using immediate send.");
     } else if (m_delayed_recovery && !selected_stage) {
         m_vault_send_block_reason = tr("Choose a recovery stage before reviewing. The wallet will not select a lower-signature stage automatically.");
     } else if (m_delayed_recovery && selected_stage && selected_stage->recoverable_now == 0) {
         if (selected_stage->earliest_blocks_remaining) {
             const int64_t seconds = int64_t{*selected_stage->earliest_blocks_remaining} * Params().GetConsensus().nPowTargetSpacing;
             m_vault_send_block_reason = tr("This stage is expected to become eligible in about %1.")
-                                            .arg(GUIUtil::formatNiceTimeOffset(seconds));
+                                            .arg(GUIUtil::formatVaultDuration(seconds));
         } else {
             m_vault_send_block_reason = tr("This recovery stage has no eligible funds yet.");
         }
