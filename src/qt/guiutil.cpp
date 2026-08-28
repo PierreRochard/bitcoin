@@ -37,7 +37,10 @@
 #include <QAbstractItemView>
 #include <QApplication>
 #include <QClipboard>
+#include <QColor>
 #include <QDateTime>
+#include <QPalette>
+#include <QPixmap>
 #include <QDesktopServices>
 #include <QDialog>
 #include <QDoubleValidator>
@@ -62,6 +65,7 @@
 #include <QSettings>
 #include <QShortcut>
 #include <QSize>
+#include <QSizePolicy>
 #include <QStandardPaths>
 #include <QString>
 #include <QTextDocument>
@@ -815,6 +819,138 @@ QString formatNiceTimeOffset(qint64 secs)
         timeBehindText = QObject::tr("%1 and %2").arg(QObject::tr("%n year(s)", "", years)).arg(QObject::tr("%n week(s)","", remainder/WEEK_IN_SECONDS));
     }
     return timeBehindText;
+}
+
+QString formatVaultDuration(qint64 secs)
+{
+    if (secs < 0) secs = 0;
+    constexpr qint64 day = 24 * 60 * 60;
+    if (secs < day) {
+        return formatNiceTimeOffset(secs);
+    }
+    const int days = static_cast<int>((secs + day / 2) / day);
+    return days == 1 ? QObject::tr("1 day") : QObject::tr("%1 days").arg(days);
+}
+
+QString formatVaultAmount(BitcoinUnit unit, const CAmount& amount, bool privacy)
+{
+    if (privacy) {
+        return QStringLiteral("•••• %1").arg(BitcoinUnits::shortName(unit));
+    }
+    QString number{BitcoinUnits::format(unit, amount, false, BitcoinUnits::SeparatorStyle::STANDARD)};
+    if (number.contains(QLatin1Char('.'))) {
+        while (number.endsWith(QLatin1Char('0'))) number.chop(1);
+        if (number.endsWith(QLatin1Char('.'))) number.chop(1);
+    }
+    return number + QLatin1Char(' ') + BitcoinUnits::shortName(unit);
+}
+
+QString recoveryVaultStyleSheet(const QPalette& palette)
+{
+    const QColor window{palette.color(QPalette::Window)};
+    const bool dark{(window.red() * 299 + window.green() * 587 + window.blue() * 114) < 140000};
+    // Opaque slates from the offscreen captures. Do not use
+    // palette(placeholder-text): on macOS that role is a dark color with
+    // alpha, and QSS drops the alpha so secondary copy paints charcoal.
+    const QString muted{dark ? QStringLiteral("#9AA0A6") : QStringLiteral("#6B7280")};
+    const QString hairline{dark ? QStringLiteral("#3C4043") : QStringLiteral("#D0D5DD")};
+    const QString disabled{dark ? QStringLiteral("#6B7280") : QStringLiteral("#9AA0A6")};
+    return QStringLiteral(
+        "QLabel[vaultEyebrow=\"true\"] { font-weight: 600; color: %1; }"
+        "QLabel[vaultSecondary=\"true\"] { color: %1; }"
+        "QLabel#vaultPhaseProgress { color: %1; }"
+        "QFrame[vaultCard=\"true\"] { background: transparent; border: none; border-top: 1px solid %2; border-radius: 0px; }"
+        "QFrame[vaultCard=\"true\"] QLabel { background: transparent; border: none; }"
+        "QFrame[vaultDivider=\"true\"] { background: %2; border: none; min-width: 1px; max-width: 1px; min-height: 36px; }"
+        "QFrame[vaultPaper=\"true\"] { background: palette(base); border: 1px solid %2; border-radius: 10px; }"
+        "QFrame[vaultPaper=\"true\"] QLabel, QFrame[vaultPaper=\"true\"] QCheckBox { background: transparent; border: none; }"
+        "QFrame[vaultInset=\"true\"] { background: transparent; border: none; border-top: 1px solid %2; border-radius: 0px; }"
+        "QPushButton[vaultQuiet=\"true\"] { border: none; background: transparent; padding: 2px 6px; color: %1; }"
+        "QPushButton[vaultQuiet=\"true\"]:hover { color: palette(text); }"
+        "QPushButton[vaultQuiet=\"true\"]:disabled { color: %3; }"
+        "QFrame#recoveryTimeline { background: palette(base); border: 1px solid %2; border-radius: 10px; }"
+        "QLabel#independentVerificationState { border-radius: 8px; }"
+        "QWidget#vaultPhaseHeader { margin-bottom: 4px; }"
+        "QProgressBar#vaultRenewalProgress { border: none; background: %2; border-radius: 2px; min-height: 6px; max-height: 6px; text-align: center; }"
+        "QProgressBar#vaultRenewalProgress::chunk { background: palette(text); border-radius: 2px; }"
+        "QLabel#vaultRenewalProgressCount { color: %1; }"
+        "QLabel#vaultSendNotice { background: palette(base); color: palette(text); padding: 12px 14px; border: 1px solid %2; border-radius: 10px; }"
+        "QFrame#delayedRecoveryPanel { background: palette(base); border: 1px solid %2; border-radius: 10px; }")
+        .arg(muted, hairline, disabled);
+}
+
+void applyRecoveryVaultStyle(QWidget* widget)
+{
+    if (!widget) return;
+    widget->setStyleSheet(recoveryVaultStyleSheet(widget->palette()));
+}
+
+namespace {
+bool IsDarkPalette(const QPalette& palette)
+{
+    const QColor window{palette.color(QPalette::Window)};
+    return (window.red() * 299 + window.green() * 587 + window.blue() * 114) < 140000;
+}
+
+QString VaultIllustrationSlug(VaultIllustration illustration)
+{
+    switch (illustration) {
+    case VaultIllustration::ACCESS_TIMELINE: return QStringLiteral("access-timeline");
+    case VaultIllustration::RECOVERY_KIT: return QStringLiteral("recovery-kit");
+    case VaultIllustration::ADDRESS_VERIFICATION: return QStringLiteral("address-verification");
+    case VaultIllustration::RESTORE_AUTHORITY: return QStringLiteral("restore-authority");
+    case VaultIllustration::DELAYED_RECOVERY: return QStringLiteral("delayed-recovery");
+    case VaultIllustration::PROTECTION_RENEWAL: return QStringLiteral("protection-renewal");
+    case VaultIllustration::VAULT_READY: return QStringLiteral("vault-ready");
+    }
+    assert(false);
+    return {};
+}
+} // namespace
+
+VaultIllustrationLabel::VaultIllustrationLabel(
+    VaultIllustration illustration, const QSize& logical_size, QWidget* parent)
+    : QLabel(parent), m_illustration(illustration), m_logical_size(logical_size)
+{
+    setObjectName(QStringLiteral("vaultIllustration"));
+    setProperty("vaultIllustration", true);
+    setFocusPolicy(Qt::NoFocus);
+    setAttribute(Qt::WA_TransparentForMouseEvents);
+    setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    setFixedSize(m_logical_size);
+    setAlignment(Qt::AlignCenter);
+    setAccessibleName({});
+    setAccessibleDescription({});
+    updateIllustration();
+}
+
+void VaultIllustrationLabel::changeEvent(QEvent* event)
+{
+    bool refresh{event->type() == QEvent::PaletteChange};
+#if QT_VERSION >= QT_VERSION_CHECK(6, 6, 0)
+    refresh |= event->type() == QEvent::DevicePixelRatioChange;
+#endif
+    if (refresh) {
+        updateIllustration();
+    }
+    QLabel::changeEvent(event);
+}
+
+void VaultIllustrationLabel::updateIllustration()
+{
+    const QString theme{IsDarkPalette(palette()) ? QStringLiteral("dark") : QStringLiteral("light")};
+    const QString resource{QStringLiteral(":/images/recovery-vault/%1-%2")
+                               .arg(VaultIllustrationSlug(m_illustration), theme)};
+    QPixmap source{resource};
+    assert(!source.isNull());
+    const qreal scale{devicePixelRatioF()};
+    QPixmap rendered{source.scaled(
+        QSize{qRound(m_logical_size.width() * scale), qRound(m_logical_size.height() * scale)},
+        Qt::KeepAspectRatio, Qt::SmoothTransformation)};
+    rendered.setDevicePixelRatio(scale);
+    setPixmap(rendered);
+    setProperty("vaultIllustrationTheme", theme);
+    setProperty("vaultIllustrationResource", resource);
 }
 
 QString formatBytes(uint64_t bytes)

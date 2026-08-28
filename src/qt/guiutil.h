@@ -8,6 +8,7 @@
 #include <consensus/amount.h>
 #include <net.h>
 #include <netaddress.h>
+#include <qt/bitcoinunits.h>
 #include <util/check.h>
 #include <util/fs.h>
 
@@ -19,7 +20,9 @@
 #include <QMessageBox>
 #include <QMetaObject>
 #include <QObject>
+#include <QPalette>
 #include <QProgressBar>
+#include <QSize>
 #include <QString>
 #include <QTableView>
 
@@ -244,6 +247,52 @@ namespace GUIUtil
     QString formatTimeOffset(int64_t time_offset);
 
     QString formatNiceTimeOffset(qint64 secs);
+
+    /** Vault timelines stay in days once the delay is at least one day, so
+     * 90/180-day Recovery Vault copy never collapses into "week(s)". */
+    QString formatVaultDuration(qint64 secs);
+
+    /** Consumer Recovery Vault amounts: no trailing BTC zeros, and a quiet
+     * privacy mask instead of a hash-filled decimal string. */
+    QString formatVaultAmount(BitcoinUnit unit, const CAmount& amount, bool privacy = false);
+
+    /** Shared Recovery Vault material: paper cards, hairlines, quiet type.
+     * Muted slate is baked from the palette as an opaque color. macOS
+     * PlaceholderText is a dark color with alpha; QSS paints it opaque and
+     * the secondary copy goes charcoal. */
+    QString recoveryVaultStyleSheet(const QPalette& palette);
+    void applyRecoveryVaultStyle(QWidget* widget);
+
+    /** Static, non-authoritative teaching art used by Recovery Vault surfaces.
+     * Every image is paired for light and dark palettes and contains no wallet
+     * state, addresses, amounts, fingerprints, or recovery material. */
+    enum class VaultIllustration {
+        ACCESS_TIMELINE,
+        RECOVERY_KIT,
+        ADDRESS_VERIFICATION,
+        RESTORE_AUTHORITY,
+        DELAYED_RECOVERY,
+        PROTECTION_RENEWAL,
+        VAULT_READY,
+    };
+
+    /** Fixed-size palette-aware Recovery Vault illustration. The source art is
+     * kept at 720x480 and downsampled smoothly for the current screen scale. */
+    class VaultIllustrationLabel final : public QLabel
+    {
+    public:
+        VaultIllustrationLabel(VaultIllustration illustration, const QSize& logical_size,
+                               QWidget* parent = nullptr);
+
+    protected:
+        void changeEvent(QEvent* event) override;
+
+    private:
+        void updateIllustration();
+
+        VaultIllustration m_illustration;
+        QSize m_logical_size;
+    };
 
     QString formatBytes(uint64_t bytes);
 

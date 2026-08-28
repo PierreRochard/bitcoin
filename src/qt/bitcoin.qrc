@@ -45,6 +45,22 @@
         <file alias="network_disabled">res/icons/network_disabled.png</file>
         <file alias="proxy">res/icons/proxy.png</file>
     </qresource>
+    <qresource prefix="/images">
+        <file alias="recovery-vault/access-timeline-light">res/images/recovery-vault/access-timeline-light.png</file>
+        <file alias="recovery-vault/access-timeline-dark">res/images/recovery-vault/access-timeline-dark.png</file>
+        <file alias="recovery-vault/recovery-kit-light">res/images/recovery-vault/recovery-kit-light.png</file>
+        <file alias="recovery-vault/recovery-kit-dark">res/images/recovery-vault/recovery-kit-dark.png</file>
+        <file alias="recovery-vault/address-verification-light">res/images/recovery-vault/address-verification-light.png</file>
+        <file alias="recovery-vault/address-verification-dark">res/images/recovery-vault/address-verification-dark.png</file>
+        <file alias="recovery-vault/restore-authority-light">res/images/recovery-vault/restore-authority-light.png</file>
+        <file alias="recovery-vault/restore-authority-dark">res/images/recovery-vault/restore-authority-dark.png</file>
+        <file alias="recovery-vault/delayed-recovery-light">res/images/recovery-vault/delayed-recovery-light.png</file>
+        <file alias="recovery-vault/delayed-recovery-dark">res/images/recovery-vault/delayed-recovery-dark.png</file>
+        <file alias="recovery-vault/protection-renewal-light">res/images/recovery-vault/protection-renewal-light.png</file>
+        <file alias="recovery-vault/protection-renewal-dark">res/images/recovery-vault/protection-renewal-dark.png</file>
+        <file alias="recovery-vault/vault-ready-light">res/images/recovery-vault/vault-ready-light.png</file>
+        <file alias="recovery-vault/vault-ready-dark">res/images/recovery-vault/vault-ready-dark.png</file>
+    </qresource>
     <qresource prefix="/animation">
         <file alias="spinner-000">res/animation/spinner-000.png</file>
         <file alias="spinner-001">res/animation/spinner-001.png</file>
